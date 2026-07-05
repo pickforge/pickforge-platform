@@ -1,0 +1,118 @@
+:root {
+  --pf-surface: #0a0a0b;
+  --pf-surface-1: #0f0f11;
+  --pf-surface-2: #141417;
+  --pf-surface-3: #1b1b1f;
+  --pf-text-hi: #f2f2f3;
+  --pf-text-med: #a0a0a6;
+  --pf-text-low: #6e6e75;
+  --pf-ember: #ff7a1a;
+  --pf-ember-soft: #ff9a4a;
+  --pf-ember-deep: #cc5e0c;
+  --pf-hairline: rgba(255, 255, 255, 0.08);
+  --pf-hairline-strong: rgba(255, 255, 255, 0.14);
+  --pf-item-fill: rgba(255, 255, 255, 0.03);
+  --pf-connected: #3dd68c;
+  --pf-warning: #f2b53a;
+  --pf-error: #ff6b5c;
+  --pf-info: #7aa2ff;
+  --pf-ember-glow: rgba(255, 122, 26, 0.28);
+  --pf-winctl-close-hover: color-mix(in srgb, var(--pf-error) 80%, black 12%);
+  --pf-glow-ember-soft: 0 0 30px -8px rgba(255, 122, 26, 0.25);
+  --pf-glow-ember: 0 0 60px -10px rgba(255, 122, 26, 0.45);
+  --pf-glow-ember-strong: 0 0 90px -10px rgba(255, 122, 26, 0.65);
+  --pf-shadow-raised: 0 8px 24px -6px rgba(0, 0, 0, 0.4);
+  --pf-shadow-overlay: 0 16px 48px -10px rgba(0, 0, 0, 0.6);
+  --pf-font-sans: "Geist Sans", "Geist", system-ui, -apple-system, sans-serif;
+  --pf-font-mono: "Geist Mono", "GeistMono", ui-monospace, "SF Mono", Menlo, monospace;
+  --pf-size-display-lg: 42px;
+  --pf-size-display-md: 34px;
+  --pf-size-display-sm: 28px;
+  --pf-size-headline-lg: 25px;
+  --pf-size-headline-md: 21px;
+  --pf-size-headline-sm: 18px;
+  --pf-size-title-lg: 16px;
+  --pf-size-title-md: 14px;
+  --pf-size-title-sm: 13px;
+  --pf-size-body-lg: 15px;
+  --pf-size-body-md: 13px;
+  --pf-size-body-sm: 12px;
+  --pf-size-label-lg: 13px;
+  --pf-size-label-md: 12px;
+  --pf-size-label-sm: 11px;
+  --pf-size-eyebrow: 10px;
+  --pf-size-mono: 12px;
+  --pf-weight-regular: 400;
+  --pf-weight-medium: 500;
+  --pf-weight-semibold: 600;
+  --pf-weight-bold: 700;
+  --pf-tracking-eyebrow: 1.8px;
+  --pf-titlebar-h: 38px;
+  --pf-winctl-btn-w: 30px;
+  --pf-winctl-btn-h: 26px;
+  --pf-winctl-gap: 2px;
+  --pf-chip-margin-x: 1px;
+  --pf-chip-pad-y: 2px;
+  --pf-chip-pad-left: 3px;
+  --pf-chip-glyph-w: 13px;
+  --pf-chip-glyph-h: 11px;
+  --pf-chip-glyph-radius: 2px;
+  --pf-chip-glyph-dot: 2px;
+  --pf-chip-glyph-inset: 1px;
+  --pf-chip-glyph-horizon: 4px;
+  --pf-space-xs: 4px;
+  --pf-space-sm: 8px;
+  --pf-space-md: 12px;
+  --pf-space-lg: 16px;
+  --pf-space-xl: 24px;
+  --pf-space-xxl: 32px;
+  --pf-space-xxxl: 48px;
+  --pf-radius-sm: 6px;
+  --pf-radius-md: 10px;
+  --pf-radius-lg: 14px;
+  --pf-radius-xl: 16px;
+  --pf-radius-pill: 999px;
+  --pf-hairline-width: 1px;
+  --pf-bracket-width: 1.5px;
+  --pf-dur-micro: 110ms;
+  --pf-dur-fast: 180ms;
+  --pf-dur-standard: 260ms;
+  --pf-dur-slow: 420ms;
+  --pf-dur-reveal: 640ms;
+  --pf-dur-pulse: 2400ms;
+  --pf-dur-breath: 6000ms;
+  --pf-ease-forge: cubic-bezier(0.16, 1, 0.3, 1);
+  --pf-ease-curve: cubic-bezier(0.65, 0, 0.35, 1);
+  --pf-ease-out: cubic-bezier(0.33, 1, 0.68, 1);
+}
+
+:root[data-theme="light"] {
+  --pf-surface: #fafaf7;
+  --pf-surface-1: #ffffff;
+  --pf-surface-2: #f2f2ee;
+  --pf-surface-3: #e9e9e4;
+  --pf-text-hi: #17171a;
+  --pf-text-med: #55555c;
+  --pf-text-low: #6e6e75;
+  --pf-ember: #e5610a;
+  --pf-ember-soft: #f58220;
+  --pf-ember-deep: #b14c00;
+  --pf-hairline: rgba(0, 0, 0, 0.1);
+  --pf-hairline-strong: rgba(0, 0, 0, 0.16);
+  --pf-item-fill: rgba(0, 0, 0, 0.03);
+  --pf-warning: #9a6700;
+  --pf-ember-glow: rgba(229, 97, 10, 0.23);
+  --pf-glow-ember-soft: 0 0 30px -8px rgba(229, 97, 10, 0.3);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --pf-dur-micro: 0ms;
+    --pf-dur-fast: 0ms;
+    --pf-dur-standard: 0ms;
+    --pf-dur-slow: 0ms;
+    --pf-dur-reveal: 0ms;
+    --pf-dur-pulse: 0ms;
+    --pf-dur-breath: 0ms;
+  }
+}

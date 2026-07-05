@@ -1,0 +1,44 @@
+.pf-mono {
+  color: var(--pf-text-med);
+  font-family: var(--pf-font-mono);
+  font-size: var(--pf-size-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.pf-eyebrow {
+  color: var(--pf-text-low);
+  font-family: var(--pf-font-mono);
+  font-size: var(--pf-size-eyebrow);
+  font-weight: var(--pf-weight-medium);
+  letter-spacing: var(--pf-tracking-eyebrow);
+  margin: 0;
+  text-transform: uppercase;
+}
+
+.pf-icon {
+  display: block;
+  flex: none;
+}
+
+.pf-reveal {
+  animation: pf-rise var(--pf-dur-reveal) var(--pf-ease-forge) both;
+  animation-delay: var(--pf-reveal-delay, 0ms);
+}
+
+@keyframes pf-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pf-reveal {
+    animation: none;
+  }
+}

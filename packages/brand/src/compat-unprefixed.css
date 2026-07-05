@@ -1,0 +1,49 @@
+@import "./global.css";
+
+:root {
+  --ember: var(--pf-ember);
+  --ember-soft: var(--pf-ember-soft);
+  --ember-deep: var(--pf-ember-deep);
+  --surface: var(--pf-surface);
+  --surface-1: var(--pf-surface-1);
+  --surface-2: var(--pf-surface-2);
+  --surface-3: var(--pf-surface-3);
+  --text: var(--pf-text-hi);
+  --muted: var(--pf-text-low);
+  --hairline: var(--pf-hairline);
+  --hairline-strong: var(--pf-hairline-strong);
+  --ok: var(--pf-connected);
+  --warn: var(--pf-warning);
+  --bad: var(--pf-error);
+  --wash: rgba(255, 255, 255, 0.04);
+  --wash-strong: rgba(255, 255, 255, 0.07);
+  --well: rgba(0, 0, 0, 0.2);
+  --well-border: rgba(255, 255, 255, 0.05);
+  --border-input: rgba(255, 255, 255, 0.1);
+  --pill-border: rgba(255, 255, 255, 0.15);
+  --pill-bg: rgba(255, 255, 255, 0.05);
+  --glass-bg: rgba(15, 15, 17, 0.7);
+  --capsule-bg: rgba(15, 15, 17, 0.88);
+  --scroll-thumb: rgba(255, 255, 255, 0.12);
+  --font-sans: var(--pf-font-sans);
+  --font-mono: var(--pf-font-mono);
+  --radius-card: var(--pf-radius-lg);
+  --radius-pill: var(--pf-radius-pill);
+  --ease-forge: var(--pf-ease-forge);
+  --glow-ember: var(--pf-glow-ember);
+  --glow-ember-soft: var(--pf-glow-ember-soft);
+  --glow-ember-strong: var(--pf-glow-ember-strong);
+}
+
+:root[data-theme="light"] {
+  --wash: rgba(23, 23, 26, 0.04);
+  --wash-strong: rgba(23, 23, 26, 0.08);
+  --well: rgba(23, 23, 26, 0.05);
+  --well-border: rgba(23, 23, 26, 0.06);
+  --border-input: rgba(23, 23, 26, 0.12);
+  --pill-border: rgba(23, 23, 26, 0.16);
+  --pill-bg: rgba(23, 23, 26, 0.04);
+  --glass-bg: rgba(255, 255, 255, 0.7);
+  --capsule-bg: rgba(255, 255, 255, 0.9);
+  --scroll-thumb: rgba(23, 23, 26, 0.18);
+}

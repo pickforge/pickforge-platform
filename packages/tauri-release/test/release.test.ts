@@ -78,6 +78,26 @@ describe("@pickforge/tauri-release", () => {
       "linux-x86_64",
       "linux-x86_64-deb",
     ]);
+    expect(platformKeysForAssetName("PickScribe_1.0.0_x86_64.rpm")).toEqual([
+      "linux-x86_64",
+      "linux-x86_64-rpm",
+    ]);
+    expect(platformKeysForAssetName("windows-PickGauge_1.0.0_x64-setup.exe")).toEqual([
+      "windows-x86_64",
+      "windows-x86_64-nsis",
+    ]);
+    expect(platformKeysForAssetName("windows-PickGauge_1.0.0_x64-setup.exe.zip")).toEqual([
+      "windows-x86_64",
+      "windows-x86_64-nsis",
+    ]);
+    expect(platformKeysForAssetName("windows-PickGauge_1.0.0_x64_en-US.msi")).toEqual([
+      "windows-x86_64",
+      "windows-x86_64-msi",
+    ]);
+    expect(platformKeysForAssetName("windows-PickGauge_1.0.0_x64_en-US.msi.zip")).toEqual([
+      "windows-x86_64",
+      "windows-x86_64-msi",
+    ]);
     expect(platformKeyForAssetName("windows-PickGauge_1.0.0_x64-setup.exe")).toBe(
       "windows-x86_64",
     );
@@ -136,6 +156,7 @@ describe("@pickforge/tauri-release", () => {
     const root = tempRoot();
     writeSignedAsset(root, "linux-appimage-PickGauge_1.0.0_amd64.AppImage", "linux-signature");
     writeSignedAsset(root, "linux-deb-PickGauge_1.0.0_amd64.deb", "deb-signature");
+    writeSignedAsset(root, "linux-rpm-PickGauge_1.0.0_x86_64.rpm", "rpm-signature");
     writeSignedAsset(root, "windows-PickGauge_1.0.0_x64-setup.exe", "exe-signature");
     writeSignedAsset(root, "windows-PickGauge_1.0.0_x64_en-US.msi", "msi-signature");
     writeSignedAsset(root, "macos-intel-PickGauge.app.tar.gz", "mac-intel-signature");
@@ -152,7 +173,10 @@ describe("@pickforge/tauri-release", () => {
     expect(latest.platforms["linux-x86_64"]?.signature).toBe("linux-signature");
     expect(latest.platforms["linux-x86_64-appimage"]?.signature).toBe("linux-signature");
     expect(latest.platforms["linux-x86_64-deb"]?.signature).toBe("deb-signature");
+    expect(latest.platforms["linux-x86_64-rpm"]?.signature).toBe("rpm-signature");
     expect(latest.platforms["windows-x86_64"]?.signature).toBe("exe-signature");
+    expect(latest.platforms["windows-x86_64-nsis"]?.signature).toBe("exe-signature");
+    expect(latest.platforms["windows-x86_64-msi"]?.signature).toBe("msi-signature");
     expect(latest.platforms["darwin-x86_64"]?.signature).toBe("mac-intel-signature");
     expect(latest.platforms["darwin-aarch64"]?.signature).toBe("mac-arm-signature");
     expect(verifyLatestJson(latest)).toEqual({
@@ -163,7 +187,10 @@ describe("@pickforge/tauri-release", () => {
         "linux-x86_64",
         "linux-x86_64-appimage",
         "linux-x86_64-deb",
+        "linux-x86_64-rpm",
         "windows-x86_64",
+        "windows-x86_64-msi",
+        "windows-x86_64-nsis",
       ],
       errors: [],
     });
@@ -197,6 +224,26 @@ describe("@pickforge/tauri-release", () => {
     expect(appImageLatest.platforms["linux-x86_64-appimage"]?.signature).toBe(
       "appimage-signature",
     );
+  });
+
+  it("emits package-specific Linux and Windows updater targets", () => {
+    const root = tempRoot();
+    writeSignedAsset(root, "PickForge_1.0.0_x86_64.rpm", "rpm-signature");
+    writeSignedAsset(root, "PickForge_1.0.0_x64-setup.exe.zip", "nsis-signature");
+    writeSignedAsset(root, "PickForge_1.0.0_x64_en-US.msi.zip", "msi-signature");
+
+    const latest = generateLatestJson({
+      assetsDir: root,
+      downloadBaseUrl: "https://github.com/pickforge/pickforge/releases/download/v1.0.0",
+      pubDate: "2026-07-05T12:00:00Z",
+      version: "1.0.0",
+    });
+
+    expect(latest.platforms["linux-x86_64"]?.signature).toBe("rpm-signature");
+    expect(latest.platforms["linux-x86_64-rpm"]?.signature).toBe("rpm-signature");
+    expect(latest.platforms["windows-x86_64"]?.signature).toBe("nsis-signature");
+    expect(latest.platforms["windows-x86_64-nsis"]?.signature).toBe("nsis-signature");
+    expect(latest.platforms["windows-x86_64-msi"]?.signature).toBe("msi-signature");
   });
 
   it("infers macOS updater platform keys from artifact paths", () => {

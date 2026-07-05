@@ -15,7 +15,10 @@ export const PLATFORM_KEYS = [
   "linux-x86_64",
   "linux-x86_64-appimage",
   "linux-x86_64-deb",
+  "linux-x86_64-rpm",
   "windows-x86_64",
+  "windows-x86_64-msi",
+  "windows-x86_64-nsis",
   "darwin-x86_64",
   "darwin-aarch64",
 ] as const;
@@ -397,8 +400,14 @@ function platformKeysForAssetPath(assetPath: string): PlatformKey[] {
   if (assetName.endsWith(".deb")) {
     return ["linux-x86_64", "linux-x86_64-deb"];
   }
-  if (assetName.endsWith(".msi") || assetName.endsWith(".exe")) {
-    return ["windows-x86_64"];
+  if (assetName.endsWith(".rpm")) {
+    return ["linux-x86_64", "linux-x86_64-rpm"];
+  }
+  if (assetName.endsWith(".msi") || assetName.endsWith(".msi.zip")) {
+    return ["windows-x86_64", "windows-x86_64-msi"];
+  }
+  if (assetName.endsWith(".exe") || assetName.endsWith(".exe.zip")) {
+    return ["windows-x86_64", "windows-x86_64-nsis"];
   }
   if (assetName.endsWith(".app.tar.gz")) {
     if (/apple-silicon|aarch64|arm64/u.test(loweredPath)) {
@@ -451,13 +460,16 @@ function platformPriority(assetName: string, platform: PlatformKey): number {
   if (platform === "linux-x86_64" && lowered.endsWith(".deb")) {
     return 2;
   }
-  if (lowered.endsWith("-setup.exe")) {
+  if (platform === "linux-x86_64" && lowered.endsWith(".rpm")) {
+    return 3;
+  }
+  if (lowered.endsWith("-setup.exe") || lowered.endsWith("-setup.exe.zip")) {
     return 0;
   }
-  if (lowered.endsWith(".exe")) {
+  if (lowered.endsWith(".exe") || lowered.endsWith(".exe.zip")) {
     return 1;
   }
-  if (lowered.endsWith(".msi")) {
+  if (lowered.endsWith(".msi") || lowered.endsWith(".msi.zip")) {
     return 2;
   }
   return 0;

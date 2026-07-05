@@ -70,7 +70,7 @@ export interface PickforgeAuthClient {
 
 interface EntitlementRow {
   key: string;
-  value: PickforgeJson | null;
+  value?: PickforgeJson | null;
   expires_at: string | null;
   granted_at: string;
 }
@@ -239,7 +239,7 @@ export function createPickforgeAuthClient(config: PickforgeAuthConfig): Pickforg
 function toEntitlement(row: EntitlementRow): PickforgeEntitlement {
   return {
     key: row.key,
-    value: row.value ?? true,
+    value: row.value === undefined ? true : row.value,
     expiresAt: row.expires_at,
     grantedAt: row.granted_at,
   };

@@ -156,6 +156,30 @@ describe("@pickforge/auth", () => {
     expect(supabase.from).toHaveBeenCalledTimes(2);
   });
 
+  it("preserves explicit null entitlement values", async () => {
+    mockSupabase({
+      entitlementRows: [
+        {
+          expires_at: null,
+          granted_at: "2026-07-05T12:00:00Z",
+          key: "nullable_payload",
+          value: null,
+        },
+      ],
+      session: sessionFor("user-1"),
+    });
+    const client = createPickforgeAuthClient(baseConfig());
+
+    await expect(client.getEntitlements()).resolves.toEqual([
+      {
+        expiresAt: null,
+        grantedAt: "2026-07-05T12:00:00Z",
+        key: "nullable_payload",
+        value: null,
+      },
+    ]);
+  });
+
   it("routes redirect listener failures to the configured error handler", async () => {
     const redirectListeners: Array<(url: string) => void | Promise<void>> = [];
     const onRedirectError = vi.fn();

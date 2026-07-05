@@ -257,6 +257,9 @@ export function collectAssets(
 
 export function generateLatestJson(options: GenerateLatestJsonOptions): LatestJson {
   const assetsDir = resolve(options.assetsDir);
+  if (!isSemver(options.version)) {
+    throw new Error("version must be SemVer");
+  }
   const pubDate = normalizePubDate(options.pubDate ?? new Date());
   const sigFiles = listFiles(assetsDir).filter((file) => file.endsWith(".sig"));
   const orphanSignatures = sigFiles.filter((file) => !existsSync(file.slice(0, -".sig".length)));
@@ -397,14 +400,17 @@ function platformKeysForAssetPath(assetPath: string): PlatformKey[] {
   if (isUnsupportedLinuxArchitecture(assetPath)) {
     return [];
   }
+  if (isUnsupportedWindowsArchitecture(assetPath)) {
+    return [];
+  }
   if (assetName.endsWith(".AppImage") || assetName.endsWith(".AppImage.tar.gz")) {
     return ["linux-x86_64", "linux-x86_64-appimage"];
   }
   if (assetName.endsWith(".deb")) {
-    return ["linux-x86_64", "linux-x86_64-deb"];
+    return ["linux-x86_64-deb"];
   }
   if (assetName.endsWith(".rpm")) {
-    return ["linux-x86_64", "linux-x86_64-rpm"];
+    return ["linux-x86_64-rpm"];
   }
   if (assetName.endsWith(".msi") || assetName.endsWith(".msi.zip")) {
     return ["windows-x86_64", "windows-x86_64-msi"];
@@ -438,6 +444,15 @@ function toPlatformCandidates(signatureFile: string, assetsDir: string): Platfor
   ) {
     throw new Error(
       `unsupported Linux updater architecture for ${assetName}; only x86_64 is supported`,
+    );
+  }
+  if (
+    platforms.length === 0 &&
+    isWindowsUpdaterAsset(assetPath) &&
+    isUnsupportedWindowsArchitecture(assetPath)
+  ) {
+    throw new Error(
+      `unsupported Windows updater architecture for ${assetName}; only x86_64 is supported`,
     );
   }
   return platforms.map((platform) => ({
@@ -644,6 +659,17 @@ function isLinuxUpdaterAsset(assetPath: string): boolean {
   );
 }
 
+function isWindowsUpdaterAsset(assetPath: string): boolean {
+  const assetName = basename(assetPath);
+  return (
+    assetName.endsWith(".msi") ||
+    assetName.endsWith(".msi.zip") ||
+    assetName.endsWith(".exe") ||
+    assetName.endsWith(".exe.zip") ||
+    assetName.endsWith(".nsis.zip")
+  );
+}
+
 function isUnsupportedLinuxArchitecture(assetPath: string): boolean {
   if (!isLinuxUpdaterAsset(assetPath)) {
     return false;
@@ -655,6 +681,17 @@ function isUnsupportedLinuxArchitecture(assetPath: string): boolean {
   return /(?:^|[^a-z0-9])(?:aarch64|arm64|armv7l?|i686|x86)(?:[^a-z0-9]|$)/u.test(
     loweredPath,
   );
+}
+
+function isUnsupportedWindowsArchitecture(assetPath: string): boolean {
+  if (!isWindowsUpdaterAsset(assetPath)) {
+    return false;
+  }
+  const loweredPath = normalizePath(assetPath).toLowerCase();
+  if (/(?:^|[^a-z0-9])(?:x86_64|amd64|x64)(?:[^a-z0-9]|$)/u.test(loweredPath)) {
+    return false;
+  }
+  return /(?:^|[^a-z0-9])(?:aarch64|arm64|i686|x86)(?:[^a-z0-9]|$)/u.test(loweredPath);
 }
 
 function escapeRegExp(value: string): string {

@@ -75,11 +75,9 @@ describe("@pickforge/tauri-release", () => {
       "linux-x86_64-appimage",
     ]);
     expect(platformKeysForAssetName("PickScribe_1.0.0_amd64.deb")).toEqual([
-      "linux-x86_64",
       "linux-x86_64-deb",
     ]);
     expect(platformKeysForAssetName("PickScribe_1.0.0_x86_64.rpm")).toEqual([
-      "linux-x86_64",
       "linux-x86_64-rpm",
     ]);
     expect(platformKeysForAssetName("windows-PickGauge_1.0.0_x64-setup.exe")).toEqual([
@@ -200,7 +198,7 @@ describe("@pickforge/tauri-release", () => {
     });
   });
 
-  it("uses Linux debs and v1-compatible AppImage bundles as default Linux updater targets", () => {
+  it("uses AppImage bundles as default Linux updater targets and keeps debs package-specific", () => {
     const debRoot = tempRoot();
     writeSignedAsset(debRoot, "PickScribe_1.0.0_amd64.deb", "deb-signature");
 
@@ -211,7 +209,7 @@ describe("@pickforge/tauri-release", () => {
       version: "1.0.0",
     });
 
-    expect(debLatest.platforms["linux-x86_64"]?.signature).toBe("deb-signature");
+    expect(debLatest.platforms["linux-x86_64"]).toBeUndefined();
     expect(debLatest.platforms["linux-x86_64-deb"]?.signature).toBe("deb-signature");
 
     const appImageRoot = tempRoot();
@@ -243,7 +241,7 @@ describe("@pickforge/tauri-release", () => {
       version: "1.0.0",
     });
 
-    expect(latest.platforms["linux-x86_64"]?.signature).toBe("rpm-signature");
+    expect(latest.platforms["linux-x86_64"]).toBeUndefined();
     expect(latest.platforms["linux-x86_64-rpm"]?.signature).toBe("rpm-signature");
     expect(latest.platforms["windows-x86_64"]?.signature).toBe("nsis-signature");
     expect(latest.platforms["windows-x86_64-nsis"]?.signature).toBe("nsis-signature");
@@ -262,6 +260,20 @@ describe("@pickforge/tauri-release", () => {
         version: "1.0.0",
       }),
     ).toThrow(/unsupported Linux updater architecture/u);
+  });
+
+  it("rejects unsupported Windows updater architectures instead of mislabeling them", () => {
+    const root = tempRoot();
+    writeSignedAsset(root, "PickForge_1.0.0_arm64-setup.exe", "arm-signature");
+
+    expect(() =>
+      generateLatestJson({
+        assetsDir: root,
+        downloadBaseUrl: "https://github.com/pickforge/pickforge/releases/download/v1.0.0",
+        pubDate: "2026-07-05T12:00:00Z",
+        version: "1.0.0",
+      }),
+    ).toThrow(/unsupported Windows updater architecture/u);
   });
 
   it("infers macOS updater platform keys from artifact paths", () => {
@@ -357,6 +369,14 @@ describe("@pickforge/tauri-release", () => {
         version: "1.2.3",
       }),
     ).toThrow(/pubDate must be an RFC3339 date-time string/u);
+    expect(() =>
+      generateLatestJson({
+        assetsDir: tempRoot(),
+        downloadBaseUrl: "https://example.com",
+        pubDate: "2026-07-05T12:00:00Z",
+        version: "release-1.2.3",
+      }),
+    ).toThrow(/version must be SemVer/u);
     expect(
       verifyLatestJson({
         version: "v1.2.3",

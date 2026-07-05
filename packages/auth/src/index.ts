@@ -33,6 +33,7 @@ export interface PickforgeAuthConfig {
   storage: PickforgeStorageAdapter;
   openExternalUrl(url: string): void | Promise<void>;
   redirectListener?: PickforgeRedirectListenerAdapter;
+  onRedirectError?: (error: unknown, url: string) => void | Promise<void>;
   entitlementCacheTtlMs?: number;
 }
 
@@ -187,9 +188,19 @@ export function createPickforgeAuthClient(config: PickforgeAuthConfig): Pickforg
       const entitlements = (data ?? [])
         .map(toEntitlement)
         .filter((entitlement) => entitlement.expiresAt === null || Date.parse(entitlement.expiresAt) > now);
+      const earliestEntitlementExpiry = entitlements.reduce<number | null>((earliest, entitlement) => {
+        if (entitlement.expiresAt === null) {
+          return earliest;
+        }
+        const expiresAtMs = Date.parse(entitlement.expiresAt);
+        return earliest === null ? expiresAtMs : Math.min(earliest, expiresAtMs);
+      }, null);
       entitlementCache = {
         entitlements,
-        expiresAtMs: now + cacheTtlMs,
+        expiresAtMs:
+          earliestEntitlementExpiry === null
+            ? now + cacheTtlMs
+            : Math.min(now + cacheTtlMs, earliestEntitlementExpiry),
         userId,
       };
       return entitlements;
@@ -207,7 +218,9 @@ export function createPickforgeAuthClient(config: PickforgeAuthConfig): Pickforg
   };
 
   config.redirectListener?.listen((url) => {
-    void client.handleRedirect(url);
+    void client.handleRedirect(url).catch((error: unknown) => {
+      void config.onRedirectError?.(error, url);
+    });
   });
 
   return client;

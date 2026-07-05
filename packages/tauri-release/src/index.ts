@@ -1,5 +1,6 @@
 import {
   copyFileSync,
+  existsSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -243,6 +244,14 @@ export function generateLatestJson(options: GenerateLatestJsonOptions): LatestJs
   const assetsDir = resolve(options.assetsDir);
   const pubDate = normalizePubDate(options.pubDate ?? new Date());
   const sigFiles = listFiles(assetsDir).filter((file) => file.endsWith(".sig"));
+  const orphanSignatures = sigFiles.filter((file) => !existsSync(file.slice(0, -".sig".length)));
+  if (orphanSignatures.length > 0) {
+    throw new Error(
+      `signature files are missing matching assets: ${orphanSignatures
+        .map((file) => basename(file))
+        .join(", ")}`,
+    );
+  }
   const candidates = sigFiles.flatMap((file) => toPlatformCandidates(file));
   const selected = selectPlatformCandidates(candidates);
   const platforms: Record<string, LatestJsonPlatform> = {};
@@ -282,25 +291,36 @@ export function writeLatestJson(path: string, latest: LatestJson): void {
 
 export function verifyLatestJson(input: string | LatestJson): LatestJsonVerification {
   const errors: string[] = [];
-  let latest: LatestJson | null = null;
+  let parsed: unknown = null;
 
   try {
-    latest = typeof input === "string" ? (JSON.parse(input) as LatestJson) : input;
+    parsed = typeof input === "string" ? JSON.parse(input) : input;
   } catch (error) {
     errors.push(`invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
   }
 
+  if (errors.length === 0 && !isRecord(parsed)) {
+    errors.push("latest.json must be an object");
+  }
+
+  const latest = errors.length === 0 ? (parsed as LatestJson) : null;
+
   if (latest !== null) {
     if (!isNonEmptyString(latest.version)) {
       errors.push("version must be a non-empty string");
+    } else if (!isSemver(latest.version)) {
+      errors.push("version must be SemVer");
     }
-    if (!isNonEmptyString(latest.pub_date) || Number.isNaN(Date.parse(latest.pub_date))) {
-      errors.push("pub_date must be an ISO date string");
+    if (!isNonEmptyString(latest.pub_date) || !isRfc3339(latest.pub_date)) {
+      errors.push("pub_date must be an RFC3339 date-time string");
     }
     if (!isRecord(latest.platforms) || Object.keys(latest.platforms).length === 0) {
       errors.push("platforms must contain at least one platform");
     } else {
       for (const [platform, value] of Object.entries(latest.platforms)) {
+        if (!PLATFORM_KEYS.includes(platform as PlatformKey)) {
+          errors.push(`${platform} is not a supported updater platform`);
+        }
         const platformRecord = isRecord(value) ? value : null;
         if (platformRecord === null) {
           errors.push(`${platform} must be an object`);
@@ -327,7 +347,7 @@ export function verifyLatestJson(input: string | LatestJson): LatestJsonVerifica
 
   return {
     ok: errors.length === 0,
-    platforms: latest?.platforms !== undefined ? Object.keys(latest.platforms) : [],
+    platforms: isRecord(latest?.platforms) ? Object.keys(latest.platforms) : [],
     errors,
   };
 }
@@ -456,7 +476,7 @@ function joinUrl(base: string, assetName: string): string {
 }
 
 function normalizeSemver(version: string): string {
-  if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/u.test(version)) {
+  if (!isSemver(version)) {
     throw new Error("baseVersion must be a semver string");
   }
   return version.split("+")[0] ?? version;
@@ -484,10 +504,21 @@ function normalizePubDate(date: Date | string): string {
   if (date instanceof Date) {
     return date.toISOString().replace(/\.\d{3}Z$/u, "Z");
   }
-  if (Number.isNaN(Date.parse(date))) {
-    throw new Error("pubDate must be parseable as a date");
+  if (!isRfc3339(date)) {
+    throw new Error("pubDate must be an RFC3339 date-time string");
   }
   return date;
+}
+
+function isSemver(version: string): boolean {
+  return /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u.test(version);
+}
+
+function isRfc3339(date: string): boolean {
+  return (
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u.test(date) &&
+    !Number.isNaN(Date.parse(date))
+  );
 }
 
 function escapeRegExp(value: string): string {

@@ -145,6 +145,46 @@ describe("@pickforge/tauri-release", () => {
       errors: [],
     });
   });
+
+  it("rejects orphan signatures before generating latest.json", () => {
+    const root = tempRoot();
+    writeFileSync(join(root, "PickGauge_1.0.0_amd64.AppImage.sig"), "signature");
+
+    expect(() =>
+      generateLatestJson({
+        assetsDir: root,
+        downloadBaseUrl: "https://github.com/pickforge/pickgauge/releases/download/v1.0.0",
+        pubDate: "2026-07-05T12:00:00Z",
+        version: "1.0.0",
+      }),
+    ).toThrow(/missing matching assets/u);
+  });
+
+  it("rejects malformed latest.json documents", () => {
+    expect(verifyLatestJson("null")).toMatchObject({
+      ok: false,
+      errors: ["latest.json must be an object"],
+    });
+    expect(
+      verifyLatestJson({
+        pub_date: "2026-07-05",
+        version: "next",
+        platforms: {
+          "windwos-x86_64": {
+            signature: "signature",
+            url: "https://example.com/app.exe",
+          },
+        },
+      }),
+    ).toMatchObject({
+      ok: false,
+      errors: expect.arrayContaining([
+        "version must be SemVer",
+        "pub_date must be an RFC3339 date-time string",
+        "windwos-x86_64 is not a supported updater platform",
+      ]),
+    });
+  });
 });
 
 function tempRoot(): string {

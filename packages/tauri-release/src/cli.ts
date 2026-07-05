@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { parseArgs } from "node:util";
+import { fileURLToPath } from "node:url";
 import {
   collectAssets,
   computeNightlyVersion,
@@ -169,7 +170,14 @@ function usage(): void {
   );
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+function isCliEntrypoint(): boolean {
+  if (process.argv[1] === undefined) {
+    return false;
+  }
+  return realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+}
+
+if (isCliEntrypoint()) {
   const code = await runCli();
   process.exitCode = code;
 }

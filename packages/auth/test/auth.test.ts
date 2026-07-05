@@ -130,6 +130,57 @@ describe("@pickforge/auth", () => {
     expect(supabase.from).toHaveBeenCalledTimes(2);
   });
 
+  it("expires the entitlement cache at the first entitlement expiry", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-05T12:00:00Z"));
+    const supabase = mockSupabase({
+      entitlementRows: [
+        {
+          expires_at: "2026-07-05T12:00:05Z",
+          granted_at: "2026-07-05T12:00:00Z",
+          key: "trial",
+          value: true,
+        },
+      ],
+      session: sessionFor("user-1"),
+    });
+    const client = createPickforgeAuthClient({
+      ...baseConfig(),
+      entitlementCacheTtlMs: 60_000,
+    });
+
+    await client.getEntitlements();
+    vi.advanceTimersByTime(5_001);
+    await client.getEntitlements();
+
+    expect(supabase.from).toHaveBeenCalledTimes(2);
+  });
+
+  it("routes redirect listener failures to the configured error handler", async () => {
+    const redirectListeners: Array<(url: string) => void | Promise<void>> = [];
+    const onRedirectError = vi.fn();
+    mockSupabase();
+
+    createPickforgeAuthClient({
+      ...baseConfig(),
+      onRedirectError,
+      redirectListener: {
+        listen(listener) {
+          redirectListeners.push(listener);
+        },
+      },
+    });
+
+    expect(redirectListeners[0]).toBeDefined();
+    redirectListeners[0]?.("pickforge://auth/callback?error=access_denied");
+    await vi.waitFor(() => {
+      expect(onRedirectError).toHaveBeenCalledWith(
+        expect.objectContaining({ message: "OAuth redirect failed: access_denied" }),
+        "pickforge://auth/callback?error=access_denied",
+      );
+    });
+  });
+
   it("subscribes to auth state changes and returns an unsubscribe function", () => {
     const unsubscribe = vi.fn();
     mockSupabase({

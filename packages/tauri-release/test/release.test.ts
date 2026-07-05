@@ -1,6 +1,6 @@
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   collectAssets,
@@ -70,7 +70,14 @@ describe("@pickforge/tauri-release", () => {
       "linux-x86_64",
       "linux-x86_64-appimage",
     ]);
-    expect(platformKeyForAssetName("PickScribe_1.0.0_amd64.deb")).toBe("linux-x86_64-deb");
+    expect(platformKeysForAssetName("PickGauge_1.0.0_amd64.AppImage.tar.gz")).toEqual([
+      "linux-x86_64",
+      "linux-x86_64-appimage",
+    ]);
+    expect(platformKeysForAssetName("PickScribe_1.0.0_amd64.deb")).toEqual([
+      "linux-x86_64",
+      "linux-x86_64-deb",
+    ]);
     expect(platformKeyForAssetName("windows-PickGauge_1.0.0_x64-setup.exe")).toBe(
       "windows-x86_64",
     );
@@ -109,6 +116,22 @@ describe("@pickforge/tauri-release", () => {
     );
   });
 
+  it("rejects duplicate collected basenames", () => {
+    const root = tempRoot();
+    writeFileSyncRecursive(join(root, "target/release/bundle/macos-intel/PickGauge.app.tar.gz"), "intel");
+    writeFileSyncRecursive(
+      join(root, "target/release/bundle/macos-apple-silicon/PickGauge.app.tar.gz"),
+      "arm",
+    );
+    const config = baseConfig({
+      artifactRoot: "target/release/bundle",
+      outputDir: "release-assets",
+      patterns: ["*.app.tar.gz"],
+    });
+
+    expect(() => collectAssets(config, { repoRoot: root })).toThrow(/duplicate collected asset/u);
+  });
+
   it("generates and verifies latest.json for Linux, macOS, and Windows fixtures", () => {
     const root = tempRoot();
     writeSignedAsset(root, "linux-appimage-PickGauge_1.0.0_amd64.AppImage", "linux-signature");
@@ -144,6 +167,65 @@ describe("@pickforge/tauri-release", () => {
       ],
       errors: [],
     });
+  });
+
+  it("uses Linux debs and v1-compatible AppImage bundles as default Linux updater targets", () => {
+    const debRoot = tempRoot();
+    writeSignedAsset(debRoot, "PickScribe_1.0.0_amd64.deb", "deb-signature");
+
+    const debLatest = generateLatestJson({
+      assetsDir: debRoot,
+      downloadBaseUrl: "https://github.com/pickforge/pickscribe/releases/download/v1.0.0",
+      pubDate: "2026-07-05T12:00:00Z",
+      version: "1.0.0",
+    });
+
+    expect(debLatest.platforms["linux-x86_64"]?.signature).toBe("deb-signature");
+    expect(debLatest.platforms["linux-x86_64-deb"]?.signature).toBe("deb-signature");
+
+    const appImageRoot = tempRoot();
+    writeSignedAsset(appImageRoot, "PickGauge_1.0.0_amd64.AppImage.tar.gz", "appimage-signature");
+
+    const appImageLatest = generateLatestJson({
+      assetsDir: appImageRoot,
+      downloadBaseUrl: "https://github.com/pickforge/pickgauge/releases/download/v1.0.0",
+      pubDate: "2026-07-05T12:00:00Z",
+      version: "1.0.0",
+    });
+
+    expect(appImageLatest.platforms["linux-x86_64"]?.signature).toBe("appimage-signature");
+    expect(appImageLatest.platforms["linux-x86_64-appimage"]?.signature).toBe(
+      "appimage-signature",
+    );
+  });
+
+  it("infers macOS updater platform keys from artifact paths", () => {
+    const root = tempRoot();
+    writeSignedAsset(root, "macos-apple-silicon/PickGauge.app.tar.gz", "mac-arm-signature");
+
+    const latest = generateLatestJson({
+      assetsDir: root,
+      downloadBaseUrl: "https://github.com/pickforge/pickgauge/releases/download/v1.0.0",
+      pubDate: "2026-07-05T12:00:00Z",
+      version: "1.0.0",
+    });
+
+    expect(latest.platforms["darwin-aarch64"]?.signature).toBe("mac-arm-signature");
+  });
+
+  it("rejects duplicate updater basenames before generating latest.json", () => {
+    const root = tempRoot();
+    writeSignedAsset(root, "macos-intel/PickGauge.app.tar.gz", "mac-intel-signature");
+    writeSignedAsset(root, "macos-apple-silicon/PickGauge.app.tar.gz", "mac-arm-signature");
+
+    expect(() =>
+      generateLatestJson({
+        assetsDir: root,
+        downloadBaseUrl: "https://github.com/pickforge/pickgauge/releases/download/v1.0.0",
+        pubDate: "2026-07-05T12:00:00Z",
+        version: "1.0.0",
+      }),
+    ).toThrow(/duplicate updater asset name/u);
   });
 
   it("rejects orphan signatures before generating latest.json", () => {
@@ -184,6 +266,19 @@ describe("@pickforge/tauri-release", () => {
         "windwos-x86_64 is not a supported updater platform",
       ]),
     });
+    expect(
+      verifyLatestJson({
+        version: "v1.2.3",
+        platforms: {
+          "linux-x86_64": {
+            signature: "signature",
+            url: "https://example.com/app.AppImage",
+          },
+        },
+      }),
+    ).toMatchObject({
+      ok: true,
+    });
   });
 });
 
@@ -194,8 +289,13 @@ function tempRoot(): string {
 }
 
 function writeSignedAsset(root: string, name: string, signature: string): void {
-  writeFileSync(join(root, name), "bundle");
-  writeFileSync(join(root, `${name}.sig`), signature);
+  writeFileSyncRecursive(join(root, name), "bundle");
+  writeFileSyncRecursive(join(root, `${name}.sig`), signature);
+}
+
+function writeFileSyncRecursive(path: string, data: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, data);
 }
 
 function baseConfig(collect: TauriReleaseConfig["collect"]): TauriReleaseConfig {

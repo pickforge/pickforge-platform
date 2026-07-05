@@ -65,6 +65,7 @@ export interface PickforgeAuthClient {
   signOut(): Promise<void>;
   getEntitlements(options?: GetEntitlementsOptions): Promise<PickforgeEntitlement[]>;
   onAuthStateChange(listener: (change: PickforgeAuthStateChange) => void): () => void;
+  dispose(): Promise<void>;
 }
 
 interface EntitlementRow {
@@ -96,6 +97,7 @@ export function createPickforgeAuthClient(config: PickforgeAuthConfig): Pickforg
   });
   const cacheTtlMs = config.entitlementCacheTtlMs ?? DEFAULT_ENTITLEMENT_CACHE_TTL_MS;
   let entitlementCache: EntitlementCache | null = null;
+  let disposeRedirectListener: (() => void | Promise<void>) | null = null;
 
   const clearEntitlementCache = (): void => {
     entitlementCache = null;
@@ -215,13 +217,21 @@ export function createPickforgeAuthClient(config: PickforgeAuthConfig): Pickforg
       });
       return () => data.subscription.unsubscribe();
     },
+
+    async dispose() {
+      await disposeRedirectListener?.();
+      disposeRedirectListener = null;
+    },
   };
 
-  config.redirectListener?.listen((url) => {
+  const redirectListenerCleanup = config.redirectListener?.listen((url) => {
     void client.handleRedirect(url).catch((error: unknown) => {
       void config.onRedirectError?.(error, url);
     });
   });
+  if (typeof redirectListenerCleanup === "function") {
+    disposeRedirectListener = redirectListenerCleanup;
+  }
 
   return client;
 }

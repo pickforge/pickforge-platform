@@ -88,7 +88,7 @@ export interface LatestJsonPlatform {
 
 export interface LatestJson {
   version: string;
-  pub_date: string;
+  pub_date?: string;
   platforms: Record<string, LatestJsonPlatform>;
   notes?: string;
 }
@@ -230,14 +230,26 @@ export function collectAssets(
     mkdirSync(outputDir, { recursive: true });
   }
 
-  return assets.map((source) => {
+  const collected: CollectedAsset[] = [];
+  const destinations = new Map<string, string>();
+
+  for (const source of assets) {
     const name = prefix ? `${prefix}-${basename(source)}` : basename(source);
     const destination = join(outputDir, name);
+    const existingSource = destinations.get(destination);
+    if (existingSource !== undefined) {
+      throw new Error(
+        `duplicate collected asset destination ${name}: ${existingSource} and ${source}`,
+      );
+    }
+    destinations.set(destination, source);
     if (!options.dryRun) {
       copyFileSync(source, destination);
     }
-    return { source, destination, name };
-  });
+    collected.push({ source, destination, name });
+  }
+
+  return collected;
 }
 
 export function generateLatestJson(options: GenerateLatestJsonOptions): LatestJson {
@@ -251,6 +263,18 @@ export function generateLatestJson(options: GenerateLatestJsonOptions): LatestJs
         .map((file) => basename(file))
         .join(", ")}`,
     );
+  }
+  const assetNames = new Map<string, string>();
+  for (const sigFile of sigFiles) {
+    const assetPath = sigFile.slice(0, -".sig".length);
+    const assetName = basename(assetPath);
+    const existingPath = assetNames.get(assetName);
+    if (existingPath !== undefined && existingPath !== assetPath) {
+      throw new Error(
+        `duplicate updater asset name ${assetName}: ${existingPath} and ${assetPath}`,
+      );
+    }
+    assetNames.set(assetName, assetPath);
   }
   const candidates = sigFiles.flatMap((file) => toPlatformCandidates(file));
   const selected = selectPlatformCandidates(candidates);
@@ -311,7 +335,10 @@ export function verifyLatestJson(input: string | LatestJson): LatestJsonVerifica
     } else if (!isSemver(latest.version)) {
       errors.push("version must be SemVer");
     }
-    if (!isNonEmptyString(latest.pub_date) || !isRfc3339(latest.pub_date)) {
+    if (
+      latest.pub_date !== undefined &&
+      (!isNonEmptyString(latest.pub_date) || !isRfc3339(latest.pub_date))
+    ) {
       errors.push("pub_date must be an RFC3339 date-time string");
     }
     if (!isRecord(latest.platforms) || Object.keys(latest.platforms).length === 0) {
@@ -357,21 +384,27 @@ export function platformKeyForAssetName(assetName: string): PlatformKey | null {
 }
 
 export function platformKeysForAssetName(assetName: string): PlatformKey[] {
-  if (assetName.endsWith(".AppImage")) {
+  return platformKeysForAssetPath(assetName);
+}
+
+function platformKeysForAssetPath(assetPath: string): PlatformKey[] {
+  const assetName = basename(assetPath);
+  const loweredPath = normalizePath(assetPath).toLowerCase();
+
+  if (assetName.endsWith(".AppImage") || assetName.endsWith(".AppImage.tar.gz")) {
     return ["linux-x86_64", "linux-x86_64-appimage"];
   }
   if (assetName.endsWith(".deb")) {
-    return ["linux-x86_64-deb"];
+    return ["linux-x86_64", "linux-x86_64-deb"];
   }
   if (assetName.endsWith(".msi") || assetName.endsWith(".exe")) {
     return ["windows-x86_64"];
   }
   if (assetName.endsWith(".app.tar.gz")) {
-    const lowered = assetName.toLowerCase();
-    if (/apple-silicon|aarch64|arm64/u.test(lowered)) {
+    if (/apple-silicon|aarch64|arm64/u.test(loweredPath)) {
       return ["darwin-aarch64"];
     }
-    if (/intel|x86_64|x64|amd64/u.test(lowered)) {
+    if (/intel|x86_64|x64|amd64/u.test(loweredPath)) {
       return ["darwin-x86_64"];
     }
   }
@@ -379,12 +412,13 @@ export function platformKeysForAssetName(assetName: string): PlatformKey[] {
 }
 
 function toPlatformCandidates(signatureFile: string): PlatformCandidate[] {
-  const assetName = basename(signatureFile.slice(0, -".sig".length));
-  return platformKeysForAssetName(assetName).map((platform) => ({
+  const assetPath = signatureFile.slice(0, -".sig".length);
+  const assetName = basename(assetPath);
+  return platformKeysForAssetPath(assetPath).map((platform) => ({
     platform,
     assetName,
     signatureFile,
-    priority: platformPriority(assetName),
+    priority: platformPriority(assetName, platform),
   }));
 }
 
@@ -406,8 +440,17 @@ function selectPlatformCandidates(candidates: PlatformCandidate[]): PlatformCand
   return [...byPlatform.values()].sort((left, right) => left.platform.localeCompare(right.platform));
 }
 
-function platformPriority(assetName: string): number {
+function platformPriority(assetName: string, platform: PlatformKey): number {
   const lowered = assetName.toLowerCase();
+  if (platform === "linux-x86_64" && lowered.endsWith(".appimage")) {
+    return 0;
+  }
+  if (platform === "linux-x86_64" && lowered.endsWith(".appimage.tar.gz")) {
+    return 1;
+  }
+  if (platform === "linux-x86_64" && lowered.endsWith(".deb")) {
+    return 2;
+  }
   if (lowered.endsWith("-setup.exe")) {
     return 0;
   }
@@ -479,7 +522,7 @@ function normalizeSemver(version: string): string {
   if (!isSemver(version)) {
     throw new Error("baseVersion must be a semver string");
   }
-  return version.split("+")[0] ?? version;
+  return (version.startsWith("v") ? version.slice(1) : version).split("+")[0] ?? version;
 }
 
 function normalizeShortSha(sha: string): string {
@@ -511,7 +554,7 @@ function normalizePubDate(date: Date | string): string {
 }
 
 function isSemver(version: string): boolean {
-  return /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u.test(version);
+  return /^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u.test(version);
 }
 
 function isRfc3339(date: string): boolean {

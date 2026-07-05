@@ -194,6 +194,23 @@ describe("@pickforge/auth", () => {
 
     expect(unsubscribe).toHaveBeenCalledOnce();
   });
+
+  it("disposes the redirect listener cleanup handle", async () => {
+    const cleanup = vi.fn();
+    mockSupabase();
+    const client = createPickforgeAuthClient({
+      ...baseConfig(),
+      redirectListener: {
+        listen() {
+          return cleanup;
+        },
+      },
+    });
+
+    await client.dispose();
+
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
 });
 
 function baseConfig() {

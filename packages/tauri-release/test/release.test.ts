@@ -90,6 +90,10 @@ describe("@pickforge/tauri-release", () => {
       "windows-x86_64",
       "windows-x86_64-nsis",
     ]);
+    expect(platformKeysForAssetName("windows-PickGauge_1.0.0_x64-setup.nsis.zip")).toEqual([
+      "windows-x86_64",
+      "windows-x86_64-nsis",
+    ]);
     expect(platformKeysForAssetName("windows-PickGauge_1.0.0_x64_en-US.msi")).toEqual([
       "windows-x86_64",
       "windows-x86_64-msi",
@@ -229,7 +233,7 @@ describe("@pickforge/tauri-release", () => {
   it("emits package-specific Linux and Windows updater targets", () => {
     const root = tempRoot();
     writeSignedAsset(root, "PickForge_1.0.0_x86_64.rpm", "rpm-signature");
-    writeSignedAsset(root, "PickForge_1.0.0_x64-setup.exe.zip", "nsis-signature");
+    writeSignedAsset(root, "PickForge_1.0.0_x64-setup.nsis.zip", "nsis-signature");
     writeSignedAsset(root, "PickForge_1.0.0_x64_en-US.msi.zip", "msi-signature");
 
     const latest = generateLatestJson({
@@ -246,6 +250,20 @@ describe("@pickforge/tauri-release", () => {
     expect(latest.platforms["windows-x86_64-msi"]?.signature).toBe("msi-signature");
   });
 
+  it("rejects unsupported Linux updater architectures instead of mislabeling them", () => {
+    const root = tempRoot();
+    writeSignedAsset(root, "PickForge_1.0.0_arm64.AppImage", "arm-signature");
+
+    expect(() =>
+      generateLatestJson({
+        assetsDir: root,
+        downloadBaseUrl: "https://github.com/pickforge/pickforge/releases/download/v1.0.0",
+        pubDate: "2026-07-05T12:00:00Z",
+        version: "1.0.0",
+      }),
+    ).toThrow(/unsupported Linux updater architecture/u);
+  });
+
   it("infers macOS updater platform keys from artifact paths", () => {
     const root = tempRoot();
     writeSignedAsset(root, "macos-apple-silicon/PickGauge.app.tar.gz", "mac-arm-signature");
@@ -258,6 +276,9 @@ describe("@pickforge/tauri-release", () => {
     });
 
     expect(latest.platforms["darwin-aarch64"]?.signature).toBe("mac-arm-signature");
+    expect(latest.platforms["darwin-aarch64"]?.url).toBe(
+      "https://github.com/pickforge/pickgauge/releases/download/v1.0.0/macos-apple-silicon/PickGauge.app.tar.gz",
+    );
   });
 
   it("rejects duplicate updater basenames before generating latest.json", () => {
@@ -313,6 +334,29 @@ describe("@pickforge/tauri-release", () => {
         "windwos-x86_64 is not a supported updater platform",
       ]),
     });
+    expect(
+      verifyLatestJson({
+        pub_date: "2026-02-31T00:00:00Z",
+        version: "1.2.3",
+        platforms: {
+          "linux-x86_64": {
+            signature: "signature",
+            url: "https://example.com/app.AppImage",
+          },
+        },
+      }),
+    ).toMatchObject({
+      ok: false,
+      errors: expect.arrayContaining(["pub_date must be an RFC3339 date-time string"]),
+    });
+    expect(() =>
+      generateLatestJson({
+        assetsDir: tempRoot(),
+        downloadBaseUrl: "https://example.com",
+        pubDate: "2026-02-31T00:00:00Z",
+        version: "1.2.3",
+      }),
+    ).toThrow(/pubDate must be an RFC3339 date-time string/u);
     expect(
       verifyLatestJson({
         version: "v1.2.3",

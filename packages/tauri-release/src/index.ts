@@ -279,7 +279,7 @@ export function generateLatestJson(options: GenerateLatestJsonOptions): LatestJs
     }
     assetNames.set(assetName, assetPath);
   }
-  const candidates = sigFiles.flatMap((file) => toPlatformCandidates(file));
+  const candidates = sigFiles.flatMap((file) => toPlatformCandidates(file, assetsDir));
   const selected = selectPlatformCandidates(candidates);
   const platforms: Record<string, LatestJsonPlatform> = {};
 
@@ -394,6 +394,9 @@ function platformKeysForAssetPath(assetPath: string): PlatformKey[] {
   const assetName = basename(assetPath);
   const loweredPath = normalizePath(assetPath).toLowerCase();
 
+  if (isUnsupportedLinuxArchitecture(assetPath)) {
+    return [];
+  }
   if (assetName.endsWith(".AppImage") || assetName.endsWith(".AppImage.tar.gz")) {
     return ["linux-x86_64", "linux-x86_64-appimage"];
   }
@@ -406,7 +409,11 @@ function platformKeysForAssetPath(assetPath: string): PlatformKey[] {
   if (assetName.endsWith(".msi") || assetName.endsWith(".msi.zip")) {
     return ["windows-x86_64", "windows-x86_64-msi"];
   }
-  if (assetName.endsWith(".exe") || assetName.endsWith(".exe.zip")) {
+  if (
+    assetName.endsWith(".exe") ||
+    assetName.endsWith(".exe.zip") ||
+    assetName.endsWith(".nsis.zip")
+  ) {
     return ["windows-x86_64", "windows-x86_64-nsis"];
   }
   if (assetName.endsWith(".app.tar.gz")) {
@@ -420,10 +427,20 @@ function platformKeysForAssetPath(assetPath: string): PlatformKey[] {
   return [];
 }
 
-function toPlatformCandidates(signatureFile: string): PlatformCandidate[] {
+function toPlatformCandidates(signatureFile: string, assetsDir: string): PlatformCandidate[] {
   const assetPath = signatureFile.slice(0, -".sig".length);
-  const assetName = basename(assetPath);
-  return platformKeysForAssetPath(assetPath).map((platform) => ({
+  const assetName = normalizePath(relative(assetsDir, assetPath));
+  const platforms = platformKeysForAssetPath(assetPath);
+  if (
+    platforms.length === 0 &&
+    isLinuxUpdaterAsset(assetPath) &&
+    isUnsupportedLinuxArchitecture(assetPath)
+  ) {
+    throw new Error(
+      `unsupported Linux updater architecture for ${assetName}; only x86_64 is supported`,
+    );
+  }
+  return platforms.map((platform) => ({
     platform,
     assetName,
     signatureFile,
@@ -463,10 +480,18 @@ function platformPriority(assetName: string, platform: PlatformKey): number {
   if (platform === "linux-x86_64" && lowered.endsWith(".rpm")) {
     return 3;
   }
-  if (lowered.endsWith("-setup.exe") || lowered.endsWith("-setup.exe.zip")) {
+  if (
+    lowered.endsWith("-setup.exe") ||
+    lowered.endsWith("-setup.exe.zip") ||
+    lowered.endsWith("-setup.nsis.zip")
+  ) {
     return 0;
   }
-  if (lowered.endsWith(".exe") || lowered.endsWith(".exe.zip")) {
+  if (
+    lowered.endsWith(".exe") ||
+    lowered.endsWith(".exe.zip") ||
+    lowered.endsWith(".nsis.zip")
+  ) {
     return 1;
   }
   if (lowered.endsWith(".msi") || lowered.endsWith(".msi.zip")) {
@@ -527,7 +552,7 @@ function resolvePath(root: string, path: string): string {
 
 function joinUrl(base: string, assetName: string): string {
   const normalizedBase = base.endsWith("/") ? base.slice(0, -1) : base;
-  return `${normalizedBase}/${encodeURIComponent(assetName)}`;
+  return `${normalizedBase}/${assetName.split("/").map(encodeURIComponent).join("/")}`;
 }
 
 function normalizeSemver(version: string): string {
@@ -570,9 +595,65 @@ function isSemver(version: string): boolean {
 }
 
 function isRfc3339(date: string): boolean {
+  const match =
+    /^(?<year>\d{4})-(?<month>\d{2})-(?<day>\d{2})T(?<hour>\d{2}):(?<minute>\d{2}):(?<second>\d{2})(?:\.\d+)?(?<zone>Z|[+-]\d{2}:\d{2})$/u.exec(
+      date,
+    );
+  if (match?.groups === undefined || Number.isNaN(Date.parse(date))) {
+    return false;
+  }
+  const year = Number(match.groups.year);
+  const month = Number(match.groups.month);
+  const day = Number(match.groups.day);
+  const hour = Number(match.groups.hour);
+  const minute = Number(match.groups.minute);
+  const second = Number(match.groups.second);
+  const zone = match.groups.zone ?? "";
+  if (
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > daysInMonth(year, month) ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59
+  ) {
+    return false;
+  }
+  if (zone !== "Z") {
+    const zoneHour = Number(zone.slice(1, 3));
+    const zoneMinute = Number(zone.slice(4, 6));
+    if (zoneHour > 23 || zoneMinute > 59) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function daysInMonth(year: number, month: number): number {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+function isLinuxUpdaterAsset(assetPath: string): boolean {
+  const assetName = basename(assetPath);
   return (
-    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u.test(date) &&
-    !Number.isNaN(Date.parse(date))
+    assetName.endsWith(".AppImage") ||
+    assetName.endsWith(".AppImage.tar.gz") ||
+    assetName.endsWith(".deb") ||
+    assetName.endsWith(".rpm")
+  );
+}
+
+function isUnsupportedLinuxArchitecture(assetPath: string): boolean {
+  if (!isLinuxUpdaterAsset(assetPath)) {
+    return false;
+  }
+  const loweredPath = normalizePath(assetPath).toLowerCase();
+  if (/(?:^|[^a-z0-9])(?:x86_64|amd64|x64)(?:[^a-z0-9]|$)/u.test(loweredPath)) {
+    return false;
+  }
+  return /(?:^|[^a-z0-9])(?:aarch64|arm64|armv7l?|i686|x86)(?:[^a-z0-9]|$)/u.test(
+    loweredPath,
   );
 }
 

@@ -1,0 +1,80 @@
+@import "./tokens.css";
+@import "./fonts.css";
+@import "./primitives.css";
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+}
+
+:root {
+  color-scheme: dark;
+  scrollbar-color: var(--pf-hairline-strong) transparent;
+  scrollbar-width: thin;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+body {
+  background: var(--pf-surface);
+  color: var(--pf-text-hi);
+  font-family: var(--pf-font-sans);
+  font-size: var(--pf-size-body-md);
+  font-weight: var(--pf-weight-regular);
+  line-height: 1.45;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+select,
+textarea {
+  color: inherit;
+  font: inherit;
+}
+
+h1,
+h2,
+h3,
+h4,
+p {
+  margin: 0;
+}
+
+:focus-visible {
+  outline: var(--pf-hairline-width) solid var(--pf-ember-deep);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--pf-ember) 35%, transparent);
+}
+
+::-webkit-scrollbar {
+  height: 8px;
+  width: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--pf-hairline-strong);
+  border-radius: var(--pf-radius-pill);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--pf-text-low);
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}

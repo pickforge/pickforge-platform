@@ -1,0 +1,30 @@
+{
+  "name": "@pickforge/brand",
+  "version": "0.1.0",
+  "description": "Pickforge CSS tokens, fonts, reset, and primitives.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": [
+    "**/*.css"
+  ],
+  "files": [
+    "src"
+  ],
+  "exports": {
+    "./tokens.css": "./src/tokens.css",
+    "./fonts.css": "./src/fonts.css",
+    "./global.css": "./src/global.css",
+    "./primitives.css": "./src/primitives.css",
+    "./compat-unprefixed.css": "./src/compat-unprefixed.css"
+  },
+  "scripts": {
+    "build": "node -e \"for (const name of ['tokens','fonts','global','primitives','compat-unprefixed']) require('node:fs').accessSync('src/' + name + '.css')\""
+  },
+  "dependencies": {
+    "@fontsource/geist-mono": "^5.2.8",
+    "@fontsource/geist-sans": "^5.2.5"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

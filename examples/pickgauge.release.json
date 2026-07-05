@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "repository": "pickforge/pickgauge",
+  "appName": "PickGauge",
+  "tauriConfig": "src-tauri/tauri.conf.json",
+  "collect": {
+    "artifactRoot": "src-tauri/target/release/bundle",
+    "outputDir": "release-assets",
+    "patterns": [
+      "*.AppImage",
+      "*.AppImage.sig",
+      "*.deb",
+      "*.deb.sig",
+      "*.rpm",
+      "*.rpm.sig",
+      "*.msi",
+      "*.msi.sig",
+      "*.exe",
+      "*.exe.sig",
+      "*.dmg",
+      "*.app.tar.gz",
+      "*.app.tar.gz.sig"
+    ]
+  },
+  "stable": {
+    "tagPrefix": "v",
+    "latestJsonAsset": "latest.json"
+  },
+  "nightly": {
+    "enabled": true,
+    "branch": "main",
+    "tagPrefix": "nightly-",
+    "latestJsonAsset": "nightly.json"
+  },
+  "updater": {
+    "requiredPlatforms": [
+      "linux-x86_64"
+    ]
+  }
+}

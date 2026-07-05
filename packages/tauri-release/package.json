@@ -1,0 +1,25 @@
+{
+  "name": "@pickforge/tauri-release",
+  "version": "0.1.0",
+  "description": "Signed Tauri release and updater-feed automation for Pickforge apps.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "pickforge-tauri-release": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts src/cli.ts --format esm --dts --clean --splitting false --out-dir dist"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

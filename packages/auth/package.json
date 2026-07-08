@@ -1,6 +1,6 @@
 {
   "name": "@pickforge/auth",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "UI-free Supabase Auth and entitlements wrapper for Pickforge apps.",
   "license": "MIT",
   "type": "module",

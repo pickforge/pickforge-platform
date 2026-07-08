@@ -28,10 +28,13 @@
 .pf-titlebar--brand-right {
   padding: 0 var(--pf-space-lg) 0 var(--pf-space-md);
 }
+/* Explicit column anchors: without a center child, grid auto-placement would
+ * drop the right slot into the middle `auto` track. */
 .pf-titlebar-left {
   display: inline-flex;
   align-items: center;
   gap: var(--pf-space-md);
+  grid-column: 1;
   justify-self: start;
   min-width: 0;
 }
@@ -39,6 +42,7 @@
   display: inline-flex;
   align-items: center;
   gap: var(--pf-space-md);
+  grid-column: 3;
   justify-self: end;
   min-width: 0;
 }
@@ -83,9 +87,11 @@
   white-space: nowrap;
 }
 /* With decorations off, Tauri only starts a drag from the exact element that
- * carries data-tauri-drag-region — descendants swallow the click. Non-interactive
- * labels fall through to the draggable parent; the dot-only pill keeps hover so
- * its native tooltip stays reachable. */
+ * carries data-tauri-drag-region — descendants swallow the click. Put the
+ * attribute on the bar AND on each slot wrapper (.pf-titlebar-left/-right and
+ * any center slot), as the reference app does. Non-interactive labels fall
+ * through via pointer-events; the dot-only pill keeps hover so its native
+ * tooltip stays reachable. */
 .pf-titlebar .pf-mark,
 .pf-titlebar .pf-wordmark,
 .pf-brand .pf-eyebrow-row,
@@ -351,7 +357,9 @@
 
 /* ---- SelectionBracket: four L-corner marks framing a child. Colors and radius
  * are per-instance (--pf-bracket-color / --pf-bracket-corner-color /
- * --pf-bracket-radius), set by the consuming component. */
+ * --pf-bracket-radius), and each corner's geometry (width/height + the
+ * top/right/bottom/left offsets, negative = outside the box) comes from the
+ * consuming component as inline styles — this file ships no default arm size. */
 .pf-bracket {
   position: relative;
   display: inline-block;

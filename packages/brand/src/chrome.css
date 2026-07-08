@@ -1,0 +1,383 @@
+/* Pickforge Studio shared app chrome. Framework-neutral primitives shared by
+ * every Studio app (titlebar shell, window controls, resize handles, statusbar,
+ * eyebrow/bracket/pill motifs). References only `--pf-*` custom properties.
+ *
+ * Import order: layer this AFTER the token layer so the vars resolve —
+ *   `@pickforge/brand/tokens.css` (or `compat-unprefixed.css`) THEN this file.
+ * This file must NOT @import tokens itself. Scrollbar rules stay single-sourced
+ * in global.css and are intentionally absent here. */
+
+/* ---- Titlebar shell (custom window chrome) ----
+ * Three-column grid: brand (left) · optional center slot · status + controls
+ * (right). The whole bar carries data-tauri-drag-region; interactive children
+ * opt out by omitting it. minmax(0, …) side tracks yield before the center. */
+.pf-titlebar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  height: var(--pf-titlebar-h);
+  padding: 0 var(--pf-space-sm) 0 var(--pf-space-lg);
+  border-bottom: var(--pf-hairline-width) solid var(--pf-hairline);
+  flex: none;
+  user-select: none;
+}
+/* macOS parks the window controls on the LEFT (and the brand on the RIGHT). */
+.pf-titlebar--controls-left {
+  padding: 0 var(--pf-space-lg) 0 var(--pf-space-sm);
+}
+.pf-titlebar--brand-right {
+  padding: 0 var(--pf-space-lg) 0 var(--pf-space-md);
+}
+.pf-titlebar-left {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--pf-space-md);
+  justify-self: start;
+  min-width: 0;
+}
+.pf-titlebar-right {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--pf-space-md);
+  justify-self: end;
+  min-width: 0;
+}
+.pf-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--pf-space-md);
+  min-width: 0;
+  overflow: hidden;
+}
+.pf-brand .pf-mark {
+  flex: none;
+}
+/* Brand mark: hairline selection frame with its top-right corner replaced by a
+ * glowing ember dot. */
+.pf-mark {
+  position: relative;
+  width: 18px;
+  height: 18px;
+  border: var(--pf-bracket-width) solid var(--pf-text-med);
+  border-radius: 4px;
+}
+.pf-mark::after {
+  content: "";
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--pf-radius-pill);
+  background: var(--pf-ember);
+  box-shadow: 0 0 9px 0 var(--pf-ember-glow), 0 0 0 2px var(--pf-surface);
+}
+.pf-wordmark {
+  font-family: var(--pf-font-sans);
+  font-weight: var(--pf-weight-bold);
+  font-size: var(--pf-size-title-lg);
+  letter-spacing: -0.02em;
+  color: var(--pf-text-hi);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* With decorations off, Tauri only starts a drag from the exact element that
+ * carries data-tauri-drag-region — descendants swallow the click. Non-interactive
+ * labels fall through to the draggable parent; the dot-only pill keeps hover so
+ * its native tooltip stays reachable. */
+.pf-titlebar .pf-mark,
+.pf-titlebar .pf-wordmark,
+.pf-brand .pf-eyebrow-row,
+.pf-titlebar-right .pf-pill {
+  pointer-events: none;
+}
+.pf-titlebar-right .pf-pill--dot {
+  pointer-events: auto;
+}
+
+/* ---- Window controls (frameless) ----
+ * Neutral chrome, never the composition's ember. The close button is the one
+ * exception: it takes the danger wash on hover from --pf-winctl-close-hover. */
+.pf-winctl {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--pf-winctl-gap);
+  flex: none;
+  -webkit-app-region: no-drag;
+}
+.pf-winctl-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--pf-winctl-btn-w);
+  height: var(--pf-winctl-btn-h);
+  border: none;
+  background: transparent;
+  color: var(--pf-text-med);
+  border-radius: var(--pf-radius-sm);
+  cursor: pointer;
+  transition: background var(--pf-dur-fast) var(--pf-ease-forge),
+    color var(--pf-dur-fast) var(--pf-ease-forge);
+}
+.pf-winctl-btn:hover {
+  background: var(--pf-item-fill);
+  color: var(--pf-text-hi);
+}
+.pf-winctl-btn:active {
+  background: var(--pf-surface-2);
+}
+.pf-winctl-btn--close:hover {
+  background: var(--pf-winctl-close-hover);
+  color: var(--pf-text-hi);
+}
+.pf-winctl-icon {
+  display: block;
+}
+
+/* ---- Resize handles (frameless) ----
+ * Thin transparent hit zones pinned to each edge/corner restore the resize
+ * cursor and start a native resize-drag. Corners sit above edges so diagonal
+ * resize wins where they overlap. */
+.pf-resize {
+  position: fixed;
+  z-index: 1000;
+}
+.pf-resize--n { top: 0; left: 0; right: 0; height: 4px; cursor: ns-resize; }
+.pf-resize--s { bottom: 0; left: 0; right: 0; height: 4px; cursor: ns-resize; }
+.pf-resize--w { top: 0; bottom: 0; left: 0; width: 4px; cursor: ew-resize; }
+.pf-resize--e { top: 0; bottom: 0; right: 0; width: 4px; cursor: ew-resize; }
+.pf-resize--nw { top: 0; left: 0; width: 9px; height: 9px; cursor: nwse-resize; z-index: 1001; }
+.pf-resize--ne { top: 0; right: 0; width: 9px; height: 9px; cursor: nesw-resize; z-index: 1001; }
+.pf-resize--sw { bottom: 0; left: 0; width: 9px; height: 9px; cursor: nesw-resize; z-index: 1001; }
+.pf-resize--se { bottom: 0; right: 0; width: 9px; height: 9px; cursor: nwse-resize; z-index: 1001; }
+
+/* ---- Statusbar ----
+ * LEFT = live context, RIGHT = app utilities / brand line. */
+.pf-statusbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--pf-space-md);
+  height: 24px;
+  padding: 0 var(--pf-space-md);
+  flex: none;
+  border-top: var(--pf-hairline-width) solid var(--pf-hairline);
+  background: var(--pf-surface-1);
+  font-family: var(--pf-font-mono);
+  font-size: var(--pf-size-eyebrow);
+  letter-spacing: 0.04em;
+  color: var(--pf-text-low);
+}
+.pf-statusbar-left {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--pf-space-sm);
+  min-width: 0;
+}
+.pf-statusbar-item {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pf-statusbar-right {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--pf-space-sm);
+  flex: none;
+}
+
+/* ---- MonoEyebrow: uppercase, wide-tracked section label + `[` tick rail ---- */
+.pf-eyebrow {
+  font-family: var(--pf-font-mono);
+  font-size: var(--pf-size-eyebrow);
+  font-weight: var(--pf-weight-medium);
+  letter-spacing: var(--pf-tracking-eyebrow);
+  text-transform: uppercase;
+  color: var(--pf-text-low);
+  margin: 0;
+}
+.pf-eyebrow-row {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--pf-space-sm);
+}
+.pf-eyebrow-tick {
+  width: 5px;
+  height: 11px;
+  border-radius: 2px 0 0 2px;
+  background: transparent;
+  border: var(--pf-bracket-width) solid var(--pf-text-low);
+  border-right: none;
+  flex: none;
+}
+
+/* ---- StatusPill + bracket indicator + pulse ring ---- */
+.pf-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--pf-space-sm);
+  padding: 3px var(--pf-space-md) 3px var(--pf-space-sm);
+  border-radius: 3px;
+  border: var(--pf-hairline-width) solid var(--pf-hairline);
+  background: var(--pf-item-fill);
+  font-family: var(--pf-font-mono);
+  font-size: var(--pf-size-eyebrow);
+  font-weight: var(--pf-weight-medium);
+  letter-spacing: var(--pf-tracking-eyebrow);
+  text-transform: uppercase;
+  color: var(--pf-text-med);
+  white-space: nowrap;
+}
+.pf-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--pf-radius-pill);
+  background: var(--pf-intent, var(--pf-ember));
+  flex: none;
+}
+/* Inside a status pill the indicator IS the brand bracket — a `[` in the
+ * semantic intent color. EmberDot stays round. */
+.pf-pill .pf-dot {
+  width: 5px;
+  height: 11px;
+  border-radius: 2px 0 0 2px;
+  background: transparent;
+  border: var(--pf-bracket-width) solid var(--pf-intent, var(--pf-ember));
+  border-right: none;
+}
+.pf-pill--dot {
+  padding: 3px;
+  gap: 0;
+}
+.pf-dot--pulsing {
+  position: relative;
+}
+.pf-dot--pulsing::after {
+  content: "";
+  position: absolute;
+  inset: calc(var(--pf-space-xs) * -1);
+  border: var(--pf-hairline-width) solid var(--pf-intent, var(--pf-ember));
+  border-radius: inherit;
+  opacity: 0;
+  pointer-events: none;
+  transform: scale(0.72);
+  transform-origin: center;
+  animation: pf-pulse var(--pf-dur-pulse) var(--pf-ease-out) infinite;
+  will-change: opacity, transform;
+}
+@keyframes pf-pulse {
+  0% {
+    opacity: 0.28;
+    transform: scale(0.72);
+  }
+  70% {
+    opacity: 0;
+    transform: scale(1.65);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.65);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pf-dot--pulsing::after {
+    animation: none;
+    opacity: 0;
+  }
+}
+
+/* ---- Quick-launch chip: bracketed command token with a `[` left rail ---- */
+.pf-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--pf-space-sm);
+  padding: 3px var(--pf-space-sm) 3px var(--pf-space-xs);
+  border-radius: 3px;
+  border: var(--pf-hairline-width) solid var(--pf-hairline);
+  background: var(--pf-surface-1);
+  color: var(--pf-text-med);
+  font-family: var(--pf-font-mono);
+  font-size: var(--pf-size-body-sm);
+  font-weight: var(--pf-weight-regular);
+  letter-spacing: 0;
+  cursor: pointer;
+  transition: background var(--pf-dur-fast) var(--pf-ease-forge),
+    border-color var(--pf-dur-fast) var(--pf-ease-forge),
+    color var(--pf-dur-fast) var(--pf-ease-forge);
+}
+.pf-chip::before {
+  content: "";
+  align-self: stretch;
+  width: 4px;
+  margin: 3px 0;
+  border: var(--pf-bracket-width) solid var(--pf-hairline-strong);
+  border-right: none;
+  border-radius: 2px 0 0 2px;
+  flex: none;
+  transition: border-color var(--pf-dur-fast) var(--pf-ease-forge);
+}
+.pf-chip:hover:not(:disabled) {
+  background: var(--pf-surface-2);
+  border-color: var(--pf-hairline-strong);
+  color: var(--pf-text-hi);
+}
+.pf-chip:hover:not(:disabled)::before {
+  border-color: var(--pf-text-hi);
+}
+.pf-chip--ember {
+  border-color: var(--pf-hairline-strong);
+  color: var(--pf-text-hi);
+}
+.pf-chip--ember::before {
+  border-color: var(--pf-text-hi);
+}
+.pf-chip-label {
+  white-space: nowrap;
+}
+.pf-chip-hint {
+  margin-left: var(--pf-space-xs);
+  padding-left: var(--pf-space-sm);
+  border-left: var(--pf-hairline-width) solid var(--pf-hairline);
+  color: var(--pf-text-low);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+}
+.pf-chip:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ---- SelectionBracket: four L-corner marks framing a child. Colors and radius
+ * are per-instance (--pf-bracket-color / --pf-bracket-corner-color /
+ * --pf-bracket-radius), set by the consuming component. */
+.pf-bracket {
+  position: relative;
+  display: inline-block;
+  transition: opacity var(--pf-dur-standard) var(--pf-ease-forge);
+}
+.pf-bracket-corner {
+  position: absolute;
+  pointer-events: none;
+}
+.pf-bracket-corner.tl {
+  border-top: var(--pf-bracket-width) solid var(--pf-bracket-color);
+  border-left: var(--pf-bracket-width) solid var(--pf-bracket-color);
+  border-top-left-radius: var(--pf-bracket-radius);
+}
+.pf-bracket-corner.tr {
+  border-top: var(--pf-bracket-width) solid var(--pf-bracket-corner-color);
+  border-right: var(--pf-bracket-width) solid var(--pf-bracket-corner-color);
+  border-top-right-radius: var(--pf-bracket-radius);
+}
+.pf-bracket-corner.bl {
+  border-bottom: var(--pf-bracket-width) solid var(--pf-bracket-color);
+  border-left: var(--pf-bracket-width) solid var(--pf-bracket-color);
+  border-bottom-left-radius: var(--pf-bracket-radius);
+}
+.pf-bracket-corner.br {
+  border-bottom: var(--pf-bracket-width) solid var(--pf-bracket-color);
+  border-right: var(--pf-bracket-width) solid var(--pf-bracket-color);
+  border-bottom-right-radius: var(--pf-bracket-radius);
+}

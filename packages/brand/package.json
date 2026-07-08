@@ -1,6 +1,6 @@
 {
   "name": "@pickforge/brand",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Pickforge CSS tokens, fonts, reset, and primitives.",
   "license": "MIT",
   "type": "module",
@@ -15,10 +15,11 @@
     "./fonts.css": "./src/fonts.css",
     "./global.css": "./src/global.css",
     "./primitives.css": "./src/primitives.css",
+    "./chrome.css": "./src/chrome.css",
     "./compat-unprefixed.css": "./src/compat-unprefixed.css"
   },
   "scripts": {
-    "build": "node -e \"for (const name of ['tokens','fonts','global','primitives','compat-unprefixed']) require('node:fs').accessSync('src/' + name + '.css')\""
+    "build": "node -e \"for (const name of ['tokens','fonts','global','primitives','chrome','compat-unprefixed']) require('node:fs').accessSync('src/' + name + '.css')\""
   },
   "dependencies": {
     "@fontsource/geist-mono": "^5.2.8",

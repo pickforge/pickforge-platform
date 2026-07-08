@@ -15,6 +15,20 @@ describe("@pickforge/brand CSS exports", () => {
     }
   });
 
+  it("exports the shared app chrome and keeps it token-only", () => {
+    const packageJson = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as {
+      exports: Record<string, string>;
+    };
+    expect(packageJson.exports).toHaveProperty("./chrome.css", "./src/chrome.css");
+
+    const chrome = readFileSync(join(packageRoot, "src/chrome.css"), "utf8");
+    for (const selector of [".pf-titlebar", ".pf-mark", ".pf-winctl", ".pf-resize", ".pf-statusbar"]) {
+      expect(chrome).toContain(selector);
+    }
+    expect(chrome).not.toMatch(/#[0-9a-fA-F]{3,8}\b/);
+    expect(chrome).not.toMatch(/^\s*@import\b/m);
+  });
+
   it("keeps canonical prefixed tokens and unprefixed compatibility tokens", () => {
     const tokens = readFileSync(join(packageRoot, "src/tokens.css"), "utf8");
     const compat = readFileSync(join(packageRoot, "src/compat-unprefixed.css"), "utf8");

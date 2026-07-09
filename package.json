@@ -8,7 +8,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "bun run --cwd packages/tauri-release build && bun run --cwd packages/auth build && bun run --cwd packages/brand build && bun run --cwd packages/flags build && bun run --cwd packages/billing build",
+    "build": "bun run --cwd packages/tauri-release build && bun run --cwd packages/auth build && bun run --cwd packages/brand build && bun run --cwd packages/flags build && bun run --cwd packages/billing build && bun run --cwd packages/edge-shared build",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "typecheck": "tsc -p tsconfig.json --noEmit",

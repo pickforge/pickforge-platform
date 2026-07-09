@@ -1,0 +1,22 @@
+{
+  "name": "@pickforge/edge-shared",
+  "version": "0.4.0",
+  "description": "Deno-compatible shared helpers for Pickforge Edge Functions.",
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --clean --splitting false --out-dir dist"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,6 +1,9 @@
 # Supabase
 
-The initial auth schema is limited to user profiles and app entitlements.
-Teams, billing, sync, and skill packs are intentionally out of scope.
+Canonical platform migrations live in `migrations/`.
 
-Run migrations with the target Supabase project before integrating app sign-in.
+`functions/` contains Edge Functions deployed to the shared platform Supabase project. App-specific Edge Functions live in app repos and import shared helpers with `npm:` specifiers.
+
+Deploy shared functions to the shared platform project. `stripe-webhook` has `verify_jwt = false` in `config.toml` because Stripe does not send Supabase JWTs; the equivalent deploy override is `supabase functions deploy stripe-webhook --no-verify-jwt`.
+
+Run migrations with the target Supabase project before integrating apps.

@@ -15,18 +15,18 @@
     },
     "packages/auth": {
       "name": "@pickforge/auth",
-      "version": "0.4.0",
+      "version": "0.5.0",
       "dependencies": {
         "@supabase/supabase-js": "^2.110.0",
       },
     },
     "packages/billing": {
       "name": "@pickforge/billing",
-      "version": "0.4.0",
+      "version": "0.5.0",
     },
     "packages/brand": {
       "name": "@pickforge/brand",
-      "version": "0.4.0",
+      "version": "0.5.0",
       "dependencies": {
         "@fontsource/geist-mono": "^5.2.8",
         "@fontsource/geist-sans": "^5.2.5",
@@ -34,15 +34,19 @@
     },
     "packages/edge-shared": {
       "name": "@pickforge/edge-shared",
-      "version": "0.4.0",
+      "version": "0.5.0",
     },
     "packages/flags": {
       "name": "@pickforge/flags",
-      "version": "0.4.0",
+      "version": "0.5.0",
+    },
+    "packages/sync": {
+      "name": "@pickforge/sync",
+      "version": "0.5.0",
     },
     "packages/tauri-release": {
       "name": "@pickforge/tauri-release",
-      "version": "0.4.0",
+      "version": "0.5.0",
       "bin": {
         "pickforge-tauri-release": "dist/cli.js",
       },
@@ -142,6 +146,8 @@
     "@pickforge/edge-shared": ["@pickforge/edge-shared@workspace:packages/edge-shared"],
 
     "@pickforge/flags": ["@pickforge/flags@workspace:packages/flags"],
+
+    "@pickforge/sync": ["@pickforge/sync@workspace:packages/sync"],
 
     "@pickforge/tauri-release": ["@pickforge/tauri-release@workspace:packages/tauri-release"],
 

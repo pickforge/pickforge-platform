@@ -1,0 +1,22 @@
+{
+  "name": "@pickforge/sync",
+  "version": "0.5.0",
+  "description": "UI-free settings sync helpers for Pickforge apps.",
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --clean --splitting false --out-dir dist"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

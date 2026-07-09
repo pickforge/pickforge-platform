@@ -32,6 +32,10 @@
         "@fontsource/geist-sans": "^5.2.5",
       },
     },
+    "packages/edge-shared": {
+      "name": "@pickforge/edge-shared",
+      "version": "0.4.0",
+    },
     "packages/flags": {
       "name": "@pickforge/flags",
       "version": "0.4.0",
@@ -134,6 +138,8 @@
     "@pickforge/billing": ["@pickforge/billing@workspace:packages/billing"],
 
     "@pickforge/brand": ["@pickforge/brand@workspace:packages/brand"],
+
+    "@pickforge/edge-shared": ["@pickforge/edge-shared@workspace:packages/edge-shared"],
 
     "@pickforge/flags": ["@pickforge/flags@workspace:packages/flags"],
 

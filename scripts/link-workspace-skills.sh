@@ -20,8 +20,11 @@ link_into() {
     ln -sfn "$repo_dir/skills/$name" "$link"
     echo "linked $link"
   done
-  if [[ -d "$target/.git" ]]; then
-    local exclude="$target/.git/info/exclude"
+  if [[ -e "$target/.git" ]]; then
+    local exclude
+    exclude="$(git -C "$target" rev-parse --git-path info/exclude)"
+    [[ "$exclude" = /* ]] || exclude="$target/$exclude"
+    mkdir -p "$(dirname "$exclude")"
     for pattern in ".claude/skills/$name" ".agents/skills/$name"; do
       grep -qxF "$pattern" "$exclude" 2>/dev/null || echo "$pattern" >> "$exclude"
     done

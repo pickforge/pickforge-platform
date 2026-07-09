@@ -49,8 +49,9 @@ fine, the good run reuses the draft, but check step 4 carefully afterwards.
 gh release view vX.Y.Z --json assets --jq '.assets[].name'
 ```
 
-- Every platform present: AppImage/deb/rpm + `.sig`, msi/exe + `.sig`, dmg,
-  `.app.tar.gz` + `.sig`.
+- Every asset the app's `<app>.release.json` expects is present — the
+  `collect.patterns` list and `updater.requiredPlatforms` are authoritative,
+  not a fixed matrix (some apps ship fewer platforms).
 - No assets carrying an older version in the filename (leftovers from a
   cancelled run). Delete any: `gh release delete-asset vX.Y.Z <name>`.
 - `latest.json` platform URLs all point at vX.Y.Z. The generator excludes
@@ -60,14 +61,19 @@ gh release view vX.Y.Z --json assets --jq '.assets[].name'
 If `latest.json` needs repair, regenerate locally and re-upload:
 
 ```bash
+rm -rf release-assets   # stale local assets leak into the regenerated feed
 gh release download vX.Y.Z --dir release-assets --pattern '*'
 bun run pickforge-tauri-release generate-latest-json \
+  --config <app>.release.json \
   --assets-dir release-assets --version X.Y.Z \
   --download-base-url "https://github.com/pickforge/<app>/releases/download/vX.Y.Z" \
   --out latest.json
 bun run pickforge-tauri-release verify-latest-json --input latest.json
 gh release upload vX.Y.Z latest.json --clobber
 ```
+
+(`--config` matters: the CLI defaults to `pickforge.release.json`, which is the
+wrong app everywhere but pickforge.)
 
 ## 5. Hand off
 

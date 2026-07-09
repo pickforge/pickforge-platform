@@ -17,4 +17,5 @@ await auth.startOAuth("github");
 ```
 
 The package handles PKCE OAuth redirects and reads entitlements from Supabase.
-App UI, billing, teams, and offline product behavior stay in app repos.
+Billing server helpers live in `@pickforge/billing`.
+App UI, teams, and offline product behavior stay in app repos.

@@ -5,7 +5,8 @@ import { fileURLToPath } from "node:url";
 import {
   collectAssets,
   computeNightlyVersion,
-  generateLatestJson,
+  fixAppImage,
+  generateLatestJsonReport,
   loadReleaseConfig,
   verifyLatestJson,
   writeLatestJson,
@@ -17,7 +18,8 @@ type CliCommand =
   | "compute-nightly-version"
   | "collect-assets"
   | "generate-latest-json"
-  | "verify-latest-json";
+  | "verify-latest-json"
+  | "fix-appimage";
 
 const COMMANDS = new Set<CliCommand>([
   "validate-config",
@@ -25,6 +27,7 @@ const COMMANDS = new Set<CliCommand>([
   "collect-assets",
   "generate-latest-json",
   "verify-latest-json",
+  "fix-appimage",
 ]);
 
 export async function runCli(argv = process.argv.slice(2)): Promise<number> {
@@ -46,6 +49,8 @@ export async function runCli(argv = process.argv.slice(2)): Promise<number> {
         return generate(argv.slice(1));
       case "verify-latest-json":
         return verify(argv.slice(1));
+      case "fix-appimage":
+        return fixAppImageCommand(argv.slice(1));
     }
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
@@ -127,7 +132,7 @@ function generate(argv: string[]): number {
     throw new Error("generate-latest-json requires --version and --download-base-url");
   }
   const config = loadReleaseConfig(values.config);
-  const latest = generateLatestJson({
+  const report = generateLatestJsonReport({
     assetsDir: values["assets-dir"] ?? config.collect.outputDir,
     version: values.version,
     downloadBaseUrl: values["download-base-url"],
@@ -136,10 +141,15 @@ function generate(argv: string[]): number {
     requiredPlatforms: config.updater?.requiredPlatforms,
   });
   if (values.out !== undefined) {
-    writeLatestJson(values.out, latest);
+    writeLatestJson(values.out, report.latestJson);
   }
-  process.stdout.write(`${JSON.stringify(latest, null, 2)}\n`);
-  return Object.keys(latest.platforms).length === 0 ? 1 : 0;
+  if (report.excludedStaleAssets.length > 0) {
+    process.stderr.write(
+      `${JSON.stringify({ excludedStaleAssets: report.excludedStaleAssets }, null, 2)}\n`,
+    );
+  }
+  process.stdout.write(`${JSON.stringify(report.latestJson, null, 2)}\n`);
+  return Object.keys(report.latestJson.platforms).length === 0 ? 1 : 0;
 }
 
 function verify(argv: string[]): number {
@@ -154,6 +164,29 @@ function verify(argv: string[]): number {
   return result.ok ? 0 : 1;
 }
 
+function fixAppImageCommand(argv: string[]): number {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      appimage: { type: "string" },
+      "latest-json": { type: "string" },
+      "sign-command": { type: "string" },
+      "keep-temp": { type: "boolean", default: false },
+    },
+  });
+  if (values.appimage === undefined) {
+    throw new Error("fix-appimage requires --appimage");
+  }
+  const result = fixAppImage({
+    appimage: values.appimage,
+    latestJson: values["latest-json"],
+    signCommand: values["sign-command"],
+    keepTemp: values["keep-temp"],
+  });
+  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  return 0;
+}
+
 function usage(): void {
   process.stderr.write(
     [
@@ -165,6 +198,7 @@ function usage(): void {
       "  collect-assets --config pickforge.release.json [--prefix linux-appimage]",
       "  generate-latest-json --version 1.2.3 --download-base-url <url>",
       "  verify-latest-json --input latest.json",
+      "  fix-appimage --appimage <path> [--latest-json <path>] [--sign-command <cmd>] [--keep-temp]",
       "",
     ].join("\n"),
   );

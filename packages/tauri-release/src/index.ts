@@ -1,12 +1,20 @@
+import { spawnSync } from "node:child_process";
 import {
+  chmodSync,
   copyFileSync,
   existsSync,
+  lstatSync,
+  mkdtempSync,
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
+  rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export const DEFAULT_CONFIG_FILE = "pickforge.release.json";
@@ -22,6 +30,10 @@ export const PLATFORM_KEYS = [
   "darwin-x86_64",
   "darwin-aarch64",
 ] as const;
+
+const TOOL_OUTPUT_MAX_BUFFER = 64 * 1024 * 1024;
+const WAYLAND_LIBRARY_ROOTS = ["usr/lib", "usr/lib64", "lib", "lib64"] as const;
+const WAYLAND_LIBRARY_NAME = /^libwayland-.*\.so/u;
 
 export type PlatformKey = (typeof PLATFORM_KEYS)[number];
 
@@ -105,10 +117,34 @@ export interface GenerateLatestJsonOptions {
   requiredPlatforms?: PlatformKey[];
 }
 
+export interface GenerateLatestJsonReport {
+  latestJson: LatestJson;
+  excludedStaleAssets: string[];
+}
+
 export interface LatestJsonVerification {
   ok: boolean;
   platforms: string[];
   errors: string[];
+}
+
+export type SquashfsCompression = "gzip" | "lzo" | "xz" | "lz4" | "zstd";
+
+export interface FixAppImageOptions {
+  appimage: string;
+  latestJson?: string;
+  signCommand?: string;
+  keepTemp?: boolean;
+  env?: NodeJS.ProcessEnv;
+}
+
+export interface FixAppImageResult {
+  appimage: string;
+  strippedCount: number;
+  compression: SquashfsCompression;
+  signed: boolean;
+  latestJsonPatched: boolean;
+  platformsPatched: string[];
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -118,6 +154,18 @@ interface PlatformCandidate {
   assetName: string;
   signatureFile: string;
   priority: number;
+}
+
+interface LatestJsonPatchTarget {
+  parsed: JsonRecord;
+  platforms: Array<{ platform: string; value: JsonRecord }>;
+}
+
+export class ReleaseToolError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ReleaseToolError";
+  }
 }
 
 export function loadReleaseConfig(path = DEFAULT_CONFIG_FILE): TauriReleaseConfig {
@@ -256,12 +304,22 @@ export function collectAssets(
 }
 
 export function generateLatestJson(options: GenerateLatestJsonOptions): LatestJson {
+  return generateLatestJsonReport(options).latestJson;
+}
+
+export function generateLatestJsonReport(
+  options: GenerateLatestJsonOptions,
+): GenerateLatestJsonReport {
   const assetsDir = resolve(options.assetsDir);
   if (!isSemver(options.version)) {
     throw new Error("version must be SemVer");
   }
   const pubDate = normalizePubDate(options.pubDate ?? new Date());
-  const sigFiles = listFiles(assetsDir).filter((file) => file.endsWith(".sig"));
+  const filteredSignatures = filterStaleSignatureFiles(
+    listFiles(assetsDir).filter((file) => file.endsWith(".sig")),
+    options.version,
+  );
+  const sigFiles = filteredSignatures.sigFiles;
   const orphanSignatures = sigFiles.filter((file) => !existsSync(file.slice(0, -".sig".length)));
   if (orphanSignatures.length > 0) {
     throw new Error(
@@ -312,11 +370,81 @@ export function generateLatestJson(options: GenerateLatestJsonOptions): LatestJs
   if (options.notes !== undefined) {
     latest.notes = options.notes;
   }
-  return latest;
+  return {
+    latestJson: latest,
+    excludedStaleAssets: filteredSignatures.excludedStaleAssets,
+  };
 }
 
 export function writeLatestJson(path: string, latest: LatestJson): void {
   writeFileSync(path, `${JSON.stringify(latest, null, 2)}\n`);
+}
+
+export function fixAppImage(options: FixAppImageOptions): FixAppImageResult {
+  const env = options.env ?? process.env;
+  const signed = isSigningEnabled(env);
+  if (options.latestJson !== undefined && !signed) {
+    throw new ReleaseToolError("--latest-json requires TAURI_SIGNING_PRIVATE_KEY");
+  }
+
+  requireTool("unsquashfs", env);
+  requireTool("mksquashfs", env);
+
+  const appimage = resolve(options.appimage);
+  const signaturePath = `${appimage}.sig`;
+  if (options.latestJson !== undefined) {
+    readLatestJsonPatchTarget(options.latestJson, appimage);
+  }
+  const originalMode = statSync(appimage).mode & 0o7777;
+  const original = readFileSync(appimage);
+  const offset = findSquashfsOffset(original);
+  const runtimePrefix = original.subarray(0, offset);
+  const compression = squashfsCompression(original, offset);
+  const tempDir = mkdtempSync(join(tmpdir(), "pickforge-appimage-"));
+
+  try {
+    const appDir = join(tempDir, "AppDir");
+    const squashfs = join(tempDir, "fixed.squashfs");
+
+    runTool("unsquashfs", ["-dest", appDir, "-offset", String(offset), appimage], env);
+    const strippedCount = stripWaylandLibraries(appDir);
+    runTool(
+      "mksquashfs",
+      [appDir, squashfs, "-comp", compression, "-root-owned", "-noappend"],
+      env,
+    );
+    writeFileSync(appimage, Buffer.concat([runtimePrefix, readFileSync(squashfs)]));
+    chmodSync(appimage, originalMode);
+    verifyNoWaylandLibraries(appimage, runtimePrefix.length, env);
+
+    if (signed) {
+      if (existsSync(signaturePath)) {
+        unlinkSync(signaturePath);
+      }
+      runSignCommand(appimage, options.signCommand, env);
+      readSignatureFile(signaturePath);
+    } else if (existsSync(signaturePath)) {
+      unlinkSync(signaturePath);
+    }
+
+    const platformsPatched =
+      options.latestJson === undefined
+        ? []
+        : patchLatestJsonSignatures(options.latestJson, appimage, signaturePath, signed);
+
+    return {
+      appimage,
+      strippedCount,
+      compression,
+      signed,
+      latestJsonPatched: platformsPatched.length > 0,
+      platformsPatched,
+    };
+  } finally {
+    if (options.keepTemp !== true) {
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  }
 }
 
 export function verifyLatestJson(input: string | LatestJson): LatestJsonVerification {
@@ -479,6 +607,379 @@ function selectPlatformCandidates(candidates: PlatformCandidate[]): PlatformCand
   }
 
   return [...byPlatform.values()].sort((left, right) => left.platform.localeCompare(right.platform));
+}
+
+function filterStaleSignatureFiles(
+  sigFiles: string[],
+  version: string,
+): { sigFiles: string[]; excludedStaleAssets: string[] } {
+  const currentVersion = normalizeVersionToken(version);
+  const included: string[] = [];
+  const excluded = new Set<string>();
+
+  for (const sigFile of sigFiles.sort((left, right) => left.localeCompare(right))) {
+    const assetPath = sigFile.slice(0, -".sig".length);
+    const assetName = basename(assetPath);
+    if (hasStaleVersionToken(assetName, currentVersion)) {
+      if (existsSync(assetPath)) {
+        excluded.add(assetName);
+      }
+      excluded.add(basename(sigFile));
+    } else {
+      included.push(sigFile);
+    }
+  }
+
+  return {
+    sigFiles: included,
+    excludedStaleAssets: [...excluded].sort((left, right) => left.localeCompare(right)),
+  };
+}
+
+function hasStaleVersionToken(assetName: string, currentVersion: string): boolean {
+  const tokens = versionTokens(assetName);
+  const allowRpmSuffix = assetName.endsWith(".rpm");
+  return (
+    tokens.length > 0 &&
+    tokens.some((token) => !versionTokenMatches(token, currentVersion, allowRpmSuffix))
+  );
+}
+
+function versionTokens(assetName: string): string[] {
+  const scanName = trimKnownArtifactSuffix(assetName);
+  const matches = scanName.matchAll(
+    /(?:^|[^0-9A-Za-z])[vV]?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)(?=$|[^0-9A-Za-z])/gu,
+  );
+  return [...matches].flatMap((match) => (match[1] === undefined ? [] : [match[1]]));
+}
+
+function versionTokenMatches(
+  token: string,
+  currentVersion: string,
+  allowRpmSuffix: boolean,
+): boolean {
+  if (token === currentVersion) {
+    return true;
+  }
+  if (!allowRpmSuffix || !token.startsWith(currentVersion)) {
+    return false;
+  }
+  const rpmSuffix = token.slice(currentVersion.length);
+  return rpmSuffix.length > 1 && /^-\d/u.test(rpmSuffix);
+}
+
+function normalizeVersionToken(version: string): string {
+  return version.startsWith("v") ? version.slice(1) : version;
+}
+
+function trimKnownArtifactSuffix(assetName: string): string {
+  const suffixes = [
+    ".AppImage.tar.gz",
+    ".app.tar.gz",
+    ".setup.nsis.zip",
+    ".nsis.zip",
+    ".msi.zip",
+    ".exe.zip",
+    ".AppImage",
+    ".deb",
+    ".rpm",
+    ".msi",
+    ".exe",
+  ];
+  const suffix = suffixes.find((value) => assetName.endsWith(value));
+  return suffix === undefined ? assetName : assetName.slice(0, -suffix.length);
+}
+
+function stripWaylandLibraries(appDir: string): number {
+  const appDirReal = realpathSync(appDir);
+  let strippedCount = 0;
+  for (const root of WAYLAND_LIBRARY_ROOTS) {
+    strippedCount += stripWaylandLibrariesInDirectory(join(appDir, root), appDirReal);
+  }
+  return strippedCount;
+}
+
+function stripWaylandLibrariesInDirectory(directory: string, appDirReal: string): number {
+  if (!existsSync(directory)) {
+    return 0;
+  }
+  const directoryStats = lstatSync(directory);
+  if (!directoryStats.isDirectory()) {
+    return 0;
+  }
+  if (!isPathInside(appDirReal, realpathSync(directory))) {
+    return 0;
+  }
+
+  let strippedCount = 0;
+  for (const entry of readdirSync(directory)) {
+    const entryPath = join(directory, entry);
+    const entryStats = lstatSync(entryPath);
+    if (WAYLAND_LIBRARY_NAME.test(entry)) {
+      if (entryStats.isFile() || entryStats.isSymbolicLink()) {
+        unlinkSync(entryPath);
+        strippedCount += 1;
+      }
+    } else if (entryStats.isDirectory()) {
+      strippedCount += stripWaylandLibrariesInDirectory(entryPath, appDirReal);
+    }
+  }
+  return strippedCount;
+}
+
+function isPathInside(parent: string, child: string): boolean {
+  const relativePath = relative(parent, child);
+  return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
+}
+
+function findSquashfsOffset(input: Buffer): number {
+  const elfOffset = squashfsOffsetFromElf(input);
+  if (elfOffset !== null) {
+    return elfOffset;
+  }
+
+  const magic = Buffer.from("hsqs");
+  let offset = input.indexOf(magic);
+  while (offset !== -1) {
+    if (isValidSquashfsSuperblock(input, offset)) {
+      return offset;
+    }
+    offset = input.indexOf(magic, offset + 1);
+  }
+  throw new ReleaseToolError("AppImage does not contain a valid SquashFS payload");
+}
+
+function squashfsOffsetFromElf(input: Buffer): number | null {
+  if (
+    input.length < 64 ||
+    input[0] !== 0x7f ||
+    input[1] !== 0x45 ||
+    input[2] !== 0x4c ||
+    input[3] !== 0x46 ||
+    input[4] !== 2 ||
+    input[5] !== 1
+  ) {
+    return null;
+  }
+
+  const sectionHeaderOffset = input.readBigUInt64LE(40);
+  const sectionHeaderEntrySize = input.readUInt16LE(58);
+  const sectionHeaderCount = input.readUInt16LE(60);
+  const offset =
+    sectionHeaderOffset + BigInt(sectionHeaderEntrySize) * BigInt(sectionHeaderCount);
+  if (offset > BigInt(Number.MAX_SAFE_INTEGER)) {
+    return null;
+  }
+
+  const numericOffset = Number(offset);
+  return isValidSquashfsSuperblock(input, numericOffset) ? numericOffset : null;
+}
+
+function isValidSquashfsSuperblock(input: Buffer, offset: number): boolean {
+  if (offset + 96 > input.length) {
+    return false;
+  }
+  const blockSize = input.readUInt32LE(offset + 12);
+  const compression = input.readUInt16LE(offset + 20);
+  const major = input.readUInt16LE(offset + 28);
+  const minor = input.readUInt16LE(offset + 30);
+  return (
+    major === 4 &&
+    minor === 0 &&
+    compression >= 1 &&
+    compression <= 6 &&
+    blockSize >= 4096 &&
+    blockSize <= 1048576 &&
+    (blockSize & (blockSize - 1)) === 0
+  );
+}
+
+function squashfsCompression(input: Buffer, offset: number): SquashfsCompression {
+  const id = input.readUInt16LE(offset + 20);
+  switch (id) {
+    case 1:
+      return "gzip";
+    case 2:
+      throw new ReleaseToolError("SquashFS lzma compression is not supported for repacking");
+    case 3:
+      return "lzo";
+    case 4:
+      return "xz";
+    case 5:
+      return "lz4";
+    case 6:
+      return "zstd";
+    default:
+      throw new ReleaseToolError(`unsupported SquashFS compression id ${id}`);
+  }
+}
+
+function verifyNoWaylandLibraries(appimage: string, offset: number, env: NodeJS.ProcessEnv): void {
+  const listing = runTool("unsquashfs", ["-ls", "-offset", String(offset), appimage], env);
+  if (listing.split(/\r?\n/u).some(isWaylandLibraryListingEntry)) {
+    throw new ReleaseToolError("rebuilt AppImage still contains libwayland libraries");
+  }
+}
+
+function isWaylandLibraryListingEntry(line: string): boolean {
+  const path = normalizePath(line.trim()).replace(/^squashfs-root\/?/u, "");
+  const parts = path.split("/").filter((part) => part.length > 0);
+  const file = parts.at(-1);
+  if (file === undefined || !WAYLAND_LIBRARY_NAME.test(file)) {
+    return false;
+  }
+  const dir = parts.slice(0, -1).join("/");
+  return WAYLAND_LIBRARY_ROOTS.some((root) => dir === root || dir.startsWith(`${root}/`));
+}
+
+function isSigningEnabled(env: NodeJS.ProcessEnv): boolean {
+  return (
+    isNonEmptyString(env.TAURI_SIGNING_PRIVATE_KEY) ||
+    isNonEmptyString(env.TAURI_SIGNING_PRIVATE_KEY_PATH)
+  );
+}
+
+function runSignCommand(
+  appimage: string,
+  signCommand: string | undefined,
+  env: NodeJS.ProcessEnv,
+): void {
+  if (signCommand === undefined) {
+    runTool("bun", ["run", "tauri", "signer", "sign", appimage], env);
+    return;
+  }
+  runShellCommand(`${signCommand} ${shellQuote(appimage)}`, env);
+}
+
+function patchLatestJsonSignatures(
+  latestJson: string,
+  appimage: string,
+  signaturePath: string,
+  signed: boolean,
+): string[] {
+  if (!signed) {
+    throw new ReleaseToolError("--latest-json requires TAURI_SIGNING_PRIVATE_KEY");
+  }
+
+  const signature = readSignatureFile(signaturePath);
+  const target = readLatestJsonPatchTarget(latestJson, appimage);
+  for (const { value } of target.platforms) {
+    value.signature = signature;
+  }
+
+  writeFileSync(latestJson, `${JSON.stringify(target.parsed, null, 2)}\n`);
+  return target.platforms
+    .map(({ platform }) => platform)
+    .sort((left, right) => left.localeCompare(right));
+}
+
+function readSignatureFile(signaturePath: string): string {
+  if (!existsSync(signaturePath)) {
+    throw new ReleaseToolError(`missing signature file ${basename(signaturePath)}`);
+  }
+  const signature = readFileSync(signaturePath, "utf8").trim();
+  if (signature.length === 0) {
+    throw new ReleaseToolError(`signature file ${basename(signaturePath)} is empty`);
+  }
+  return signature;
+}
+
+function readLatestJsonPatchTarget(latestJson: string, appimage: string): LatestJsonPatchTarget {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(latestJson, "utf8")) as unknown;
+  } catch (error) {
+    throw new ReleaseToolError(
+      `invalid latest.json: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (!isRecord(parsed)) {
+    throw new ReleaseToolError("latest.json must be an object");
+  }
+  if (!isRecord(parsed.platforms)) {
+    throw new ReleaseToolError("latest.json platforms must be an object");
+  }
+
+  const appimageName = basename(appimage);
+  const platformsPatched: LatestJsonPatchTarget["platforms"] = [];
+  for (const [platform, value] of Object.entries(parsed.platforms)) {
+    if (!isRecord(value)) {
+      throw new ReleaseToolError(`${platform} must be an object`);
+    }
+    if (!isNonEmptyString(value.url)) {
+      throw new ReleaseToolError(`${platform}.url must be a non-empty string`);
+    }
+    if (basenameFromUrl(value.url) === appimageName) {
+      platformsPatched.push({ platform, value });
+    }
+  }
+
+  if (platformsPatched.length === 0) {
+    throw new ReleaseToolError(`latest.json has no platform URL matching ${appimageName}`);
+  }
+
+  return { parsed, platforms: platformsPatched };
+}
+
+function basenameFromUrl(value: string): string {
+  try {
+    return basename(decodeURIComponent(new URL(value).pathname));
+  } catch {
+    return basename(value);
+  }
+}
+
+function requireTool(command: string, env: NodeJS.ProcessEnv): void {
+  const result = spawnSync(command, ["-version"], { env, stdio: "ignore" });
+  if (result.error !== undefined) {
+    throw new ReleaseToolError(`missing required tool: ${command}`);
+  }
+}
+
+function runTool(command: string, args: string[], env: NodeJS.ProcessEnv): string {
+  const result = spawnSync(command, args, {
+    encoding: "utf8",
+    env,
+    maxBuffer: TOOL_OUTPUT_MAX_BUFFER,
+  });
+  if (result.error !== undefined) {
+    throw new ReleaseToolError(
+      result.error.message.includes("ENOENT")
+        ? `missing required tool: ${command}`
+        : `${command} failed: ${result.error.message}`,
+    );
+  }
+  if (result.status !== 0) {
+    throw new ReleaseToolError(
+      `${command} failed with exit code ${result.status ?? "unknown"}${formatToolOutput(
+        result.stderr,
+      )}`,
+    );
+  }
+  return result.stdout;
+}
+
+function runShellCommand(command: string, env: NodeJS.ProcessEnv): void {
+  const result = spawnSync(command, { encoding: "utf8", env, shell: true });
+  if (result.error !== undefined) {
+    throw new ReleaseToolError(`sign command failed: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    throw new ReleaseToolError(
+      `sign command failed with exit code ${result.status ?? "unknown"}${formatToolOutput(
+        result.stderr,
+      )}`,
+    );
+  }
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/gu, "'\\''")}'`;
+}
+
+function formatToolOutput(output: string): string {
+  const trimmed = output.trim();
+  return trimmed.length === 0 ? "" : `: ${trimmed}`;
 }
 
 function platformPriority(assetName: string, platform: PlatformKey): number {

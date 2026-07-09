@@ -1,6 +1,6 @@
 {
   "name": "@pickforge/tauri-release",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Signed Tauri release and updater-feed automation for Pickforge apps.",
   "license": "MIT",
   "type": "module",

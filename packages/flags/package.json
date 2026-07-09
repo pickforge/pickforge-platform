@@ -1,0 +1,22 @@
+{
+  "name": "@pickforge/flags",
+  "version": "0.1.0",
+  "description": "UI-free feature-flag registry for release gating in Pickforge apps.",
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --clean --splitting false --out-dir dist"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -32,6 +32,7 @@ import {
 const tempRoots: string[] = [];
 const squashfsToolsAvailable = hasCommand("mksquashfs") && hasCommand("unsquashfs");
 const zstdSquashfsAvailable = squashfsToolsAvailable && hasSquashfsCompressor("zstd");
+const toolOutputMaxBuffer = 64 * 1024 * 1024;
 
 afterEach(() => {
   for (const root of tempRoots.splice(0)) {
@@ -262,6 +263,28 @@ describe("@pickforge/tauri-release", () => {
     expect(report.excludedStaleAssets).toEqual([
       "App_v0.1.1_amd64.AppImage",
       "App_v0.1.1_amd64.AppImage.sig",
+    ]);
+  });
+
+  it("keeps SemVer build metadata in version token comparisons", () => {
+    const root = tempRoot();
+    writeSignedAsset(root, "App_1.2.3-beta+build_amd64.AppImage", "current-linux-signature");
+    writeSignedAsset(root, "App_1.2.3-beta+old_amd64.AppImage", "stale-linux-signature");
+
+    const report = generateLatestJsonReport({
+      assetsDir: root,
+      downloadBaseUrl: "https://github.com/pickforge/app/releases/download/v1.2.3-beta+build",
+      pubDate: "2026-07-05T12:00:00Z",
+      requiredPlatforms: ["linux-x86_64"],
+      version: "1.2.3-beta+build",
+    });
+
+    expect(report.latestJson.platforms["linux-x86_64"]?.signature).toBe(
+      "current-linux-signature",
+    );
+    expect(report.excludedStaleAssets).toEqual([
+      "App_1.2.3-beta+old_amd64.AppImage",
+      "App_1.2.3-beta+old_amd64.AppImage.sig",
     ]);
   });
 
@@ -651,6 +674,29 @@ describe("@pickforge/tauri-release", () => {
   );
 
   it.skipIf(!squashfsToolsAvailable)(
+    "allows non-library resource paths containing libwayland names",
+    () => {
+      const root = tempRoot();
+      const appDir = join(root, "AppDir");
+      mkdirSync(join(appDir, "usr/share/doc"), { recursive: true });
+      mkdirSync(join(appDir, "usr/bin"), { recursive: true });
+      writeFileSync(join(appDir, "usr/share/doc/libwayland-client.so.0.txt"), "docs");
+      writeFileSync(join(appDir, "usr/bin/app"), "#!/bin/sh\n");
+      const { appimage, runtimePrefix } = packSyntheticAppImage(root, appDir);
+
+      const result = fixAppImage({
+        appimage,
+        env: envWithoutSigning(),
+      });
+
+      expect(result.strippedCount).toBe(0);
+      expect(listAppImage(appimage, runtimePrefix.length)).toContain(
+        "usr/share/doc/libwayland-client.so.0.txt",
+      );
+    },
+  );
+
+  it.skipIf(!squashfsToolsAvailable)(
     "does not follow a symlinked usr/lib while stripping AppImage libraries",
     () => {
       const root = tempRoot();
@@ -770,6 +816,50 @@ describe("@pickforge/tauri-release", () => {
       expect(patched.platforms["linux-x86_64"]?.signature).toBe("new-signature");
       expect(patched.platforms["linux-x86_64-appimage"]?.signature).toBe("new-signature");
       expect(patched.platforms["windows-x86_64"]?.signature).toBe("windows-signature");
+    },
+  );
+
+  it.skipIf(!squashfsToolsAvailable)(
+    "signs when TAURI_SIGNING_PRIVATE_KEY_PATH is set",
+    () => {
+      const root = tempRoot();
+      const { appimage } = createSyntheticAppImage(root);
+      const signStub = join(root, "sign-stub.sh");
+      writeFileSync(signStub, "#!/bin/sh\nprintf 'path-signature\\n' > \"$1.sig\"\n");
+      chmodSync(signStub, 0o755);
+
+      const result = fixAppImage({
+        appimage,
+        env: {
+          ...envWithoutSigning(),
+          TAURI_SIGNING_PRIVATE_KEY_PATH: join(root, "tauri.key"),
+        },
+        signCommand: signStub,
+      });
+
+      expect(result.signed).toBe(true);
+      expect(readFileSync(`${appimage}.sig`, "utf8")).toBe("path-signature\n");
+    },
+  );
+
+  it.skipIf(!squashfsToolsAvailable)(
+    "removes stale signatures before invoking the signer",
+    () => {
+      const root = tempRoot();
+      const { appimage } = createSyntheticAppImage(root);
+      const signStub = join(root, "failing-sign-stub.sh");
+      writeFileSync(signStub, "#!/bin/sh\nexit 7\n");
+      writeFileSync(`${appimage}.sig`, "stale-signature");
+      chmodSync(signStub, 0o755);
+
+      expect(() =>
+        fixAppImage({
+          appimage,
+          env: { ...envWithoutSigning(), TAURI_SIGNING_PRIVATE_KEY: "test-key" },
+          signCommand: signStub,
+        }),
+      ).toThrow(/sign command failed with exit code 7/u);
+      expect(existsSync(`${appimage}.sig`)).toBe(false);
     },
   );
 
@@ -994,7 +1084,7 @@ function listAppImage(appimage: string, offset: number): string {
 }
 
 function runFixtureTool(command: string, args: string[]): string {
-  const result = spawnSync(command, args, { encoding: "utf8" });
+  const result = spawnSync(command, args, { encoding: "utf8", maxBuffer: toolOutputMaxBuffer });
   if (result.error !== undefined || result.status !== 0) {
     throw new Error(
       `${command} failed: ${result.error?.message ?? result.stderr.trim() ?? result.status}`,
@@ -1046,5 +1136,9 @@ async function captureCli(argv: string[]): Promise<{ code: number; stdout: strin
 }
 
 function envWithoutSigning(): NodeJS.ProcessEnv {
-  return { ...process.env, TAURI_SIGNING_PRIVATE_KEY: undefined };
+  return {
+    ...process.env,
+    TAURI_SIGNING_PRIVATE_KEY: undefined,
+    TAURI_SIGNING_PRIVATE_KEY_PATH: undefined,
+  };
 }

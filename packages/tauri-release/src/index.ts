@@ -31,6 +31,10 @@ export const PLATFORM_KEYS = [
   "darwin-aarch64",
 ] as const;
 
+const TOOL_OUTPUT_MAX_BUFFER = 64 * 1024 * 1024;
+const WAYLAND_LIBRARY_ROOTS = ["usr/lib", "usr/lib64", "lib", "lib64"] as const;
+const WAYLAND_LIBRARY_NAME = /^libwayland-.*\.so/u;
+
 export type PlatformKey = (typeof PLATFORM_KEYS)[number];
 
 export interface ReleaseCollectConfig {
@@ -414,6 +418,9 @@ export function fixAppImage(options: FixAppImageOptions): FixAppImageResult {
     verifyNoWaylandLibraries(appimage, runtimePrefix.length, env);
 
     if (signed) {
+      if (existsSync(signaturePath)) {
+        unlinkSync(signaturePath);
+      }
       runSignCommand(appimage, options.signCommand, env);
       readSignatureFile(signaturePath);
     } else if (existsSync(signaturePath)) {
@@ -641,7 +648,7 @@ function hasStaleVersionToken(assetName: string, currentVersion: string): boolea
 function versionTokens(assetName: string): string[] {
   const scanName = trimKnownArtifactSuffix(assetName);
   const matches = scanName.matchAll(
-    /(?:^|[^0-9A-Za-z])[vV]?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)(?=$|[^0-9A-Za-z])/gu,
+    /(?:^|[^0-9A-Za-z])[vV]?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)(?=$|[^0-9A-Za-z])/gu,
   );
   return [...matches].flatMap((match) => (match[1] === undefined ? [] : [match[1]]));
 }
@@ -686,7 +693,7 @@ function trimKnownArtifactSuffix(assetName: string): string {
 function stripWaylandLibraries(appDir: string): number {
   const appDirReal = realpathSync(appDir);
   let strippedCount = 0;
-  for (const root of ["usr/lib", "usr/lib64", "lib", "lib64"]) {
+  for (const root of WAYLAND_LIBRARY_ROOTS) {
     strippedCount += stripWaylandLibrariesInDirectory(join(appDir, root), appDirReal);
   }
   return strippedCount;
@@ -708,7 +715,7 @@ function stripWaylandLibrariesInDirectory(directory: string, appDirReal: string)
   for (const entry of readdirSync(directory)) {
     const entryPath = join(directory, entry);
     const entryStats = lstatSync(entryPath);
-    if (/^libwayland-.*\.so/u.test(entry)) {
+    if (WAYLAND_LIBRARY_NAME.test(entry)) {
       if (entryStats.isFile() || entryStats.isSymbolicLink()) {
         unlinkSync(entryPath);
         strippedCount += 1;
@@ -809,13 +816,27 @@ function squashfsCompression(input: Buffer, offset: number): SquashfsCompression
 
 function verifyNoWaylandLibraries(appimage: string, offset: number, env: NodeJS.ProcessEnv): void {
   const listing = runTool("unsquashfs", ["-ls", "-offset", String(offset), appimage], env);
-  if (listing.includes("libwayland-")) {
+  if (listing.split(/\r?\n/u).some(isWaylandLibraryListingEntry)) {
     throw new ReleaseToolError("rebuilt AppImage still contains libwayland libraries");
   }
 }
 
+function isWaylandLibraryListingEntry(line: string): boolean {
+  const path = normalizePath(line.trim()).replace(/^squashfs-root\/?/u, "");
+  const parts = path.split("/").filter((part) => part.length > 0);
+  const file = parts.at(-1);
+  if (file === undefined || !WAYLAND_LIBRARY_NAME.test(file)) {
+    return false;
+  }
+  const dir = parts.slice(0, -1).join("/");
+  return WAYLAND_LIBRARY_ROOTS.some((root) => dir === root || dir.startsWith(`${root}/`));
+}
+
 function isSigningEnabled(env: NodeJS.ProcessEnv): boolean {
-  return env.TAURI_SIGNING_PRIVATE_KEY !== undefined && env.TAURI_SIGNING_PRIVATE_KEY.length > 0;
+  return (
+    isNonEmptyString(env.TAURI_SIGNING_PRIVATE_KEY) ||
+    isNonEmptyString(env.TAURI_SIGNING_PRIVATE_KEY_PATH)
+  );
 }
 
 function runSignCommand(
@@ -916,7 +937,11 @@ function requireTool(command: string, env: NodeJS.ProcessEnv): void {
 }
 
 function runTool(command: string, args: string[], env: NodeJS.ProcessEnv): string {
-  const result = spawnSync(command, args, { encoding: "utf8", env });
+  const result = spawnSync(command, args, {
+    encoding: "utf8",
+    env,
+    maxBuffer: TOOL_OUTPUT_MAX_BUFFER,
+  });
   if (result.error !== undefined) {
     throw new ReleaseToolError(
       result.error.message.includes("ENOENT")

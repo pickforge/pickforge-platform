@@ -15,22 +15,26 @@
     },
     "packages/auth": {
       "name": "@pickforge/auth",
-      "version": "0.1.1",
+      "version": "0.3.0",
       "dependencies": {
         "@supabase/supabase-js": "^2.110.0",
       },
     },
     "packages/brand": {
       "name": "@pickforge/brand",
-      "version": "0.1.1",
+      "version": "0.3.0",
       "dependencies": {
         "@fontsource/geist-mono": "^5.2.8",
         "@fontsource/geist-sans": "^5.2.5",
       },
     },
+    "packages/flags": {
+      "name": "@pickforge/flags",
+      "version": "0.1.0",
+    },
     "packages/tauri-release": {
       "name": "@pickforge/tauri-release",
-      "version": "0.1.1",
+      "version": "0.3.0",
       "bin": {
         "pickforge-tauri-release": "dist/cli.js",
       },
@@ -124,6 +128,8 @@
     "@pickforge/auth": ["@pickforge/auth@workspace:packages/auth"],
 
     "@pickforge/brand": ["@pickforge/brand@workspace:packages/brand"],
+
+    "@pickforge/flags": ["@pickforge/flags@workspace:packages/flags"],
 
     "@pickforge/tauri-release": ["@pickforge/tauri-release@workspace:packages/tauri-release"],
 

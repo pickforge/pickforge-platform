@@ -15,14 +15,18 @@
     },
     "packages/auth": {
       "name": "@pickforge/auth",
-      "version": "0.3.0",
+      "version": "0.4.0",
       "dependencies": {
         "@supabase/supabase-js": "^2.110.0",
       },
     },
+    "packages/billing": {
+      "name": "@pickforge/billing",
+      "version": "0.4.0",
+    },
     "packages/brand": {
       "name": "@pickforge/brand",
-      "version": "0.3.0",
+      "version": "0.4.0",
       "dependencies": {
         "@fontsource/geist-mono": "^5.2.8",
         "@fontsource/geist-sans": "^5.2.5",
@@ -30,11 +34,11 @@
     },
     "packages/flags": {
       "name": "@pickforge/flags",
-      "version": "0.1.0",
+      "version": "0.4.0",
     },
     "packages/tauri-release": {
       "name": "@pickforge/tauri-release",
-      "version": "0.3.0",
+      "version": "0.4.0",
       "bin": {
         "pickforge-tauri-release": "dist/cli.js",
       },
@@ -126,6 +130,8 @@
     "@oxc-project/types": ["@oxc-project/types@0.138.0", "", {}, "sha512-1a7ZKmrRTCoN1XMZ4L0PyyqrMnrNlLyPuOkdSX2MZg7IiIGRUyurNhAm73ptDOraoBcIordsIGKNPKUzy3ZmfA=="],
 
     "@pickforge/auth": ["@pickforge/auth@workspace:packages/auth"],
+
+    "@pickforge/billing": ["@pickforge/billing@workspace:packages/billing"],
 
     "@pickforge/brand": ["@pickforge/brand@workspace:packages/brand"],
 

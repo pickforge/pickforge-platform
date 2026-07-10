@@ -8,6 +8,14 @@ const migration = readFileSync(
 );
 
 const supabaseConfig = readFileSync(join(import.meta.dirname, "../../../supabase/config.toml"), "utf8");
+const metadataMigration = readFileSync(
+  join(import.meta.dirname, "../../../supabase/migrations/20260709050000_debit_credits_metadata.sql"),
+  "utf8",
+);
+const routerRateMigration = readFileSync(
+  join(import.meta.dirname, "../../../supabase/migrations/20260709060000_router_rate_limit.sql"),
+  "utf8",
+);
 
 describe("debit credits migration", () => {
   it("adds a user-scoped ledger idempotency key", () => {
@@ -41,6 +49,26 @@ describe("debit credits migration", () => {
     expect(migration).toContain(
       "revoke execute on function public.debit_credits(uuid, integer, text, text) from public, anon, authenticated",
     );
+  });
+});
+
+describe("debit credits metadata migration", () => {
+  it("stores usage metadata and restricts the new RPC signature", () => {
+    expect(metadataMigration).toContain("usage_metadata jsonb default '{}'::jsonb");
+    expect(metadataMigration).toContain("metadata");
+    expect(metadataMigration).toContain("usage_metadata");
+    expect(metadataMigration).toContain(
+      "revoke execute on function public.debit_credits(uuid, integer, text, text, jsonb)",
+    );
+  });
+});
+
+describe("router rate limit migration", () => {
+  it("limits each user to ten requests per ten seconds", () => {
+    expect(routerRateMigration).toContain("create table if not exists public.router_rate_limits");
+    expect(routerRateMigration).toContain("create function public.consume_router_rate_limit(target_user uuid)");
+    expect(routerRateMigration).toContain("current_count >= 10");
+    expect(routerRateMigration).toContain("interval '10 seconds'");
   });
 });
 

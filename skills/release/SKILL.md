@@ -19,6 +19,12 @@ publishes. That gate is not yours to skip.
   `src-tauri/Cargo.toml` **and** `Cargo.lock` (run `cargo check` to refresh it).
 - Stage per file or with `git add -u` — a batched `git add a b c` aborts entirely if
   one path is wrong, and release PRs have silently missed the cargo bumps this way.
+- Feature flags (rule: workspace `AGENTS.md`, "Feature flags"):
+  - Check `gh issue list --label flagged` for features this release enables.
+    Flipping a flag on = changing its `default` in this prep PR; list flipped
+    flags in the draft notes and tick "enabled in vX.Y.Z" on their issues.
+  - Any flag that shipped enabled in a previous release and still exists is
+    stale — file or do the removal (don't block the release on it).
 - Open the PR (`chore: release vX.Y.Z`) through the normal ship-pr flow.
 
 ## 2. Tag

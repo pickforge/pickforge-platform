@@ -263,7 +263,7 @@ describe("@pickforge/edge-shared", () => {
     expect(stripe.customers.del.mock.invocationCallOrder[0]!).toBeLessThan(admin.auth.admin.deleteUser.mock.invocationCallOrder[0]!);
   });
 
-  it("deletes the user without a Stripe customer and tolerates Stripe failures", async () => {
+  it("deletes the user without a Stripe customer", async () => {
     const noCustomerAdmin = accountAdmin();
     const noCustomerStripe = { customers: { del: vi.fn(async () => ({})) } };
     const noCustomerHandler = createDeleteAccountHandler({
@@ -277,7 +277,9 @@ describe("@pickforge/edge-shared", () => {
     });
     expect(noCustomerStripe.customers.del).not.toHaveBeenCalled();
     expect(noCustomerAdmin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
+  });
 
+  it("preserves the account when Stripe deletion fails and retries safely after a missing customer", async () => {
     const failingStripeAdmin = accountAdmin({ billing_customers: [{ user_id: USER_ID, stripe_customer_id: "cus_456" }] });
     const failingStripe = { customers: { del: vi.fn(async () => Promise.reject(new Error("Stripe unavailable"))) } };
     const failingStripeHandler = createDeleteAccountHandler({
@@ -286,10 +288,25 @@ describe("@pickforge/edge-shared", () => {
       resolveUserId: vi.fn(async () => USER_ID),
     });
 
-    await expect(failingStripeHandler(new Request("https://edge.test", { method: "POST" }))).resolves.toMatchObject({
-      status: 200,
+    const failedResponse = await failingStripeHandler(new Request("https://edge.test", { method: "POST" }));
+    expect(failedResponse.status).toBe(503);
+    await expect(failedResponse.json()).resolves.toEqual({ error: "deletion_incomplete" });
+    expect(failingStripeAdmin.auth.admin.deleteUser).not.toHaveBeenCalled();
+
+    const missingStripeAdmin = accountAdmin({ billing_customers: [{ user_id: USER_ID, stripe_customer_id: "cus_789" }] });
+    const missingStripe = {
+      customers: { del: vi.fn(async () => Promise.reject({ code: "resource_missing" })) },
+    };
+    const missingStripeHandler = createDeleteAccountHandler({
+      admin: missingStripeAdmin,
+      stripe: missingStripe,
+      resolveUserId: vi.fn(async () => USER_ID),
     });
-    expect(failingStripeAdmin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
+
+    const missingResponse = await missingStripeHandler(new Request("https://edge.test", { method: "POST" }));
+    expect(missingResponse.status).toBe(200);
+    await expect(missingResponse.json()).resolves.toEqual({ deleted: true });
+    expect(missingStripeAdmin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
   });
 
   it("treats a missing auth user as deleted and returns 500 for other deletion failures", async () => {

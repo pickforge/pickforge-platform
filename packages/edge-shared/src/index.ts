@@ -1,5 +1,6 @@
 export type EdgeSharedErrorCode =
   | "database_error"
+  | "deletion_incomplete"
   | "entitlement_required"
   | "insufficient_credits"
   | "invalid_debit_amount"
@@ -527,9 +528,13 @@ export function createDeleteAccountHandler({
 
       if (typeof billingCustomer?.stripe_customer_id === "string" && billingCustomer.stripe_customer_id.length > 0) {
         try {
-          // Stripe deletion is best-effort because it retains transaction records for legal and fiscal obligations.
+          // One-time credit packs have no recurring charges; delete Stripe first to avoid orphaning customer PII.
           await stripe.customers.del(billingCustomer.stripe_customer_id);
-        } catch {}
+        } catch (error) {
+          if (!isStripeCustomerMissingError(error)) {
+            throw new EdgeSharedError("deletion_incomplete", "Failed to delete Stripe customer", { cause: error });
+          }
+        }
       }
 
       const { error } = await admin.auth.admin.deleteUser(userId);
@@ -831,7 +836,9 @@ function databaseError(message: string, cause: SupabaseErrorLike): EdgeSharedErr
 
 function accountErrorResponse(error: unknown): Response {
   if (error instanceof EdgeSharedError) {
-    return jsonResponse(error.code === "unauthorized" ? 401 : 400, { error: error.code });
+    return jsonResponse(error.code === "unauthorized" ? 401 : error.code === "deletion_incomplete" ? 503 : 400, {
+      error: error.code,
+    });
   }
 
   return jsonResponse(500, { error: "internal_error" });
@@ -839,4 +846,8 @@ function accountErrorResponse(error: unknown): Response {
 
 function isUserNotFoundError(error: SupabaseErrorLike): boolean {
   return error.code === "user_not_found" || /user not found/i.test(error.message);
+}
+
+function isStripeCustomerMissingError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && (error as { code?: unknown }).code === "resource_missing";
 }

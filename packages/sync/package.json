@@ -1,6 +1,6 @@
 {
   "name": "@pickforge/sync",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "UI-free settings sync helpers for Pickforge apps.",
   "license": "MIT",
   "repository": {

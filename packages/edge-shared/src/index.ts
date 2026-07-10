@@ -5,6 +5,7 @@ export type EdgeSharedErrorCode =
   | "invalid_debit_amount"
   | "invalid_idempotency_key"
   | "invalid_rpc_result"
+  | "boundary_violation"
   | "invalid_string"
   | "invalid_stripe_webhook_config"
   | "unauthorized";
@@ -87,6 +88,7 @@ export interface DebitCreditsOptions {
   amountCents: number;
   reason: string;
   idempotencyKey: string;
+  metadata?: { [key: string]: EdgeSharedJson };
 }
 
 export type DebitCreditsResult =
@@ -131,6 +133,52 @@ export interface CreateStripeWebhookHandlerOptions<TStripe = unknown, TSupabase 
   webhookSecret: string;
   verifyStripeEvent(options: VerifyStripeEventOptions<TStripe>): Promise<StripeEventLike>;
   processStripeEvent(options: ProcessStripeEventOptions<TSupabase>): Promise<StripeWebhookProcessResult>;
+}
+
+export interface RouteRequestContext {
+  projectName?: string;
+  chatNames?: string[];
+  widgetLabels?: string[];
+}
+
+export interface RouteRequest {
+  commandText: string;
+  context?: RouteRequestContext;
+}
+
+export interface ChatCompletionUsage {
+  input: number;
+  output: number;
+}
+
+export interface ChatCompletionResult {
+  text: string;
+  usage: ChatCompletionUsage;
+}
+
+export interface CreateOperatorRouterHandlerOptions {
+  supabase: Pick<SupabaseClientLike, "auth">;
+  findCompletedRoute(userId: string, idempotencyKey: string): Promise<StoredRouteProposal | null>;
+  getCreditBalance(userId: string): Promise<number>;
+  consumeRateLimit(userId: string): Promise<boolean>;
+  debit(options: Omit<DebitCreditsOptions, "supabase">): Promise<DebitCreditsResult>;
+  chatComplete(options: {
+    model: string;
+    apiKey: string;
+    baseUrl: string;
+    systemPrompt: string;
+    userPrompt: string;
+  }): Promise<ChatCompletionResult>;
+  model: string;
+  apiKey: string;
+  baseUrl: string;
+  creditCostCents: number;
+  systemPrompt?: string;
+}
+
+export interface StoredRouteProposal {
+  proposalJson: string;
+  usage: ChatCompletionUsage;
 }
 
 interface EntitlementRow {
@@ -212,6 +260,7 @@ export async function debitCredits({
   amountCents,
   reason,
   idempotencyKey,
+  metadata,
 }: DebitCreditsOptions): Promise<DebitCreditsResult> {
   const validUserId = validateNonEmptyString(userId, "userId", "invalid_string");
   const validAmount = validatePositiveInteger(amountCents, "amountCents");
@@ -221,12 +270,14 @@ export async function debitCredits({
     "idempotencyKey",
     "invalid_idempotency_key",
   );
+  const validMetadata = metadata === undefined ? {} : validateMetadata(metadata);
 
   const { data, error } = await supabase.rpc<DebitCreditsRpcResult>("debit_credits", {
     target_user: validUserId,
     debit_cents: validAmount,
     reason: validReason,
     idem_key: validIdempotencyKey,
+    usage_metadata: validMetadata,
   });
   if (error !== null) {
     throw databaseError("Failed to debit credits", error);
@@ -260,13 +311,156 @@ export function newIdempotencyKey(scope: string, uniquePart: string): string {
   )}`;
 }
 
-export function jsonResponse(status: number, body: unknown): Response {
+export const operatorRouterSystemPrompt = [
+  "Return one JSON object for one PickForge developer command.",
+  "Use only these v2 action payloads:",
+  "- openProject: {\"action\":\"openProject\"}; put the natural project name in projectRef.",
+  "- openChat: {\"action\":\"openChat\",\"chat\":string|null}; optional projectRef may disambiguate.",
+  "- createChat: {\"action\":\"createChat\",\"provider\":\"claude\"|\"codex\",\"model\":string|null}.",
+  "- sendPrompt: {\"action\":\"sendPrompt\",\"prompt\":string,\"chat\":string|null}; never invent project paths.",
+  "- startSwarm: {\"action\":\"startSwarm\",\"mode\":\"scout\"|\"review\",\"count\":1-5,\"goal\":string,\"provider\":\"claude\"|\"codex\"|\"mixed\"}.",
+  "- swarmStatus: {\"action\":\"swarmStatus\"}.",
+  "- interruptRun: {\"action\":\"interruptRun\",\"run\":string|null}.",
+  "- steerRun: {\"action\":\"steerRun\",\"run\":string|null,\"instruction\":string}.",
+  "- launchEmulator: {\"action\":\"launchEmulator\",\"device\":string|null}.",
+  "- launchRun: {\"action\":\"launchRun\",\"target\":string|null}.",
+  "- reloadRun: {\"action\":\"reloadRun\"}.",
+  "- stopRun: {\"action\":\"stopRun\"}.",
+  "- hotRestart: {\"action\":\"hotRestart\"}.",
+  "- enterSelectMode: {\"action\":\"enterSelectMode\"}.",
+  "- takeScreenshot: {\"action\":\"takeScreenshot\"}.",
+  "- selectWidget: {\"action\":\"selectWidget\",\"description\":string}.",
+  "The router only proposes; local code handles ids, provenance, approval, cost, audit, and execution.",
+  "Confidence is 0..1 and advisory. Use projectRef only as an opaque natural-language hint.",
+  "If the command cannot map safely to one action, return {\"unclear\":true,\"reason\":\"short reason\"}.",
+  "Output only JSON, no markdown.",
+].join("\n");
+
+export function assertRouteRequest(body: unknown): RouteRequest {
+  if (!isRecord(body) || !hasOnlyKeys(body, ["commandText", "context"])) {
+    throw boundaryViolation();
+  }
+
+  const commandText = readCommandText(body.commandText);
+  const context = body.context === undefined ? undefined : readRouteContext(body.context);
+
+  return context === undefined ? { commandText } : { commandText, context };
+}
+
+export function createOperatorRouterHandler({
+  supabase,
+  findCompletedRoute,
+  getCreditBalance,
+  consumeRateLimit,
+  debit,
+  chatComplete,
+  model,
+  apiKey,
+  baseUrl,
+  creditCostCents,
+  systemPrompt = operatorRouterSystemPrompt,
+}: CreateOperatorRouterHandlerOptions): (req: Request) => Promise<Response> {
+  const validModel = validateNonEmptyString(model, "model", "invalid_string");
+  const validApiKey = validateNonEmptyString(apiKey, "apiKey", "invalid_string");
+  const validBaseUrl = validateNonEmptyString(baseUrl, "baseUrl", "invalid_string");
+  const validCreditCostCents = validatePositiveInteger(creditCostCents, "creditCostCents");
+
+  return async (req: Request): Promise<Response> => {
+    try {
+      const { userId } = await getUserFromRequest({ supabase, req });
+      const routeRequest = await readRouteRequest(req);
+      const idempotencyKey = validateNonEmptyString(
+        req.headers.get("x-idempotency-key"),
+        "x-idempotency-key",
+        "invalid_idempotency_key",
+      );
+      const scopedIdempotencyKey = newIdempotencyKey("router", `${userId}:${idempotencyKey}`);
+      const completedRoute = await findCompletedRoute(userId, scopedIdempotencyKey);
+      if (completedRoute !== null) {
+        return routeResponse(completedRoute, validCreditCostCents);
+      }
+      if (!(await consumeRateLimit(userId))) {
+        return jsonResponse(429, { error: "rate_limited" });
+      }
+      const balance = await getCreditBalance(userId);
+      if (!Number.isSafeInteger(balance)) {
+        throw new EdgeSharedError("invalid_rpc_result", "Supabase returned an invalid credit balance");
+      }
+      if (balance < validCreditCostCents) {
+        throw new EdgeSharedError("insufficient_credits", "Not enough credits", { balance });
+      }
+
+      const completion = await chatComplete({
+        model: validModel,
+        apiKey: validApiKey,
+        baseUrl: validBaseUrl,
+        systemPrompt,
+        userPrompt: JSON.stringify(routeRequest),
+      });
+      const route = {
+        proposalJson: completion.text,
+        usage: { input: completion.usage.input, output: completion.usage.output },
+      };
+      let debitResult: DebitCreditsResult;
+      try {
+        debitResult = await debit({
+          userId,
+          amountCents: validCreditCostCents,
+          reason: "Operator routing",
+          idempotencyKey: scopedIdempotencyKey,
+          metadata: route,
+        });
+      } catch (error) {
+        const storedRoute = await findCompletedRoute(userId, scopedIdempotencyKey);
+        if (storedRoute !== null) {
+          return routeResponse(storedRoute, validCreditCostCents);
+        }
+
+        throw error;
+      }
+      if (debitResult.duplicate) {
+        const storedRoute = await findCompletedRoute(userId, scopedIdempotencyKey);
+        if (storedRoute === null) {
+          throw new EdgeSharedError("invalid_rpc_result", "Stored router result is missing");
+        }
+
+        return routeResponse(storedRoute, validCreditCostCents);
+      }
+
+      return routeResponse(route, validCreditCostCents);
+    } catch (error) {
+      if (error instanceof EdgeSharedError) {
+        return jsonResponse(routerErrorStatus(error.code), {
+          error: error.code,
+          ...(error.balance === undefined ? {} : { balance: error.balance }),
+        });
+      }
+
+      return jsonResponse(500, { error: "internal_error" });
+    }
+  };
+}
+
+export function jsonResponse(status: number, body: unknown, headers: HeadersInit = {}): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: {
       "content-type": "application/json",
+      ...headers,
     },
   });
+}
+
+export function corsHeaders(): HeadersInit {
+  return {
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "POST, OPTIONS",
+    "access-control-allow-headers": "apikey, x-client-info, authorization, content-type, x-idempotency-key",
+  };
+}
+
+export function corsPreflightResponse(): Response {
+  return new Response(null, { status: 204, headers: corsHeaders() });
 }
 
 export function createStripeWebhookHandler<TStripe = unknown, TSupabase = unknown>({
@@ -318,6 +512,121 @@ function validateNonEmptyString(
   }
 
   return value;
+}
+
+function readRouteContext(value: unknown): RouteRequestContext {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["projectName", "chatNames", "widgetLabels"])) {
+    throw boundaryViolation();
+  }
+
+  const projectName = value.projectName === undefined ? undefined : readRouteString(value.projectName, 200);
+  const chatNames = value.chatNames === undefined ? undefined : readRouteStringList(value.chatNames);
+  const widgetLabels = value.widgetLabels === undefined ? undefined : readRouteStringList(value.widgetLabels);
+
+  return {
+    ...(projectName === undefined ? {} : { projectName }),
+    ...(chatNames === undefined ? {} : { chatNames }),
+    ...(widgetLabels === undefined ? {} : { widgetLabels }),
+  };
+}
+
+function readRouteStringList(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > 100) {
+    throw boundaryViolation();
+  }
+
+  return value.map((item) => readRouteString(item, 200));
+}
+
+function readRouteString(value: unknown, maxLength = 4000): string {
+  if (
+    typeof value !== "string" ||
+    value.trim().length === 0 ||
+    value.length > maxLength ||
+    containsForbiddenIdentifier(value)
+  ) {
+    throw boundaryViolation();
+  }
+
+  return value;
+}
+
+function readCommandText(value: unknown): string {
+  // operator.md permits user-authored command text; only attached local context is a hard boundary.
+  if (typeof value !== "string" || value.length > 4000) {
+    throw boundaryViolation();
+  }
+
+  return value;
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: string[]): boolean {
+  return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+function containsForbiddenIdentifier(value: string): boolean {
+  return (
+    /\b[a-z][a-z0-9+.-]*:\/\//i.test(value) ||
+    /(?:^|[\s"'])~\//.test(value) ||
+    /(?:^|[\s"'])\.\//.test(value) ||
+    /(?:^|[^\w/])\/[a-z0-9_.-]+/i.test(value) ||
+    /\.\.\//.test(value) ||
+    /\b(?:home|etc|usr|var|tmp|opt|root|mnt|workspace|projects)\/[a-z0-9_.-]+/i.test(value) ||
+    /\b(?!and\/or\b)[a-z0-9_.-]+\/[a-z0-9_.-]+\b/i.test(value) ||
+    /(?:^|\/)\.[^/\s]+/.test(value) ||
+    /(?:^|[^a-z0-9_])\.(?:env|git|ssh|aws|npmrc|netrc)\b/i.test(value) ||
+    /[a-z]:[\\/]/i.test(value) ||
+    /\\\\/.test(value) ||
+    /\b[a-z0-9_.-]+\\[a-z0-9_.-]+\\/i.test(value) ||
+    /\b[a-z0-9-]+(?::\d{1,5})\b/i.test(value) ||
+    /\blocalhost\b/i.test(value) ||
+    /\[[0-9a-f:.]+\]/i.test(value) ||
+    /\b[a-z0-9-]+(?:\.[a-z0-9-]+)+\b/i.test(value) ||
+    /\b100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}\b/.test(value) ||
+    /\b[a-z0-9][a-z0-9_-]{31,}\b/i.test(value)
+  );
+}
+
+function validateMetadata(value: unknown): { [key: string]: EdgeSharedJson } {
+  if (!isRecord(value)) {
+    throw new EdgeSharedError("invalid_string", "metadata must be an object");
+  }
+
+  return value as { [key: string]: EdgeSharedJson };
+}
+
+function routeResponse(route: StoredRouteProposal | ChatCompletionResult, costCents: number): Response {
+  const proposalJson = "proposalJson" in route ? route.proposalJson : route.text;
+
+  return jsonResponse(200, { proposalJson, usage: route.usage, costCents });
+}
+
+async function readRouteRequest(req: Request): Promise<RouteRequest> {
+  try {
+    return assertRouteRequest(await req.json());
+  } catch (error) {
+    if (error instanceof EdgeSharedError) {
+      throw error;
+    }
+
+    throw boundaryViolation();
+  }
+}
+
+function boundaryViolation(): EdgeSharedError {
+  return new EdgeSharedError("boundary_violation", "Request contains data outside the routing boundary");
+}
+
+function routerErrorStatus(code: EdgeSharedErrorCode): number {
+  if (code === "unauthorized") {
+    return 401;
+  }
+
+  if (code === "insufficient_credits") {
+    return 402;
+  }
+
+  return code === "database_error" ? 500 : 400;
 }
 
 function validatePositiveInteger(value: unknown, field: string): number {

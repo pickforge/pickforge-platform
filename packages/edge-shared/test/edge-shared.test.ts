@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   EdgeSharedError,
+  assertRouteRequest,
+  corsPreflightResponse,
+  createOperatorRouterHandler,
   createStripeWebhookHandler,
   debitCredits,
   getBearerToken,
@@ -110,6 +113,7 @@ describe("@pickforge/edge-shared", () => {
           debit_cents: 150,
           reason: "render",
           idem_key: "render:job_123",
+          usage_metadata: {},
         },
       },
     ]);
@@ -223,6 +227,16 @@ describe("@pickforge/edge-shared", () => {
     await expect(response.json()).resolves.toEqual({ ok: true });
   });
 
+  it("creates CORS preflight responses", () => {
+    const response = corsPreflightResponse();
+
+    expect(response.status).toBe(204);
+    expect(response.headers.get("access-control-allow-origin")).toBe("*");
+    expect(response.headers.get("access-control-allow-headers")).toBe(
+      "apikey, x-client-info, authorization, content-type, x-idempotency-key",
+    );
+  });
+
   it("handles verified Stripe webhook requests", async () => {
     const stripe = {};
     const supabase = {};
@@ -309,6 +323,331 @@ describe("@pickforge/edge-shared", () => {
 
     expect(response.status).toBe(500);
     await expect(response.json()).resolves.toEqual({ error: "webhook_processing_failed" });
+  });
+
+  it.each([
+    "open /home/dev/project",
+    "open \"/home/dev/x\"",
+    "open C:\\Users\\dev\\project",
+    "open \\\\server\\share",
+    "open foo\\bar\\baz",
+    "open https://db.internal.corp/path",
+    "connect localhost:3000",
+    "connect buildserver:8080",
+    "connect db.internal.corp",
+    "open build.local",
+    "connect 100.64.1.2",
+    "use abcdefghijklmnopqrstuvwxyz0123456789",
+    "connect ssh://buildserver",
+    "connect localhost",
+    "connect [fd00::1]",
+  ])("rejects forbidden attached context identifiers: %s", (projectName) => {
+    expectBoundaryViolation(() => assertRouteRequest({ commandText: "open Billing", context: { projectName } }));
+  });
+
+  it("allows user-authored command identifiers", () => {
+    expect(
+      assertRouteRequest({ commandText: "create codex chat using gpt-5.4-mini about api.example.com from /home/dev" }),
+    ).toEqual({ commandText: "create codex chat using gpt-5.4-mini about api.example.com from /home/dev" });
+  });
+
+  it("strictly parses the route request allowlist", () => {
+    expect(
+      assertRouteRequest({
+        commandText: "open project Billing",
+        context: { projectName: "Billing", chatNames: ["CI"], widgetLabels: ["Run"] },
+      }),
+    ).toEqual({
+      commandText: "open project Billing",
+      context: { projectName: "Billing", chatNames: ["CI"], widgetLabels: ["Run"] },
+    });
+    expectBoundaryViolation(() => assertRouteRequest({ commandText: "open Billing", source: "secret" }));
+    expectBoundaryViolation(() => assertRouteRequest({ commandText: "open Billing", context: { path: "Billing" } }));
+    expectBoundaryViolation(() =>
+      assertRouteRequest({ commandText: "open Billing", context: { chatNames: ["buildserver:8080"] } }),
+    );
+    expect(assertRouteRequest({ commandText: "start a review swarm for the auth diff" })).toEqual({
+      commandText: "start a review swarm for the auth diff",
+    });
+  });
+
+  it("routes a valid command then debits with a namespaced key", async () => {
+    const supabase = new MemorySupabase();
+    const debit = vi.fn(async () => ({ duplicate: false as const, balance: 98 }));
+    const chatComplete = vi.fn(async () => ({
+      text: "{\"action\":{\"action\":\"openProject\"},\"confidence\":0.9}",
+      usage: { input: 42, output: 13 },
+    }));
+    const handler = createOperatorRouterHandler({
+      supabase,
+      findCompletedRoute: vi.fn(async () => null),
+      consumeRateLimit: vi.fn(async () => true),
+      getCreditBalance: vi.fn(async () => 100),
+      debit,
+      chatComplete,
+      model: "gpt-5.4-mini",
+      apiKey: "key",
+      baseUrl: "https://api.openai.com/v1",
+      creditCostCents: 2,
+    });
+
+    const response = await handler(
+      new Request("https://edge.test", {
+        method: "POST",
+        headers: { Authorization: "Bearer token", "x-idempotency-key": "router:attempt-1" },
+        body: JSON.stringify({ commandText: "open project Billing", context: { projectName: "Billing" } }),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      proposalJson: "{\"action\":{\"action\":\"openProject\"},\"confidence\":0.9}",
+      usage: { input: 42, output: 13 },
+      costCents: 2,
+    });
+    expect(debit).toHaveBeenCalledWith({
+      userId: USER_ID,
+      amountCents: 2,
+      reason: "Operator routing",
+      idempotencyKey: `router:${USER_ID}:router:attempt-1`,
+      metadata: {
+        proposalJson: "{\"action\":{\"action\":\"openProject\"},\"confidence\":0.9}",
+        usage: { input: 42, output: 13 },
+      },
+    });
+    expect(chatComplete).toHaveBeenCalledOnce();
+  });
+
+  it("returns insufficient credits without calling the model", async () => {
+    const supabase = new MemorySupabase();
+    const chatComplete = vi.fn();
+    const handler = createOperatorRouterHandler({
+      supabase,
+      findCompletedRoute: vi.fn(async () => null),
+      consumeRateLimit: vi.fn(async () => true),
+      getCreditBalance: vi.fn(async () => 1),
+      debit: vi.fn(),
+      chatComplete,
+      model: "gpt-5.4-mini",
+      apiKey: "key",
+      baseUrl: "https://api.openai.com/v1",
+      creditCostCents: 2,
+    });
+
+    const response = await handler(routeRequest("open project Billing"));
+    expect(response.status).toBe(402);
+    await expect(response.json()).resolves.toEqual({ error: "insufficient_credits", balance: 1 });
+    expect(chatComplete).not.toHaveBeenCalled();
+  });
+
+  it("returns a stored proposal without calling the model for a replay", async () => {
+    const supabase = new MemorySupabase();
+    const debit = vi.fn(async () => ({ duplicate: false as const, balance: 98 }));
+    const chatComplete = vi.fn(async () => ({ text: "{}", usage: { input: 1, output: 1 } }));
+    const handler = createOperatorRouterHandler({
+      supabase,
+      findCompletedRoute: vi.fn(async () => ({ proposalJson: "{\"stored\":true}", usage: { input: 3, output: 2 } })),
+      consumeRateLimit: vi.fn(async () => true),
+      getCreditBalance: vi.fn(async () => 100),
+      debit,
+      chatComplete,
+      model: "gpt-5.4-mini",
+      apiKey: "key",
+      baseUrl: "https://api.openai.com/v1",
+      creditCostCents: 2,
+    });
+
+    const response = await handler(routeRequest("open project Billing"));
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      proposalJson: "{\"stored\":true}",
+      usage: { input: 3, output: 2 },
+      costCents: 2,
+    });
+    expect(chatComplete).not.toHaveBeenCalled();
+    expect(debit).not.toHaveBeenCalled();
+  });
+
+  it("rejects forbidden attached context before debiting or calling the model", async () => {
+    const supabase = new MemorySupabase();
+    const debit = vi.fn();
+    const chatComplete = vi.fn();
+    const handler = createOperatorRouterHandler({
+      supabase,
+      findCompletedRoute: vi.fn(async () => null),
+      consumeRateLimit: vi.fn(async () => true),
+      getCreditBalance: vi.fn(async () => 100),
+      debit,
+      chatComplete,
+      model: "gpt-5.4-mini",
+      apiKey: "key",
+      baseUrl: "https://api.openai.com/v1",
+      creditCostCents: 2,
+    });
+
+    const response = await handler(
+      routeRequest("open project Billing", { projectName: "/home/dev/project" }),
+    );
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "boundary_violation" });
+    expect(debit).not.toHaveBeenCalled();
+    expect(chatComplete).not.toHaveBeenCalled();
+  });
+
+  it("does not debit a failed route and allows a retry", async () => {
+    const supabase = new MemorySupabase();
+    const debit = vi.fn(async () => ({ duplicate: false as const, balance: 98 }));
+    const chatComplete = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("provider unavailable"))
+      .mockResolvedValueOnce({ text: "{}", usage: { input: 1, output: 1 } });
+    const handler = createOperatorRouterHandler({
+      supabase,
+      findCompletedRoute: vi.fn(async () => null),
+      consumeRateLimit: vi.fn(async () => true),
+      getCreditBalance: vi.fn(async () => 100),
+      debit,
+      chatComplete,
+      model: "gpt-5.4-mini",
+      apiKey: "key",
+      baseUrl: "https://api.openai.com/v1",
+      creditCostCents: 2,
+    });
+
+    await expect(handler(routeRequest("open project Billing"))).resolves.toMatchObject({ status: 500 });
+    expect(debit).not.toHaveBeenCalled();
+    await expect(handler(routeRequest("open project Billing"))).resolves.toMatchObject({ status: 200 });
+    expect(debit).toHaveBeenCalledOnce();
+  });
+
+  it("returns the stored result after a concurrent duplicate debit", async () => {
+    const stored = { proposalJson: "{\"stored\":true}", usage: { input: 5, output: 3 } };
+    const findCompletedRoute = vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(stored);
+    const handler = createOperatorRouterHandler({
+      supabase: new MemorySupabase(),
+      findCompletedRoute,
+      consumeRateLimit: vi.fn(async () => true),
+      getCreditBalance: vi.fn(async () => 100),
+      debit: vi.fn(async () => ({ duplicate: true as const })),
+      chatComplete: vi.fn(async () => ({ text: "{\"fresh\":true}", usage: { input: 1, output: 1 } })),
+      model: "gpt-5.4-mini",
+      apiKey: "key",
+      baseUrl: "https://api.openai.com/v1",
+      creditCostCents: 2,
+    });
+
+    const response = await handler(routeRequest("open project Billing"));
+    await expect(response.json()).resolves.toEqual({ ...stored, costCents: 2 });
+    expect(findCompletedRoute).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns the stored proposal when a committed debit loses its response", async () => {
+    const stored = { proposalJson: "{\"stored\":true}", usage: { input: 5, output: 3 } };
+    const handler = createOperatorRouterHandler({
+      supabase: new MemorySupabase(),
+      findCompletedRoute: vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(stored),
+      consumeRateLimit: vi.fn(async () => true),
+      getCreditBalance: vi.fn(async () => 100),
+      debit: vi.fn(async () => {
+        throw new Error("response lost");
+      }),
+      chatComplete: vi.fn(async () => ({ text: "{\"fresh\":true}", usage: { input: 1, output: 1 } })),
+      model: "gpt-5.4-mini",
+      apiKey: "key",
+      baseUrl: "https://api.openai.com/v1",
+      creditCostCents: 2,
+    });
+
+    const response = await handler(routeRequest("open project Billing"));
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ ...stored, costCents: 2 });
+  });
+
+  it.each([
+    { commandText: "x".repeat(4001) },
+    { commandText: "open Billing", context: { projectName: "x".repeat(201) } },
+    { commandText: "open Billing", context: { chatNames: Array.from({ length: 101 }, () => "CI") } },
+    { commandText: "open Billing", context: { widgetLabels: ["/etc"] } },
+    { commandText: "open Billing", context: { chatNames: ["../secrets"] } },
+    { commandText: "open Billing", context: { projectName: "./.env" } },
+    { commandText: "open Billing", context: { projectName: "~/.env" } },
+    { commandText: "open Billing", context: { chatNames: ["../.ssh/id_rsa"] } },
+    { commandText: "open Billing", context: { widgetLabels: ["/home/u/.aws/credentials"] } },
+    { commandText: "open Billing", context: { projectName: "projects/app" } },
+    { commandText: "open Billing", context: { projectName: "foo/bar" } },
+    { commandText: "open Billing", context: { projectName: "Edit .env" } },
+    { commandText: "open Billing", context: { projectName: "deploy .git" } },
+  ])("rejects oversized or forbidden attached context data", (body) => {
+    expectBoundaryViolation(() => assertRouteRequest(body));
+  });
+
+  it("allows ordinary attached context", () => {
+    expect(assertRouteRequest({ commandText: "start a review and/or a scout", context: { projectName: "Billing" } })).toEqual({
+      commandText: "start a review and/or a scout",
+      context: { projectName: "Billing" },
+    });
+  });
+
+  it("allows a normal attached label with punctuation", () => {
+    expect(assertRouteRequest({ commandText: "open Billing", context: { projectName: "Sprint 3. Final" } })).toEqual({
+      commandText: "open Billing",
+      context: { projectName: "Sprint 3. Final" },
+    });
+  });
+
+  it("returns rate_limited after ten routed attempts", async () => {
+    const debit = vi.fn(async () => ({ duplicate: false as const, balance: 98 }));
+    const chatComplete = vi.fn(async () => ({ text: "{}", usage: { input: 1, output: 1 } }));
+    let attempts = 0;
+    const handler = createOperatorRouterHandler({
+      supabase: new MemorySupabase(),
+      findCompletedRoute: vi.fn(async () => null),
+      consumeRateLimit: vi.fn(async () => ++attempts <= 10),
+      getCreditBalance: vi.fn(async () => 100),
+      debit,
+      chatComplete,
+      model: "gpt-5.4-mini",
+      apiKey: "key",
+      baseUrl: "https://api.openai.com/v1",
+      creditCostCents: 2,
+    });
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await expect(handler(routeRequest("open project Billing", undefined, `attempt-${attempt}`))).resolves.toMatchObject({
+        status: 200,
+      });
+    }
+
+    const response = await handler(routeRequest("open project Billing", undefined, "attempt-10"));
+    expect(response.status).toBe(429);
+    await expect(response.json()).resolves.toEqual({ error: "rate_limited" });
+    expect(debit).toHaveBeenCalledTimes(10);
+    expect(chatComplete).toHaveBeenCalledTimes(10);
+  });
+
+  it("maps invalid JSON to a boundary violation", async () => {
+    const handler = createOperatorRouterHandler({
+      supabase: new MemorySupabase(),
+      findCompletedRoute: vi.fn(async () => null),
+      consumeRateLimit: vi.fn(async () => true),
+      getCreditBalance: vi.fn(async () => 100),
+      debit: vi.fn(),
+      chatComplete: vi.fn(),
+      model: "gpt-5.4-mini",
+      apiKey: "key",
+      baseUrl: "https://api.openai.com/v1",
+      creditCostCents: 2,
+    });
+
+    const response = await handler(
+      new Request("https://edge.test", {
+        method: "POST",
+        headers: { Authorization: "Bearer token", "x-idempotency-key": "attempt-1" },
+        body: "{",
+      }),
+    );
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: "boundary_violation" });
   });
 });
 
@@ -423,4 +762,27 @@ function scopedDebitSupabase(initialBalances: Record<string, number>): Pick<Supa
       return { data: { status: "ok", balance: nextBalance } as T, error: null };
     },
   };
+}
+
+function routeRequest(
+  commandText: string,
+  context?: { projectName?: string; chatNames?: string[]; widgetLabels?: string[] },
+  idempotencyKey = "router:attempt-1",
+): Request {
+  return new Request("https://edge.test", {
+    method: "POST",
+    headers: { Authorization: "Bearer token", "x-idempotency-key": idempotencyKey },
+    body: JSON.stringify(context === undefined ? { commandText } : { commandText, context }),
+  });
+}
+
+function expectBoundaryViolation(action: () => unknown): void {
+  try {
+    action();
+  } catch (error) {
+    expect(error).toMatchObject({ code: "boundary_violation" });
+    return;
+  }
+
+  throw new Error("Expected a boundary violation");
 }

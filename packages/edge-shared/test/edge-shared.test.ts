@@ -10,6 +10,7 @@ import {
   getUserFromRequest,
   jsonResponse,
   newIdempotencyKey,
+  operatorRouterSystemPrompt,
   requireEntitlement,
   type EdgeSharedJson,
   type SupabaseClientLike,
@@ -22,6 +23,11 @@ const USER_ID = "11111111-1111-4111-8111-111111111111";
 const OTHER_USER_ID = "22222222-2222-4222-8222-222222222222";
 
 describe("@pickforge/edge-shared", () => {
+  it("does not offer selectWidget over hosted routing", () => {
+    expect(operatorRouterSystemPrompt).not.toContain("selectWidget");
+    expect(operatorRouterSystemPrompt).toContain("Semantic widget selection is not available over hosted routing");
+  });
+
   it("parses bearer tokens from Authorization headers", () => {
     expect(getBearerToken(new Request("https://edge.test", { headers: { Authorization: "Bearer jwt_123" } }))).toBe(
       "jwt_123",

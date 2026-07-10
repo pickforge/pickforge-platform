@@ -1,6 +1,6 @@
 {
   "name": "@pickforge/brand",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Pickforge CSS tokens, fonts, reset, and primitives.",
   "license": "MIT",
   "repository": {

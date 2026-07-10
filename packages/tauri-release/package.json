@@ -3,6 +3,11 @@
   "version": "0.6.0",
   "description": "Signed Tauri release and updater-feed automation for Pickforge apps.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pickforge/pickforge-platform.git",
+    "directory": "packages/tauri-release"
+  },
   "type": "module",
   "bin": {
     "pickforge-tauri-release": "dist/cli.js"

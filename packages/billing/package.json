@@ -1,6 +1,6 @@
 {
   "name": "@pickforge/billing",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "UI-free Stripe billing and credit-ledger helpers for Pickforge apps.",
   "license": "MIT",
   "repository": {

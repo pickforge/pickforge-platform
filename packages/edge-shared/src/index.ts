@@ -329,7 +329,7 @@ export const operatorRouterSystemPrompt = [
   "- hotRestart: {\"action\":\"hotRestart\"}.",
   "- enterSelectMode: {\"action\":\"enterSelectMode\"}.",
   "- takeScreenshot: {\"action\":\"takeScreenshot\"}.",
-  "- selectWidget: {\"action\":\"selectWidget\",\"description\":string}.",
+  "Semantic widget selection is not available over hosted routing; treat any request to select or click an on-screen element as unclear.",
   "The router only proposes; local code handles ids, provenance, approval, cost, audit, and execution.",
   "Confidence is 0..1 and advisory. Use projectRef only as an opaque natural-language hint.",
   "If the command cannot map safely to one action, return {\"unclear\":true,\"reason\":\"short reason\"}.",

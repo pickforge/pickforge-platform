@@ -404,6 +404,44 @@ describe("@pickforge/edge-shared", () => {
     await expect(unauthorizedResponse.json()).resolves.toEqual({ error: "unauthorized" });
   });
 
+  it("returns 500 for account data read failures", async () => {
+    const handler = createDeleteAccountHandler({
+      admin: accountAdmin({}, { billing_customers: { message: "Database unavailable" } }),
+      stripe: { customers: { del: vi.fn() } },
+      resolveUserId: vi.fn(async () => USER_ID),
+    });
+
+    const response = await handler(new Request("https://edge.test", { method: "POST" }));
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toEqual({ error: "internal_error" });
+  });
+
+  it("exports every credit ledger page", async () => {
+    const creditLedger = Array.from({ length: 1001 }, (_, index) => ({
+      user_id: USER_ID,
+      id: `ledger_${index}`,
+      amount_cents: index,
+      kind: "credit",
+      description: null,
+      stripe_event_id: null,
+      stripe_checkout_session_id: null,
+      metadata: {},
+      created_at: "2026-01-01T00:00:00.000Z",
+      idempotency_key: `ledger:${index}`,
+    }));
+    const handler = createExportAccountHandler({
+      admin: accountAdmin({ credit_ledger: creditLedger }),
+      resolveUserId: vi.fn(async () => USER_ID),
+    });
+
+    const response = await handler(new Request("https://edge.test", { method: "POST" }));
+    const body = (await response.json()) as { creditLedger: Array<{ id: string }> };
+
+    expect(response.status).toBe(200);
+    expect(body.creditLedger).toHaveLength(1001);
+    expect(body.creditLedger.at(-1)).toEqual(expect.objectContaining({ id: "ledger_1000" }));
+  });
+
   it("handles verified Stripe webhook requests", async () => {
     const stripe = {};
     const supabase = {};
@@ -825,7 +863,7 @@ interface EntitlementRow {
   expires_at: string | null;
 }
 
-function accountAdmin(rows: Record<string, unknown[]> = {}) {
+function accountAdmin(rows: Record<string, unknown[]> = {}, errors: Record<string, SupabaseErrorLike> = {}) {
   return {
     auth: {
       admin: {
@@ -835,15 +873,20 @@ function accountAdmin(rows: Record<string, unknown[]> = {}) {
       },
     },
     from<T = unknown>(table: string): AccountQuery<T> {
-      return new AccountQuery<T>(rows[table] ?? []);
+      return new AccountQuery<T>(rows[table] ?? [], errors[table] ?? null);
     },
   };
 }
 
 class AccountQuery<T> implements SupabaseQueryBuilderLike<T> {
   private readonly filters: Array<{ column: string; value: unknown }> = [];
+  private rangeStart: number | undefined;
+  private rangeEnd: number | undefined;
 
-  constructor(private readonly rows: unknown[]) {}
+  constructor(
+    private readonly rows: unknown[],
+    private readonly error: SupabaseErrorLike | null,
+  ) {}
 
   select(): SupabaseQueryBuilderLike<T> {
     return this;
@@ -859,24 +902,37 @@ class AccountQuery<T> implements SupabaseQueryBuilderLike<T> {
     return this;
   }
 
+  order(_column: string, _options?: { ascending?: boolean }): SupabaseQueryBuilderLike<T> {
+    return this;
+  }
+
+  range(from: number, to: number): SupabaseQueryBuilderLike<T> {
+    this.rangeStart = from;
+    this.rangeEnd = to;
+    return this;
+  }
+
   async maybeSingle(): Promise<SupabaseQueryResult<T | null>> {
-    return { data: (this.filteredRows()[0] ?? null) as T | null, error: null };
+    return { data: (this.filteredRows()[0] ?? null) as T | null, error: this.error };
   }
 
   then<TResult1 = SupabaseQueryResult<T>, TResult2 = never>(
     onfulfilled?: ((value: SupabaseQueryResult<T>) => TResult1 | PromiseLike<TResult1>) | null,
     onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
   ): PromiseLike<TResult1 | TResult2> {
-    return Promise.resolve({ data: this.filteredRows() as T, error: null }).then(onfulfilled, onrejected);
+    return Promise.resolve({ data: this.filteredRows() as T, error: this.error }).then(onfulfilled, onrejected);
   }
 
   private filteredRows(): unknown[] {
-    return this.rows.filter(
+    const filtered = this.rows.filter(
       (row) =>
         typeof row === "object" &&
         row !== null &&
         this.filters.every((filter) => (row as Record<string, unknown>)[filter.column] === filter.value),
     );
+    return this.rangeStart === undefined || this.rangeEnd === undefined
+      ? filtered
+      : filtered.slice(this.rangeStart, this.rangeEnd + 1);
   }
 }
 
@@ -930,6 +986,14 @@ class MemoryQuery<T> implements SupabaseQueryBuilderLike<T> {
 
   is(column: string, value: null): SupabaseQueryBuilderLike<T> {
     return this.eq(column, value);
+  }
+
+  order(_column: string, _options?: { ascending?: boolean }): SupabaseQueryBuilderLike<T> {
+    return this;
+  }
+
+  range(_from: number, _to: number): SupabaseQueryBuilderLike<T> {
+    return this;
   }
 
   async maybeSingle(): Promise<SupabaseQueryResult<T | null>> {

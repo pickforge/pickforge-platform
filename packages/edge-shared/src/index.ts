@@ -43,6 +43,8 @@ export interface SupabaseQueryBuilderLike<T = unknown> extends PromiseLike<Supab
   select(columns?: string): SupabaseQueryBuilderLike<T>;
   eq(column: string, value: unknown): SupabaseQueryBuilderLike<T>;
   is(column: string, value: null): SupabaseQueryBuilderLike<T>;
+  order(column: string, options?: { ascending?: boolean }): SupabaseQueryBuilderLike<T>;
+  range(from: number, to: number): SupabaseQueryBuilderLike<T>;
   maybeSingle(): PromiseLike<SupabaseQueryResult<T | null>>;
 }
 
@@ -556,7 +558,7 @@ export function createExportAccountHandler({
   return async (req: Request): Promise<Response> => {
     try {
       const userId = await resolveUserId(req);
-      const [profileResult, entitlementsResult, creditLedgerResult, syncedSettingsResult, billingResult] = await Promise.all([
+      const [profileResult, entitlementsResult, creditLedger, syncedSettingsResult, billingResult] = await Promise.all([
         admin
           .from<AccountProfileRow>("profiles")
           .select("id,email,display_name,avatar_url,created_at,updated_at")
@@ -566,10 +568,7 @@ export function createExportAccountHandler({
           .from<AccountEntitlementRow>("entitlements")
           .select("id,key,value,granted_at,expires_at,source")
           .eq("user_id", userId),
-        admin
-          .from<AccountCreditLedgerRow>("credit_ledger")
-          .select("id,amount_cents,kind,description,stripe_event_id,stripe_checkout_session_id,metadata,created_at,idempotency_key")
-          .eq("user_id", userId),
+        readCreditLedgerExport(admin, userId),
         admin
           .from<AccountSyncedSettingRow>("settings_sync")
           .select("field_group,payload,updated_at")
@@ -582,7 +581,7 @@ export function createExportAccountHandler({
           .maybeSingle(),
       ]);
 
-      for (const result of [profileResult, entitlementsResult, creditLedgerResult, syncedSettingsResult, billingResult]) {
+      for (const result of [profileResult, entitlementsResult, syncedSettingsResult, billingResult]) {
         if (result.error !== null) {
           throw databaseError("Failed to export account data", result.error);
         }
@@ -594,7 +593,7 @@ export function createExportAccountHandler({
         exportedAt: new Date().toISOString(),
         profile: profileResult.data,
         entitlements: entitlementsResult.data ?? [],
-        creditLedger: creditLedgerResult.data ?? [],
+        creditLedger,
         syncedSettings: syncedSettingsResult.data ?? [],
         billing: {
           hasStripeCustomer: stripeCustomerId !== null,
@@ -836,9 +835,10 @@ function databaseError(message: string, cause: SupabaseErrorLike): EdgeSharedErr
 
 function accountErrorResponse(error: unknown): Response {
   if (error instanceof EdgeSharedError) {
-    return jsonResponse(error.code === "unauthorized" ? 401 : error.code === "deletion_incomplete" ? 503 : 400, {
-      error: error.code,
-    });
+    if (error.code === "unauthorized") return jsonResponse(401, { error: error.code });
+    if (error.code === "deletion_incomplete") return jsonResponse(503, { error: error.code });
+    if (error.code === "database_error") return jsonResponse(500, { error: "internal_error" });
+    return jsonResponse(400, { error: error.code });
   }
 
   return jsonResponse(500, { error: "internal_error" });
@@ -850,4 +850,30 @@ function isUserNotFoundError(error: SupabaseErrorLike): boolean {
 
 function isStripeCustomerMissingError(error: unknown): boolean {
   return typeof error === "object" && error !== null && (error as { code?: unknown }).code === "resource_missing";
+}
+
+async function readCreditLedgerExport(
+  admin: Pick<AccountAdminClientLike, "from">,
+  userId: string,
+): Promise<AccountCreditLedgerRow[]> {
+  const entries: AccountCreditLedgerRow[] = [];
+  const pageSize = 1000;
+
+  for (let from = 0; ; from += pageSize) {
+    const { data, error } = await admin
+      .from<AccountCreditLedgerRow[]>("credit_ledger")
+      .select("id,amount_cents,kind,description,stripe_event_id,stripe_checkout_session_id,metadata,created_at,idempotency_key")
+      .eq("user_id", userId)
+      .order("id")
+      .range(from, from + pageSize - 1);
+    if (error !== null) {
+      throw databaseError("Failed to export credit ledger", error);
+    }
+
+    const page = data ?? [];
+    entries.push(...page);
+    if (page.length < pageSize) {
+      return entries;
+    }
+  }
 }

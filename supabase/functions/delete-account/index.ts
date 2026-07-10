@@ -5,6 +5,7 @@ import {
   corsPreflightResponse,
   createDeleteAccountHandler,
   getUserFromRequest,
+  jsonResponse,
 } from "@pickforge/edge-shared";
 
 const supabaseUrl = requiredEnv("SUPABASE_URL");
@@ -17,6 +18,9 @@ const stripe = new Stripe(requiredEnv("STRIPE_SECRET_KEY"));
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return corsPreflightResponse();
+  }
+  if (req.method !== "POST") {
+    return jsonResponse(405, { error: "method_not_allowed" }, corsHeaders());
   }
 
   const handler = createDeleteAccountHandler({

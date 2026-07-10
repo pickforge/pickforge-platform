@@ -234,6 +234,28 @@ describe("@pickforge/billing", () => {
     });
   });
 
+  it("reuses an existing Stripe customer for repeat credit purchases", async () => {
+    const stripe = fakeStripe();
+
+    await createCreditCheckoutSession({
+      stripe,
+      userId: USER_ID,
+      priceId: "price_123",
+      successUrl: "https://pickforge.dev/success",
+      cancelUrl: "https://pickforge.dev/cancel",
+      existingCustomerId: "cus_123",
+    });
+
+    expect(stripe.checkout.sessions.create).toHaveBeenCalledWith({
+      mode: "payment",
+      customer: "cus_123",
+      client_reference_id: USER_ID,
+      line_items: [{ price: "price_123", quantity: 1 }],
+      success_url: "https://pickforge.dev/success",
+      cancel_url: "https://pickforge.dev/cancel",
+    });
+  });
+
   it("reads balances through the credit_balance_cents rpc", async () => {
     const supabase = new MemorySupabase();
     await processStripeEvent({ supabase, event: checkoutSessionEvent() });

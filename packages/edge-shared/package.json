@@ -1,6 +1,6 @@
 {
   "name": "@pickforge/edge-shared",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "Deno-compatible shared helpers for Pickforge Edge Functions.",
   "license": "MIT",
   "repository": {

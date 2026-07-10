@@ -41,6 +41,7 @@ export interface SupabaseAuthLike {
 export interface SupabaseQueryBuilderLike<T = unknown> extends PromiseLike<SupabaseQueryResult<T>> {
   select(columns?: string): SupabaseQueryBuilderLike<T>;
   eq(column: string, value: unknown): SupabaseQueryBuilderLike<T>;
+  is(column: string, value: null): SupabaseQueryBuilderLike<T>;
   maybeSingle(): PromiseLike<SupabaseQueryResult<T | null>>;
 }
 
@@ -174,6 +175,72 @@ export interface CreateOperatorRouterHandlerOptions {
   baseUrl: string;
   creditCostCents: number;
   systemPrompt?: string;
+}
+
+export interface AccountAdminClientLike {
+  auth: {
+    admin: {
+      deleteUser(userId: string): PromiseLike<{ error: SupabaseErrorLike | null }>;
+    };
+  };
+  from<T = unknown>(table: string): SupabaseQueryBuilderLike<T>;
+}
+
+export interface StripeCustomerClientLike {
+  customers: {
+    del(customerId: string): PromiseLike<unknown>;
+  };
+}
+
+export interface CreateDeleteAccountHandlerOptions {
+  admin: AccountAdminClientLike;
+  stripe: StripeCustomerClientLike;
+  resolveUserId(req: Request): Promise<string>;
+}
+
+export interface CreateExportAccountHandlerOptions {
+  admin: Pick<AccountAdminClientLike, "from">;
+  resolveUserId(req: Request): Promise<string>;
+}
+
+interface BillingCustomerRow {
+  stripe_customer_id: string | null;
+}
+
+interface AccountProfileRow {
+  id: string;
+  email: string;
+  display_name: string | null;
+  avatar_url: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface AccountEntitlementRow {
+  id: string;
+  key: string;
+  value: EdgeSharedJson;
+  granted_at: string;
+  expires_at: string | null;
+  source: string;
+}
+
+interface AccountCreditLedgerRow {
+  id: string;
+  amount_cents: number;
+  kind: string;
+  description: string | null;
+  stripe_event_id: string | null;
+  stripe_checkout_session_id: string | null;
+  metadata: EdgeSharedJson;
+  created_at: string;
+  idempotency_key: string;
+}
+
+interface AccountSyncedSettingRow {
+  field_group: string;
+  payload: EdgeSharedJson;
+  updated_at: string;
 }
 
 export interface StoredRouteProposal {
@@ -441,6 +508,100 @@ export function createOperatorRouterHandler({
   };
 }
 
+export function createDeleteAccountHandler({
+  admin,
+  stripe,
+  resolveUserId,
+}: CreateDeleteAccountHandlerOptions): (req: Request) => Promise<Response> {
+  return async (req: Request): Promise<Response> => {
+    try {
+      const userId = await resolveUserId(req);
+      const { data: billingCustomer, error: billingCustomerError } = await admin
+        .from<BillingCustomerRow>("billing_customers")
+        .select("stripe_customer_id")
+        .eq("user_id", userId)
+        .maybeSingle();
+      if (billingCustomerError !== null) {
+        throw databaseError("Failed to read billing customer", billingCustomerError);
+      }
+
+      if (typeof billingCustomer?.stripe_customer_id === "string" && billingCustomer.stripe_customer_id.length > 0) {
+        try {
+          // Stripe deletion is best-effort because it retains transaction records for legal and fiscal obligations.
+          await stripe.customers.del(billingCustomer.stripe_customer_id);
+        } catch {}
+      }
+
+      const { error } = await admin.auth.admin.deleteUser(userId);
+      if (error !== null && !isUserNotFoundError(error)) {
+        throw new Error("Failed to delete user", { cause: error });
+      }
+
+      return jsonResponse(200, { deleted: true });
+    } catch (error) {
+      return accountErrorResponse(error);
+    }
+  };
+}
+
+export function createExportAccountHandler({
+  admin,
+  resolveUserId,
+}: CreateExportAccountHandlerOptions): (req: Request) => Promise<Response> {
+  return async (req: Request): Promise<Response> => {
+    try {
+      const userId = await resolveUserId(req);
+      const [profileResult, entitlementsResult, creditLedgerResult, syncedSettingsResult, billingResult] = await Promise.all([
+        admin
+          .from<AccountProfileRow>("profiles")
+          .select("id,email,display_name,avatar_url,created_at,updated_at")
+          .eq("id", userId)
+          .maybeSingle(),
+        admin
+          .from<AccountEntitlementRow>("entitlements")
+          .select("id,key,value,granted_at,expires_at,source")
+          .eq("user_id", userId),
+        admin
+          .from<AccountCreditLedgerRow>("credit_ledger")
+          .select("id,amount_cents,kind,description,stripe_event_id,stripe_checkout_session_id,metadata,created_at,idempotency_key")
+          .eq("user_id", userId),
+        admin
+          .from<AccountSyncedSettingRow>("settings_sync")
+          .select("field_group,payload,updated_at")
+          .eq("user_id", userId)
+          .is("deleted_at", null),
+        admin
+          .from<BillingCustomerRow>("billing_customers")
+          .select("stripe_customer_id")
+          .eq("user_id", userId)
+          .maybeSingle(),
+      ]);
+
+      for (const result of [profileResult, entitlementsResult, creditLedgerResult, syncedSettingsResult, billingResult]) {
+        if (result.error !== null) {
+          throw databaseError("Failed to export account data", result.error);
+        }
+      }
+
+      const stripeCustomerId = billingResult.data?.stripe_customer_id ?? null;
+      return jsonResponse(200, {
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        profile: profileResult.data,
+        entitlements: entitlementsResult.data ?? [],
+        creditLedger: creditLedgerResult.data ?? [],
+        syncedSettings: syncedSettingsResult.data ?? [],
+        billing: {
+          hasStripeCustomer: stripeCustomerId !== null,
+          stripeCustomerId,
+        },
+      });
+    } catch (error) {
+      return accountErrorResponse(error);
+    }
+  };
+}
+
 export function jsonResponse(status: number, body: unknown, headers: HeadersInit = {}): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -666,4 +827,16 @@ function invalidRpcResult(): EdgeSharedError {
 
 function databaseError(message: string, cause: SupabaseErrorLike): EdgeSharedError {
   return new EdgeSharedError("database_error", message, { cause });
+}
+
+function accountErrorResponse(error: unknown): Response {
+  if (error instanceof EdgeSharedError) {
+    return jsonResponse(error.code === "unauthorized" ? 401 : 400, { error: error.code });
+  }
+
+  return jsonResponse(500, { error: "internal_error" });
+}
+
+function isUserNotFoundError(error: SupabaseErrorLike): boolean {
+  return error.code === "user_not_found" || /user not found/i.test(error.message);
 }

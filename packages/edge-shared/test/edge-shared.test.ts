@@ -3,6 +3,8 @@ import {
   EdgeSharedError,
   assertRouteRequest,
   corsPreflightResponse,
+  createDeleteAccountHandler,
+  createExportAccountHandler,
   createOperatorRouterHandler,
   createStripeWebhookHandler,
   debitCredits,
@@ -241,6 +243,148 @@ describe("@pickforge/edge-shared", () => {
     expect(response.headers.get("access-control-allow-headers")).toBe(
       "apikey, x-client-info, authorization, content-type, x-idempotency-key",
     );
+  });
+
+  it("deletes the Stripe customer before deleting the authenticated user", async () => {
+    const admin = accountAdmin({ billing_customers: [{ user_id: USER_ID, stripe_customer_id: "cus_123" }] });
+    const stripe = { customers: { del: vi.fn(async () => ({})) } };
+    const handler = createDeleteAccountHandler({
+      admin,
+      stripe,
+      resolveUserId: vi.fn(async () => USER_ID),
+    });
+
+    const response = await handler(new Request("https://edge.test", { method: "POST" }));
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ deleted: true });
+    expect(stripe.customers.del).toHaveBeenCalledWith("cus_123");
+    expect(admin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
+    expect(stripe.customers.del.mock.invocationCallOrder[0]!).toBeLessThan(admin.auth.admin.deleteUser.mock.invocationCallOrder[0]!);
+  });
+
+  it("deletes the user without a Stripe customer and tolerates Stripe failures", async () => {
+    const noCustomerAdmin = accountAdmin();
+    const noCustomerStripe = { customers: { del: vi.fn(async () => ({})) } };
+    const noCustomerHandler = createDeleteAccountHandler({
+      admin: noCustomerAdmin,
+      stripe: noCustomerStripe,
+      resolveUserId: vi.fn(async () => USER_ID),
+    });
+
+    await expect(noCustomerHandler(new Request("https://edge.test", { method: "POST" }))).resolves.toMatchObject({
+      status: 200,
+    });
+    expect(noCustomerStripe.customers.del).not.toHaveBeenCalled();
+    expect(noCustomerAdmin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
+
+    const failingStripeAdmin = accountAdmin({ billing_customers: [{ user_id: USER_ID, stripe_customer_id: "cus_456" }] });
+    const failingStripe = { customers: { del: vi.fn(async () => Promise.reject(new Error("Stripe unavailable"))) } };
+    const failingStripeHandler = createDeleteAccountHandler({
+      admin: failingStripeAdmin,
+      stripe: failingStripe,
+      resolveUserId: vi.fn(async () => USER_ID),
+    });
+
+    await expect(failingStripeHandler(new Request("https://edge.test", { method: "POST" }))).resolves.toMatchObject({
+      status: 200,
+    });
+    expect(failingStripeAdmin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
+  });
+
+  it("treats a missing auth user as deleted and returns 500 for other deletion failures", async () => {
+    const missingUserAdmin = accountAdmin();
+    missingUserAdmin.auth.admin.deleteUser.mockResolvedValue({ error: { code: "user_not_found", message: "User not found" } });
+    const missingUserHandler = createDeleteAccountHandler({
+      admin: missingUserAdmin,
+      stripe: { customers: { del: vi.fn() } },
+      resolveUserId: vi.fn(async () => USER_ID),
+    });
+
+    const missingUserResponse = await missingUserHandler(new Request("https://edge.test", { method: "POST" }));
+    expect(missingUserResponse.status).toBe(200);
+    await expect(missingUserResponse.json()).resolves.toEqual({ deleted: true });
+
+    const failedDeleteAdmin = accountAdmin();
+    failedDeleteAdmin.auth.admin.deleteUser.mockResolvedValue({ error: { message: "Database unavailable" } });
+    const failedDeleteHandler = createDeleteAccountHandler({
+      admin: failedDeleteAdmin,
+      stripe: { customers: { del: vi.fn() } },
+      resolveUserId: vi.fn(async () => USER_ID),
+    });
+
+    const failedDeleteResponse = await failedDeleteHandler(new Request("https://edge.test", { method: "POST" }));
+    expect(failedDeleteResponse.status).toBe(500);
+    await expect(failedDeleteResponse.json()).resolves.toEqual({ error: "internal_error" });
+  });
+
+  it("returns unauthorized for account deletion without an authenticated user", async () => {
+    const handler = createDeleteAccountHandler({
+      admin: accountAdmin(),
+      stripe: { customers: { del: vi.fn() } },
+      resolveUserId: async () => {
+        throw new EdgeSharedError("unauthorized", "Unauthorized");
+      },
+    });
+
+    const response = await handler(new Request("https://edge.test", { method: "POST" }));
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({ error: "unauthorized" });
+  });
+
+  it("exports every portable account data section", async () => {
+    const handler = createExportAccountHandler({
+      admin: accountAdmin({
+        profiles: [{ id: USER_ID, email: "dev@pickforge.test", display_name: "Dev", avatar_url: null, created_at: "2026-01-01T00:00:00.000Z", updated_at: "2026-01-02T00:00:00.000Z" }],
+        entitlements: [{ user_id: USER_ID, id: "ent_123", key: "pro", value: true, granted_at: "2026-01-01T00:00:00.000Z", expires_at: null, source: "stripe" }],
+        credit_ledger: [{ user_id: USER_ID, id: "ledger_123", amount_cents: 500, kind: "credit", description: "Pack", stripe_event_id: "evt_123", stripe_checkout_session_id: "cs_123", metadata: { pack: "p10" }, created_at: "2026-01-01T00:00:00.000Z", idempotency_key: "stripe:evt_123" }],
+        settings_sync: [
+          { user_id: USER_ID, field_group: "preferences", payload: { theme: "dark" }, updated_at: "2026-01-01T00:00:00.000Z", deleted_at: null },
+          { user_id: USER_ID, field_group: "archive", payload: {}, updated_at: "2026-01-01T00:00:00.000Z", deleted_at: "2026-01-02T00:00:00.000Z" },
+        ],
+        billing_customers: [{ user_id: USER_ID, stripe_customer_id: "cus_123" }],
+      }),
+      resolveUserId: vi.fn(async () => USER_ID),
+    });
+
+    const response = await handler(new Request("https://edge.test", { method: "POST" }));
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      version: 1,
+      profile: { id: USER_ID, email: "dev@pickforge.test" },
+      entitlements: [{ id: "ent_123", key: "pro" }],
+      creditLedger: [{ id: "ledger_123", amount_cents: 500 }],
+      syncedSettings: [{ field_group: "preferences" }],
+      billing: { hasStripeCustomer: true, stripeCustomerId: "cus_123" },
+    });
+  });
+
+  it("exports empty account sections and returns unauthorized without an authenticated user", async () => {
+    const emptyHandler = createExportAccountHandler({
+      admin: accountAdmin(),
+      resolveUserId: vi.fn(async () => USER_ID),
+    });
+
+    const emptyResponse = await emptyHandler(new Request("https://edge.test", { method: "POST" }));
+    await expect(emptyResponse.json()).resolves.toMatchObject({
+      profile: null,
+      entitlements: [],
+      creditLedger: [],
+      syncedSettings: [],
+      billing: { hasStripeCustomer: false, stripeCustomerId: null },
+    });
+
+    const unauthorizedHandler = createExportAccountHandler({
+      admin: accountAdmin(),
+      resolveUserId: async () => {
+        throw new EdgeSharedError("unauthorized", "Unauthorized");
+      },
+    });
+    const unauthorizedResponse = await unauthorizedHandler(new Request("https://edge.test", { method: "POST" }));
+    expect(unauthorizedResponse.status).toBe(401);
+    await expect(unauthorizedResponse.json()).resolves.toEqual({ error: "unauthorized" });
   });
 
   it("handles verified Stripe webhook requests", async () => {
@@ -664,6 +808,61 @@ interface EntitlementRow {
   expires_at: string | null;
 }
 
+function accountAdmin(rows: Record<string, unknown[]> = {}) {
+  return {
+    auth: {
+      admin: {
+        deleteUser: vi.fn<(userId: string) => Promise<{ error: SupabaseErrorLike | null }>>(
+          async (_userId) => ({ error: null }),
+        ),
+      },
+    },
+    from<T = unknown>(table: string): AccountQuery<T> {
+      return new AccountQuery<T>(rows[table] ?? []);
+    },
+  };
+}
+
+class AccountQuery<T> implements SupabaseQueryBuilderLike<T> {
+  private readonly filters: Array<{ column: string; value: unknown }> = [];
+
+  constructor(private readonly rows: unknown[]) {}
+
+  select(): SupabaseQueryBuilderLike<T> {
+    return this;
+  }
+
+  eq(column: string, value: unknown): SupabaseQueryBuilderLike<T> {
+    this.filters.push({ column, value });
+    return this;
+  }
+
+  is(column: string, value: null): SupabaseQueryBuilderLike<T> {
+    this.filters.push({ column, value });
+    return this;
+  }
+
+  async maybeSingle(): Promise<SupabaseQueryResult<T | null>> {
+    return { data: (this.filteredRows()[0] ?? null) as T | null, error: null };
+  }
+
+  then<TResult1 = SupabaseQueryResult<T>, TResult2 = never>(
+    onfulfilled?: ((value: SupabaseQueryResult<T>) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): PromiseLike<TResult1 | TResult2> {
+    return Promise.resolve({ data: this.filteredRows() as T, error: null }).then(onfulfilled, onrejected);
+  }
+
+  private filteredRows(): unknown[] {
+    return this.rows.filter(
+      (row) =>
+        typeof row === "object" &&
+        row !== null &&
+        this.filters.every((filter) => (row as Record<string, unknown>)[filter.column] === filter.value),
+    );
+  }
+}
+
 class MemorySupabase implements SupabaseClientLike {
   readonly entitlements: EntitlementRow[] = [];
   readonly rpcCalls: Array<{ fn: string; args?: Record<string, unknown> }> = [];
@@ -710,6 +909,10 @@ class MemoryQuery<T> implements SupabaseQueryBuilderLike<T> {
   eq(column: string, value: unknown): SupabaseQueryBuilderLike<T> {
     this.filters.push({ column, value });
     return this;
+  }
+
+  is(column: string, value: null): SupabaseQueryBuilderLike<T> {
+    return this.eq(column, value);
   }
 
   async maybeSingle(): Promise<SupabaseQueryResult<T | null>> {

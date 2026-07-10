@@ -240,6 +240,10 @@ interface AccountCreditLedgerRow {
   idempotency_key: string;
 }
 
+interface StripeCustomerMetadataRow {
+  metadata: EdgeSharedJson;
+}
+
 interface AccountSyncedSettingRow {
   field_group: string;
   payload: EdgeSharedJson;
@@ -519,19 +523,28 @@ export function createDeleteAccountHandler({
   return async (req: Request): Promise<Response> => {
     try {
       const userId = await resolveUserId(req);
-      const { data: billingCustomer, error: billingCustomerError } = await admin
-        .from<BillingCustomerRow>("billing_customers")
-        .select("stripe_customer_id")
-        .eq("user_id", userId)
-        .maybeSingle();
+      const [{ data: billingCustomer, error: billingCustomerError }, ledgerRows] = await Promise.all([
+        admin
+          .from<BillingCustomerRow>("billing_customers")
+          .select("stripe_customer_id")
+          .eq("user_id", userId)
+          .maybeSingle(),
+        readCreditLedgerPages<StripeCustomerMetadataRow>(admin, userId, "metadata"),
+      ]);
       if (billingCustomerError !== null) {
         throw databaseError("Failed to read billing customer", billingCustomerError);
       }
 
-      if (typeof billingCustomer?.stripe_customer_id === "string" && billingCustomer.stripe_customer_id.length > 0) {
+      const customerIds = new Set<string>();
+      addStripeCustomerId(customerIds, billingCustomer?.stripe_customer_id);
+      for (const row of ledgerRows) {
+        addStripeCustomerId(customerIds, isRecord(row.metadata) ? row.metadata.stripe_customer_id : undefined);
+      }
+
+      for (const customerId of customerIds) {
         try {
           // One-time credit packs have no recurring charges; delete Stripe first to avoid orphaning customer PII.
-          await stripe.customers.del(billingCustomer.stripe_customer_id);
+          await stripe.customers.del(customerId);
         } catch (error) {
           if (!isStripeCustomerMissingError(error)) {
             throw new EdgeSharedError("deletion_incomplete", "Failed to delete Stripe customer", { cause: error });
@@ -856,13 +869,25 @@ async function readCreditLedgerExport(
   admin: Pick<AccountAdminClientLike, "from">,
   userId: string,
 ): Promise<AccountCreditLedgerRow[]> {
-  const entries: AccountCreditLedgerRow[] = [];
+  return readCreditLedgerPages<AccountCreditLedgerRow>(
+    admin,
+    userId,
+    "id,amount_cents,kind,description,stripe_event_id,stripe_checkout_session_id,metadata,created_at,idempotency_key",
+  );
+}
+
+async function readCreditLedgerPages<T>(
+  admin: Pick<AccountAdminClientLike, "from">,
+  userId: string,
+  columns: string,
+): Promise<T[]> {
+  const entries: T[] = [];
   const pageSize = 1000;
 
   for (let from = 0; ; from += pageSize) {
     const { data, error } = await admin
-      .from<AccountCreditLedgerRow[]>("credit_ledger")
-      .select("id,amount_cents,kind,description,stripe_event_id,stripe_checkout_session_id,metadata,created_at,idempotency_key")
+      .from<T[]>("credit_ledger")
+      .select(columns)
       .eq("user_id", userId)
       .order("id")
       .range(from, from + pageSize - 1);
@@ -875,5 +900,11 @@ async function readCreditLedgerExport(
     if (page.length < pageSize) {
       return entries;
     }
+  }
+}
+
+function addStripeCustomerId(customerIds: Set<string>, value: unknown): void {
+  if (typeof value === "string" && value.trim().length > 0) {
+    customerIds.add(value.trim());
   }
 }

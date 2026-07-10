@@ -245,8 +245,14 @@ describe("@pickforge/edge-shared", () => {
     );
   });
 
-  it("deletes the Stripe customer before deleting the authenticated user", async () => {
-    const admin = accountAdmin({ billing_customers: [{ user_id: USER_ID, stripe_customer_id: "cus_123" }] });
+  it("deletes every recorded Stripe customer before deleting the authenticated user", async () => {
+    const admin = accountAdmin({
+      billing_customers: [{ user_id: USER_ID, stripe_customer_id: "cus_current" }],
+      credit_ledger: [
+        { user_id: USER_ID, metadata: { stripe_customer_id: "cus_history" } },
+        { user_id: USER_ID, metadata: { stripe_customer_id: "cus_current" } },
+      ],
+    });
     const stripe = { customers: { del: vi.fn(async () => ({})) } };
     const handler = createDeleteAccountHandler({
       admin,
@@ -258,7 +264,9 @@ describe("@pickforge/edge-shared", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({ deleted: true });
-    expect(stripe.customers.del).toHaveBeenCalledWith("cus_123");
+    expect(stripe.customers.del).toHaveBeenCalledTimes(2);
+    expect(stripe.customers.del).toHaveBeenCalledWith("cus_current");
+    expect(stripe.customers.del).toHaveBeenCalledWith("cus_history");
     expect(admin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
     expect(stripe.customers.del.mock.invocationCallOrder[0]!).toBeLessThan(admin.auth.admin.deleteUser.mock.invocationCallOrder[0]!);
   });
@@ -279,9 +287,16 @@ describe("@pickforge/edge-shared", () => {
     expect(noCustomerAdmin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
   });
 
-  it("preserves the account when Stripe deletion fails and retries safely after a missing customer", async () => {
-    const failingStripeAdmin = accountAdmin({ billing_customers: [{ user_id: USER_ID, stripe_customer_id: "cus_456" }] });
-    const failingStripe = { customers: { del: vi.fn(async () => Promise.reject(new Error("Stripe unavailable"))) } };
+  it("preserves the account when any Stripe deletion fails and retries safely after a missing customer", async () => {
+    const failingStripeAdmin = accountAdmin({
+      billing_customers: [{ user_id: USER_ID, stripe_customer_id: "cus_456" }],
+      credit_ledger: [{ user_id: USER_ID, metadata: { stripe_customer_id: "cus_457" } }],
+    });
+    const failingStripe = {
+      customers: {
+        del: vi.fn().mockResolvedValueOnce({}).mockRejectedValueOnce(new Error("Stripe unavailable")),
+      },
+    };
     const failingStripeHandler = createDeleteAccountHandler({
       admin: failingStripeAdmin,
       stripe: failingStripe,
@@ -291,11 +306,15 @@ describe("@pickforge/edge-shared", () => {
     const failedResponse = await failingStripeHandler(new Request("https://edge.test", { method: "POST" }));
     expect(failedResponse.status).toBe(503);
     await expect(failedResponse.json()).resolves.toEqual({ error: "deletion_incomplete" });
+    expect(failingStripe.customers.del).toHaveBeenCalledTimes(2);
     expect(failingStripeAdmin.auth.admin.deleteUser).not.toHaveBeenCalled();
 
-    const missingStripeAdmin = accountAdmin({ billing_customers: [{ user_id: USER_ID, stripe_customer_id: "cus_789" }] });
+    const missingStripeAdmin = accountAdmin({
+      billing_customers: [{ user_id: USER_ID, stripe_customer_id: "cus_789" }],
+      credit_ledger: [{ user_id: USER_ID, metadata: { stripe_customer_id: "cus_790" } }],
+    });
     const missingStripe = {
-      customers: { del: vi.fn(async () => Promise.reject({ code: "resource_missing" })) },
+      customers: { del: vi.fn().mockRejectedValueOnce({ code: "resource_missing" }).mockResolvedValueOnce({}) },
     };
     const missingStripeHandler = createDeleteAccountHandler({
       admin: missingStripeAdmin,

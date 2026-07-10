@@ -1,5 +1,6 @@
 export type EdgeSharedErrorCode =
   | "database_error"
+  | "deletion_incomplete"
   | "entitlement_required"
   | "insufficient_credits"
   | "invalid_debit_amount"
@@ -41,6 +42,9 @@ export interface SupabaseAuthLike {
 export interface SupabaseQueryBuilderLike<T = unknown> extends PromiseLike<SupabaseQueryResult<T>> {
   select(columns?: string): SupabaseQueryBuilderLike<T>;
   eq(column: string, value: unknown): SupabaseQueryBuilderLike<T>;
+  is(column: string, value: null): SupabaseQueryBuilderLike<T>;
+  order(column: string, options?: { ascending?: boolean }): SupabaseQueryBuilderLike<T>;
+  range(from: number, to: number): SupabaseQueryBuilderLike<T>;
   maybeSingle(): PromiseLike<SupabaseQueryResult<T | null>>;
 }
 
@@ -174,6 +178,76 @@ export interface CreateOperatorRouterHandlerOptions {
   baseUrl: string;
   creditCostCents: number;
   systemPrompt?: string;
+}
+
+export interface AccountAdminClientLike {
+  auth: {
+    admin: {
+      deleteUser(userId: string): PromiseLike<{ error: SupabaseErrorLike | null }>;
+    };
+  };
+  from<T = unknown>(table: string): SupabaseQueryBuilderLike<T>;
+}
+
+export interface StripeCustomerClientLike {
+  customers: {
+    del(customerId: string): PromiseLike<unknown>;
+  };
+}
+
+export interface CreateDeleteAccountHandlerOptions {
+  admin: AccountAdminClientLike;
+  stripe: StripeCustomerClientLike;
+  resolveUserId(req: Request): Promise<string>;
+}
+
+export interface CreateExportAccountHandlerOptions {
+  admin: Pick<AccountAdminClientLike, "from">;
+  resolveUserId(req: Request): Promise<string>;
+}
+
+interface BillingCustomerRow {
+  stripe_customer_id: string | null;
+}
+
+interface AccountProfileRow {
+  id: string;
+  email: string;
+  display_name: string | null;
+  avatar_url: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface AccountEntitlementRow {
+  id: string;
+  key: string;
+  value: EdgeSharedJson;
+  granted_at: string;
+  expires_at: string | null;
+  source: string;
+}
+
+interface AccountCreditLedgerRow {
+  id: string;
+  amount_cents: number;
+  kind: string;
+  description: string | null;
+  stripe_event_id: string | null;
+  stripe_checkout_session_id: string | null;
+  metadata: EdgeSharedJson;
+  created_at: string;
+  idempotency_key: string;
+}
+
+interface StripeCustomerMetadataRow {
+  metadata: EdgeSharedJson;
+}
+
+interface AccountSyncedSettingRow {
+  field_group: string;
+  payload: EdgeSharedJson;
+  updated_at: string;
 }
 
 export interface StoredRouteProposal {
@@ -441,6 +515,110 @@ export function createOperatorRouterHandler({
   };
 }
 
+export function createDeleteAccountHandler({
+  admin,
+  stripe,
+  resolveUserId,
+}: CreateDeleteAccountHandlerOptions): (req: Request) => Promise<Response> {
+  return async (req: Request): Promise<Response> => {
+    try {
+      const userId = await resolveUserId(req);
+      const [{ data: billingCustomer, error: billingCustomerError }, ledgerRows] = await Promise.all([
+        admin
+          .from<BillingCustomerRow>("billing_customers")
+          .select("stripe_customer_id")
+          .eq("user_id", userId)
+          .maybeSingle(),
+        readCreditLedgerPages<StripeCustomerMetadataRow>(admin, userId, "metadata"),
+      ]);
+      if (billingCustomerError !== null) {
+        throw databaseError("Failed to read billing customer", billingCustomerError);
+      }
+
+      const customerIds = new Set<string>();
+      addStripeCustomerId(customerIds, billingCustomer?.stripe_customer_id);
+      for (const row of ledgerRows) {
+        addStripeCustomerId(customerIds, isRecord(row.metadata) ? row.metadata.stripe_customer_id : undefined);
+      }
+
+      for (const customerId of customerIds) {
+        try {
+          // One-time credit packs have no recurring charges; delete Stripe first to avoid orphaning customer PII.
+          await stripe.customers.del(customerId);
+        } catch (error) {
+          if (!isStripeCustomerMissingError(error)) {
+            throw new EdgeSharedError("deletion_incomplete", "Failed to delete Stripe customer", { cause: error });
+          }
+        }
+      }
+
+      const { error } = await admin.auth.admin.deleteUser(userId);
+      if (error !== null && !isUserNotFoundError(error)) {
+        throw new Error("Failed to delete user", { cause: error });
+      }
+
+      return jsonResponse(200, { deleted: true });
+    } catch (error) {
+      return accountErrorResponse(error);
+    }
+  };
+}
+
+export function createExportAccountHandler({
+  admin,
+  resolveUserId,
+}: CreateExportAccountHandlerOptions): (req: Request) => Promise<Response> {
+  return async (req: Request): Promise<Response> => {
+    try {
+      const userId = await resolveUserId(req);
+      const [profileResult, entitlementsResult, creditLedger, syncedSettingsResult, billingResult] = await Promise.all([
+        admin
+          .from<AccountProfileRow>("profiles")
+          .select("id,email,display_name,avatar_url,created_at,updated_at")
+          .eq("id", userId)
+          .maybeSingle(),
+        admin
+          .from<AccountEntitlementRow>("entitlements")
+          .select("id,key,value,granted_at,expires_at,source")
+          .eq("user_id", userId),
+        readCreditLedgerExport(admin, userId),
+        admin
+          .from<AccountSyncedSettingRow>("settings_sync")
+          .select("field_group,payload,updated_at")
+          .eq("user_id", userId)
+          .is("deleted_at", null),
+        admin
+          .from<BillingCustomerRow>("billing_customers")
+          .select("stripe_customer_id")
+          .eq("user_id", userId)
+          .maybeSingle(),
+      ]);
+
+      for (const result of [profileResult, entitlementsResult, syncedSettingsResult, billingResult]) {
+        if (result.error !== null) {
+          throw databaseError("Failed to export account data", result.error);
+        }
+      }
+
+      const stripeCustomerId = billingResult.data?.stripe_customer_id ?? null;
+      return jsonResponse(200, {
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        profile: profileResult.data,
+        entitlements: entitlementsResult.data ?? [],
+        creditLedger,
+        syncedSettings: syncedSettingsResult.data ?? [],
+        billing: {
+          hasStripeCustomer: stripeCustomerId !== null,
+          stripeCustomerId,
+        },
+      });
+    } catch (error) {
+      return accountErrorResponse(error);
+    }
+  };
+}
+
 export function jsonResponse(status: number, body: unknown, headers: HeadersInit = {}): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -666,4 +844,67 @@ function invalidRpcResult(): EdgeSharedError {
 
 function databaseError(message: string, cause: SupabaseErrorLike): EdgeSharedError {
   return new EdgeSharedError("database_error", message, { cause });
+}
+
+function accountErrorResponse(error: unknown): Response {
+  if (error instanceof EdgeSharedError) {
+    if (error.code === "unauthorized") return jsonResponse(401, { error: error.code });
+    if (error.code === "deletion_incomplete") return jsonResponse(503, { error: error.code });
+    if (error.code === "database_error") return jsonResponse(500, { error: "internal_error" });
+    return jsonResponse(400, { error: error.code });
+  }
+
+  return jsonResponse(500, { error: "internal_error" });
+}
+
+function isUserNotFoundError(error: SupabaseErrorLike): boolean {
+  return error.code === "user_not_found" || /user not found/i.test(error.message);
+}
+
+function isStripeCustomerMissingError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && (error as { code?: unknown }).code === "resource_missing";
+}
+
+async function readCreditLedgerExport(
+  admin: Pick<AccountAdminClientLike, "from">,
+  userId: string,
+): Promise<AccountCreditLedgerRow[]> {
+  return readCreditLedgerPages<AccountCreditLedgerRow>(
+    admin,
+    userId,
+    "id,amount_cents,kind,description,stripe_event_id,stripe_checkout_session_id,metadata,created_at,idempotency_key",
+  );
+}
+
+async function readCreditLedgerPages<T>(
+  admin: Pick<AccountAdminClientLike, "from">,
+  userId: string,
+  columns: string,
+): Promise<T[]> {
+  const entries: T[] = [];
+  const pageSize = 1000;
+
+  for (let from = 0; ; from += pageSize) {
+    const { data, error } = await admin
+      .from<T[]>("credit_ledger")
+      .select(columns)
+      .eq("user_id", userId)
+      .order("id")
+      .range(from, from + pageSize - 1);
+    if (error !== null) {
+      throw databaseError("Failed to export credit ledger", error);
+    }
+
+    const page = data ?? [];
+    entries.push(...page);
+    if (page.length < pageSize) {
+      return entries;
+    }
+  }
+}
+
+function addStripeCustomerId(customerIds: Set<string>, value: unknown): void {
+  if (typeof value === "string" && value.trim().length > 0) {
+    customerIds.add(value.trim());
+  }
 }

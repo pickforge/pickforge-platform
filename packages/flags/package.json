@@ -1,6 +1,6 @@
 {
   "name": "@pickforge/flags",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "UI-free feature-flag registry for release gating in Pickforge apps.",
   "license": "MIT",
   "repository": {

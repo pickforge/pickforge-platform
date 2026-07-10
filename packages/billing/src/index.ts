@@ -51,7 +51,8 @@ export type StripeWebhookPayload = string | Uint8Array | ArrayBuffer;
 
 export interface StripeCheckoutSessionCreateParams {
   mode: "payment";
-  customer_creation: "always";
+  customer_creation?: "always";
+  customer?: string;
   client_reference_id: string;
   line_items: Array<{
     price: string;
@@ -148,6 +149,7 @@ export interface CreateCreditCheckoutSessionOptions {
   priceId: string;
   successUrl: string;
   cancelUrl: string;
+  existingCustomerId?: string;
 }
 
 export interface GetCreditBalanceOptions {
@@ -215,15 +217,17 @@ export async function createCreditCheckoutSession<TSession = unknown>({
   priceId,
   successUrl,
   cancelUrl,
+  existingCustomerId,
 }: CreateCreditCheckoutSessionOptions): Promise<TSession> {
   const validUserId = validateUuid(userId, "userId");
   const validPriceId = validateNonEmptyString(priceId, "priceId");
   const validSuccessUrl = validateNonEmptyString(successUrl, "successUrl");
   const validCancelUrl = validateNonEmptyString(cancelUrl, "cancelUrl");
+  const customer = typeof existingCustomerId === "string" && existingCustomerId.trim().length > 0 ? existingCustomerId : undefined;
 
   return stripe.checkout.sessions.create<TSession>({
     mode: "payment",
-    customer_creation: "always",
+    ...(customer === undefined ? { customer_creation: "always" as const } : { customer }),
     client_reference_id: validUserId,
     line_items: [
       {

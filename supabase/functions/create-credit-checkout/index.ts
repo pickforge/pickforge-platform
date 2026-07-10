@@ -11,22 +11,30 @@ import {
 
 const supabaseUrl = requiredEnv("SUPABASE_URL");
 const supabaseAnonKey = requiredEnv("SUPABASE_ANON_KEY");
+const serviceSupabase = createClient(supabaseUrl, requiredEnv("SUPABASE_SERVICE_ROLE_KEY"), {
+  auth: { autoRefreshToken: false, persistSession: false },
+});
 const stripe = new Stripe(requiredEnv("STRIPE_SECRET_KEY"));
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return corsPreflightResponse();
   }
+  if (req.method !== "POST") {
+    return respond(405, { error: "method_not_allowed" });
+  }
 
   try {
     const { userId } = await getUserFromRequest({ supabase: createCallerSupabase(req), req });
     const { pack } = await readCheckoutRequest(req);
+    const existingCustomerId = await readExistingCustomerId(userId);
     const session = await createCreditCheckoutSession<{ url: string | null }>({
       stripe,
       userId,
       priceId: priceIdForPack(pack),
       successUrl: requiredEnv("CHECKOUT_SUCCESS_URL"),
       cancelUrl: requiredEnv("CHECKOUT_CANCEL_URL"),
+      existingCustomerId,
     });
     if (typeof session.url !== "string" || session.url.length === 0) {
       throw new Error("Stripe checkout session did not include a URL");
@@ -51,6 +59,21 @@ function createCallerSupabase(req: Request) {
     auth: { autoRefreshToken: false, persistSession: false },
     global: { headers: { Authorization: req.headers.get("authorization") ?? "" } },
   });
+}
+
+async function readExistingCustomerId(userId: string): Promise<string | undefined> {
+  const { data, error } = await serviceSupabase
+    .from<{ stripe_customer_id: string | null }>("billing_customers")
+    .select("stripe_customer_id")
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (error !== null) {
+    throw new Error("Failed to read billing customer", { cause: error });
+  }
+
+  return typeof data?.stripe_customer_id === "string" && data.stripe_customer_id.length > 0
+    ? data.stripe_customer_id
+    : undefined;
 }
 
 function respond(status: number, body: unknown): Response {

@@ -9,12 +9,12 @@ Apply Pickforge constraints as a thin overlay on `design-director`. Do not creat
 
 ## Start
 
-1. Invoke or read `design-director` and choose its light or directed path.
+1. Invoke or read the separately installed `design-director` skill and choose its light or directed path.
 2. Read the target repo's `AGENTS.md`, `CLAUDE.md` when applicable, and the current surface before proposing changes.
 3. Load the relevant sources from [pickforge-context.md](references/pickforge-context.md). Local files are canonical.
-4. For directed work, prefill the shared `design-director/references/prompt-contract.md` with the Pickforge constraints below. The task's named design lead still owns the aesthetic decisions and final screenshot acceptance.
+4. For directed work, resolve `design-director` from the active harness's skill catalog and prefill its `references/prompt-contract.md` with the Pickforge constraints below. It is a sibling skill, never a child of `pickforge-ui`. The task's named design lead still owns the aesthetic decisions and final screenshot acceptance.
 
-If `design-director` is not installed, report the missing shared dependency and use this overlay only for immediate context gathering. Do not fork or duplicate its contract here.
+If `design-director` is not installed, stop directed work and report the missing shared dependency. Do not fork or duplicate its contract here. The workspace link script distributes this Pickforge overlay only; personal agent configuration installs the general skill separately.
 
 ## Contract overrides
 

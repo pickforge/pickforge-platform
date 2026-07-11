@@ -1,6 +1,6 @@
 # Pickforge design context
 
-Load only what the task needs. Resolve paths from `/home/dev/Projects/Pickforge` or the current workspace root.
+Load only what the task needs. Find the Pickforge workspace root by locating the sibling `branding-visual/` checkout; `/home/dev/Projects/Pickforge` is the normal personal location. If the canonical checkout is absent, stop directed Pickforge visual work and report the missing dependency. Do not substitute the Claude Design mirror.
 
 ## Always for directed visual work
 

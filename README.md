@@ -20,6 +20,11 @@ Run `scripts/link-workspace-skills.sh` to symlink them into the workspace root
 and every sibling repo (rerun after adding a repo or a skill) — skill discovery
 does not traverse parent directories, so each repo needs its own link.
 
+`pickforge-ui` is the workspace-specific overlay. Its directed workflow also
+requires the separately installed personal `design-director` skill and a sibling
+`branding-visual/` checkout. The link script does not install those external
+dependencies; the overlay fails closed when either canonical source is missing.
+
 App-local skills (like each app's `run` skill) live canonically in that repo's
 `.agents/skills/<name>/SKILL.md`, with `.claude/skills/<name>` committed as a
 relative symlink (`../../.agents/skills/<name>`) so both Claude and other

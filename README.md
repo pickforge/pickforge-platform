@@ -14,7 +14,8 @@ feed.
 
 ## Workspace skills
 
-`skills/` holds agent runbooks shared across the workspace (`release`, `ci`).
+`skills/` holds agent runbooks shared across the workspace (`release`, `ci`,
+`pickforge-ui`).
 Run `scripts/link-workspace-skills.sh` to symlink them into the workspace root
 and every sibling repo (rerun after adding a repo or a skill) — skill discovery
 does not traverse parent directories, so each repo needs its own link.

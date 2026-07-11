@@ -1,0 +1,7 @@
+interface:
+  display_name: "Pickforge UI"
+  short_description: "Apply Pickforge's design system to product UI"
+  default_prompt: "Use $pickforge-ui to direct this Pickforge UI change."
+
+policy:
+  allow_implicit_invocation: true

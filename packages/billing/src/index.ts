@@ -8,7 +8,9 @@ export type BillingErrorCode =
   | "invalid_string"
   | "invalid_stripe_event"
   | "invalid_stripe_event_object"
-  | "invalid_user_id";
+  | "invalid_user_id"
+  | "refund_incomplete"
+  | "refund_terminal_failure";
 
 export type BillingJson =
   | string
@@ -62,11 +64,29 @@ export interface StripeCheckoutSessionCreateParams {
   cancel_url: string;
 }
 
+export interface StripeRefundLike {
+  id: string;
+  amount: number;
+  status: string | null;
+}
+
 export interface StripeClientLike {
   checkout: {
     sessions: {
       create<TSession = unknown>(params: StripeCheckoutSessionCreateParams): Promise<TSession>;
     };
+  };
+  refunds: {
+    create(
+      params: { payment_intent: string },
+      options: { idempotencyKey: string },
+    ): Promise<StripeRefundLike>;
+    retrieve(refundId: string): Promise<StripeRefundLike>;
+    list(params: {
+      payment_intent: string;
+      limit: number;
+      starting_after?: string;
+    }): Promise<{ data: StripeRefundLike[]; has_more: boolean }>;
   };
   webhooks: {
     constructEventAsync(
@@ -111,8 +131,8 @@ export interface SupabaseQueryBuilderLike<T = unknown> extends PromiseLike<Supab
 }
 
 export interface SupabaseClientLike {
-  from<T = unknown>(table: string): SupabaseQueryBuilderLike<T>;
-  rpc<T = unknown>(fn: string, args?: Record<string, unknown>): PromiseLike<SupabaseQueryResult<T>>;
+  from(table: string): unknown;
+  rpc(fn: string, args?: Record<string, unknown>): unknown;
 }
 
 export class BillingError extends Error {
@@ -135,12 +155,30 @@ export interface VerifyStripeEventOptions {
 
 export interface ProcessStripeEventOptions {
   supabase: SupabaseClientLike;
+  stripe: Pick<StripeClientLike, "refunds">;
   event: StripeEventLike;
 }
 
 export interface ProcessStripeEventResult {
   handled: boolean;
   duplicate: boolean;
+  reconciliation?: "deletion_race_refunded";
+}
+
+type CheckoutCompletionReconciliation =
+  | "credited"
+  | "refund"
+  | "refunded"
+  | "duplicate";
+
+interface CheckoutCompletionReconciliationArgs extends Record<string, unknown> {
+  target_user: string;
+  checkout_session_id: string;
+  event_id: string;
+  event_type: string;
+  amount_total_cents: number;
+  stripe_customer_id: string | null;
+  stripe_payment_intent_id: string;
 }
 
 export interface CreateCreditCheckoutSessionOptions {
@@ -169,6 +207,7 @@ interface StripeCheckoutSessionObject {
   customer?: unknown;
   client_reference_id?: unknown;
   payment_status?: unknown;
+  payment_intent?: unknown;
 }
 
 interface CreditLedgerRow {
@@ -197,12 +236,13 @@ export async function verifyStripeEvent({
 
 export async function processStripeEvent({
   supabase,
+  stripe,
   event,
 }: ProcessStripeEventOptions): Promise<ProcessStripeEventResult> {
   assertStripeEvent(event);
 
   if (isCheckoutMoneyEvent(event.type)) {
-    const result = await processCheckoutSessionMoneyEvent({ supabase, event });
+    const result = await processCheckoutSessionMoneyEvent({ supabase, stripe, event });
     await recordStripeEventBestEffort(supabase, event);
 
     return result;
@@ -245,9 +285,9 @@ export async function getCreditBalanceCents({
   userId,
 }: GetCreditBalanceOptions): Promise<number> {
   const validUserId = validateUuid(userId, "userId");
-  const { data, error } = await supabase.rpc<number>("credit_balance_cents", {
+  const { data, error } = await (supabase.rpc("credit_balance_cents", {
     target_user: validUserId,
-  });
+  }) as PromiseLike<SupabaseQueryResult<number>>);
   if (error !== null) {
     throw databaseError("Failed to read credit balance", error);
   }
@@ -264,8 +304,7 @@ export async function listLedgerEntries({
   limit,
 }: ListLedgerEntriesOptions): Promise<CreditLedgerEntry[]> {
   const validUserId = validateUuid(userId, "userId");
-  let query = supabase
-    .from<CreditLedgerRow[]>("credit_ledger")
+  let query = (supabase.from("credit_ledger") as SupabaseQueryBuilderLike<CreditLedgerRow[]>)
     .select("id,user_id,amount_cents,kind,description,stripe_event_id,stripe_checkout_session_id,metadata,created_at")
     .eq("user_id", validUserId)
     .order("created_at", { ascending: false });
@@ -284,6 +323,7 @@ export async function listLedgerEntries({
 
 async function processCheckoutSessionMoneyEvent({
   supabase,
+  stripe,
   event,
 }: ProcessStripeEventOptions): Promise<ProcessStripeEventResult> {
   const session = getObject<StripeCheckoutSessionObject>(event);
@@ -297,65 +337,166 @@ async function processCheckoutSessionMoneyEvent({
 
   const amountCents = validateCheckoutAmount(session.amount_total);
   const customerId = readStripeObjectId(session.customer);
-
-  if (customerId !== null) {
-    const customerUpsert = await supabase.from("billing_customers").upsert(
-      {
-        user_id: userId,
-        stripe_customer_id: customerId,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: "user_id" },
-    );
-    if (customerUpsert.error !== null) {
-      throw databaseError("Failed to upsert billing customer", customerUpsert.error);
-    }
-  }
-
-  const ledgerInsert = await insertLedgerEntry(supabase, {
-    user_id: userId,
-    amount_cents: amountCents,
-    kind: "purchase",
-    description: "Credit purchase",
-    stripe_event_id: event.id,
-    stripe_checkout_session_id: sessionId,
-    metadata: compactMetadata({
-      amount_total: amountCents,
-      stripe_customer_id: customerId,
-      stripe_checkout_session_id: sessionId,
-      stripe_event_type: event.type,
-    }),
+  const paymentIntentId = validateNonEmptyString(
+    readStripeObjectId(session.payment_intent),
+    "payment_intent",
+  );
+  const reconciliation = await reconcileCheckoutCompletion(supabase, {
+    target_user: userId,
+    checkout_session_id: sessionId,
+    event_id: event.id,
+    event_type: event.type,
+    amount_total_cents: amountCents,
+    stripe_customer_id: customerId,
+    stripe_payment_intent_id: paymentIntentId,
   });
 
-  if (ledgerInsert === "duplicate") {
+  if (reconciliation === "duplicate") {
     return { handled: false, duplicate: true };
+  }
+  if (reconciliation === "refunded") {
+    return {
+      handled: false,
+      duplicate: true,
+      reconciliation: "deletion_race_refunded",
+    };
+  }
+  if (reconciliation === "refund") {
+    let createdRefund: StripeRefundLike;
+    try {
+      createdRefund = await stripe.refunds.create(
+        { payment_intent: paymentIntentId },
+        { idempotencyKey: `checkout-deletion:${sessionId}` },
+      );
+    } catch (error) {
+      if (
+        !isStripeAlreadyRefundedError(error) ||
+        !(await isPaymentIntentFullyRefunded(stripe, paymentIntentId, amountCents))
+      ) {
+        throw error;
+      }
+      await markCheckoutRefunded(supabase, sessionId, event.id);
+      return {
+        handled: true,
+        duplicate: false,
+        reconciliation: "deletion_race_refunded",
+      };
+    }
+
+    const refundId = validateNonEmptyString(createdRefund.id, "refund id");
+    const refund = await stripe.refunds.retrieve(refundId);
+    if (refund.status === "failed" || refund.status === "canceled") {
+      await recordCheckoutRefundFailure(supabase, sessionId, event.id, refundId, refund.status);
+      throw new BillingError(
+        "refund_terminal_failure",
+        `The deletion-race refund reached terminal status ${refund.status}`,
+      );
+    }
+    if (refund.status !== "succeeded") {
+      throw new BillingError(
+        "refund_incomplete",
+        "The deletion-race refund has not succeeded",
+      );
+    }
+    await markCheckoutRefunded(supabase, sessionId, event.id);
+    return {
+      handled: true,
+      duplicate: false,
+      reconciliation: "deletion_race_refunded",
+    };
   }
 
   return { handled: true, duplicate: false };
 }
 
-async function insertLedgerEntry(
+async function reconcileCheckoutCompletion(
   supabase: SupabaseClientLike,
-  values: {
-    user_id: string;
-    amount_cents: number;
-    kind: LedgerKind;
-    description: string;
-    stripe_event_id: string;
-    stripe_checkout_session_id: string | null;
-    metadata: BillingMetadata;
-  },
-): Promise<"inserted" | "duplicate"> {
-  const { error } = await supabase.from("credit_ledger").insert(values);
+  args: CheckoutCompletionReconciliationArgs,
+): Promise<CheckoutCompletionReconciliation> {
+  const { data, error } = await (supabase.rpc(
+    "checkout_lifecycle_reconcile_completion",
+    args,
+  ) as PromiseLike<SupabaseQueryResult<string>>);
   if (error !== null) {
-    if (isUniqueViolation(error)) {
-      return "duplicate";
-    }
-
-    throw databaseError("Failed to insert credit ledger entry", error);
+    throw databaseError("Failed to reconcile Checkout Session completion", error);
+  }
+  if (
+    data === "credited" ||
+    data === "refund" ||
+    data === "refunded" ||
+    data === "duplicate"
+  ) {
+    return data;
   }
 
-  return "inserted";
+  throw databaseError("Invalid Checkout Session reconciliation response", {
+    message: "checkout_lifecycle_reconcile_completion returned an unknown result",
+  });
+}
+
+async function markCheckoutRefunded(
+  supabase: SupabaseClientLike,
+  sessionId: string,
+  eventId: string,
+): Promise<void> {
+  const { error } = await (supabase.rpc("checkout_lifecycle_mark_refunded", {
+    checkout_session_id: sessionId,
+    event_id: eventId,
+  }) as PromiseLike<SupabaseQueryResult<unknown>>);
+  if (error !== null) {
+    throw databaseError("Failed to mark Checkout Session refunded", error);
+  }
+}
+
+async function recordCheckoutRefundFailure(
+  supabase: SupabaseClientLike,
+  sessionId: string,
+  eventId: string,
+  refundId: string,
+  failureStatus: "failed" | "canceled",
+): Promise<void> {
+  const { error } = await (supabase.rpc("checkout_lifecycle_record_refund_failure", {
+    checkout_session_id: sessionId,
+    event_id: eventId,
+    refund_id: refundId,
+    failure_status: failureStatus,
+  }) as PromiseLike<SupabaseQueryResult<unknown>>);
+  if (error !== null) {
+    throw databaseError("Failed to record terminal Checkout Session refund failure", error);
+  }
+}
+
+async function isPaymentIntentFullyRefunded(
+  stripe: Pick<StripeClientLike, "refunds">,
+  paymentIntentId: string,
+  amountCents: number,
+): Promise<boolean> {
+  let refundedCents = 0;
+  let startingAfter: string | undefined;
+
+  for (;;) {
+    const page = await stripe.refunds.list({
+      payment_intent: paymentIntentId,
+      limit: 100,
+      ...(startingAfter === undefined ? {} : { starting_after: startingAfter }),
+    });
+    for (const refund of page.data) {
+      if (refund.status === "succeeded" && Number.isSafeInteger(refund.amount) && refund.amount > 0) {
+        refundedCents += refund.amount;
+      }
+    }
+    if (refundedCents >= amountCents) {
+      return true;
+    }
+    if (!page.has_more) {
+      return false;
+    }
+    const lastRefund = page.data.at(-1);
+    if (lastRefund === undefined) {
+      return false;
+    }
+    startingAfter = lastRefund.id;
+  }
 }
 
 async function recordStripeEventBestEffort(
@@ -363,10 +504,11 @@ async function recordStripeEventBestEffort(
   event: StripeEventLike,
 ): Promise<void> {
   try {
-    await supabase.from("stripe_events").insert({
-      event_id: event.id,
-      type: event.type,
-    });
+    await (supabase.from("stripe_events") as SupabaseQueryBuilderLike)
+      .insert({
+        event_id: event.id,
+        type: event.type,
+      });
   } catch {
     return;
   }
@@ -376,10 +518,11 @@ async function recordUnrecognizedStripeEvent(
   supabase: SupabaseClientLike,
   event: StripeEventLike,
 ): Promise<ProcessStripeEventResult> {
-  const { error } = await supabase.from("stripe_events").insert({
-    event_id: event.id,
-    type: event.type,
-  });
+  const { error } = await (supabase.from("stripe_events") as SupabaseQueryBuilderLike)
+    .insert({
+      event_id: event.id,
+      type: event.type,
+    });
   if (error !== null) {
     if (isUniqueViolation(error)) {
       return { handled: false, duplicate: true };
@@ -450,11 +593,16 @@ function validateUuid(value: unknown, field: string): string {
 }
 
 function validateNonEmptyString(value: unknown, field: string): string {
+
   if (typeof value !== "string" || value.length === 0) {
     throw new BillingError("invalid_string", `${field} must be a non-empty string`);
   }
 
   return value;
+}
+
+function isStripeAlreadyRefundedError(error: unknown): boolean {
+  return isRecord(error) && error.code === "charge_already_refunded";
 }
 
 function validateCheckoutAmount(value: unknown): number {

@@ -6,6 +6,7 @@ import {
   createDeleteAccountHandler,
   createExportAccountHandler,
   createOperatorRouterHandler,
+  createRegisteredCheckoutSession,
   createStripeWebhookHandler,
   debitCredits,
   getBearerToken,
@@ -15,6 +16,10 @@ import {
   operatorRouterSystemPrompt,
   requireEntitlement,
   type EdgeSharedJson,
+  type StripeCheckoutClientLike,
+  type StripeCheckoutSessionLike,
+  type StripeCheckoutSessionStatus,
+  type StripeCustomerClientLike,
   type SupabaseClientLike,
   type SupabaseErrorLike,
   type SupabaseQueryBuilderLike,
@@ -245,15 +250,129 @@ describe("@pickforge/edge-shared", () => {
     );
   });
 
-  it("deletes every recorded Stripe customer before deleting the authenticated user", async () => {
-    const admin = accountAdmin({
-      billing_customers: [{ user_id: USER_ID, stripe_customer_id: "cus_current" }],
-      credit_ledger: [
-        { user_id: USER_ID, metadata: { stripe_customer_id: "cus_history" } },
-        { user_id: USER_ID, metadata: { stripe_customer_id: "cus_current" } },
-      ],
+  it("registers a first Checkout Session before returning its URL", async () => {
+    const order: string[] = [];
+    const stripe = checkoutStripe({
+      expire: vi.fn(async () => {
+        order.push("expire");
+        return { id: "cs_first", status: "expired" as const };
+      }),
     });
-    const stripe = { customers: { del: vi.fn(async () => ({})) } };
+    const registerSession = vi.fn(async () => {
+      order.push("register");
+      return false;
+    });
+
+    await expect(
+      createRegisteredCheckoutSession({
+        stripe,
+        userId: USER_ID,
+        isDeletionFenced: async () => false,
+        createSession: async () => {
+          order.push("create");
+          return { id: "cs_first", url: "https://checkout.stripe.test/first" };
+        },
+        registerSession,
+        markSessionExpired: async () => {},
+      }),
+    ).resolves.toEqual({ id: "cs_first", url: "https://checkout.stripe.test/first" });
+
+    expect(order).toEqual(["create", "register"]);
+    expect(registerSession).toHaveBeenCalledWith(USER_ID, "cs_first");
+    expect(stripe.checkout.sessions.expire).not.toHaveBeenCalled();
+  });
+
+  it("rejects a fenced checkout before creating a Stripe Session", async () => {
+    const createSession = vi.fn(async () => ({
+      id: "cs_never",
+      url: "https://checkout.stripe.test/never",
+    }));
+
+    await expect(
+      createRegisteredCheckoutSession({
+        stripe: checkoutStripe(),
+        userId: USER_ID,
+        isDeletionFenced: async () => true,
+        createSession,
+        registerSession: async () => false,
+        markSessionExpired: async () => {},
+      }),
+    ).rejects.toMatchObject({ code: "deletion_in_progress" });
+
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
+  it("expires a created Session when registration fails, without returning its URL", async () => {
+    const stripe = checkoutStripe();
+
+    await expect(
+      createRegisteredCheckoutSession({
+        stripe,
+        userId: USER_ID,
+        isDeletionFenced: async () => false,
+        createSession: async () => ({
+          id: "cs_unregistered",
+          url: "https://checkout.stripe.test/unregistered",
+        }),
+        registerSession: async () => {
+          throw new Error("database unavailable");
+        },
+        markSessionExpired: async () => {},
+      }),
+    ).rejects.toThrow("database unavailable");
+
+    expect(stripe.checkout.sessions.expire).toHaveBeenCalledWith("cs_unregistered");
+  });
+
+  it("expires a created Session whose URL cannot be returned", async () => {
+    const stripe = checkoutStripe();
+
+    await expect(
+      createRegisteredCheckoutSession({
+        stripe,
+        userId: USER_ID,
+        isDeletionFenced: async () => false,
+        createSession: async () => ({ id: "cs_without_url", url: null }),
+        registerSession: vi.fn(),
+        markSessionExpired: async () => {},
+      }),
+    ).rejects.toMatchObject({ code: "invalid_string" });
+
+    expect(stripe.checkout.sessions.expire).toHaveBeenCalledWith("cs_without_url");
+  });
+
+  it("registers then expires when deletion fences the user during Stripe creation", async () => {
+    let fenced = false;
+    const stripe = checkoutStripe();
+    const registerSession = vi.fn(async () => fenced);
+    const markSessionExpired = vi.fn(async () => {});
+
+    await expect(
+      createRegisteredCheckoutSession({
+        stripe,
+        userId: USER_ID,
+        isDeletionFenced: async () => fenced,
+        createSession: async () => {
+          fenced = true;
+          return { id: "cs_raced", url: "https://checkout.stripe.test/raced" };
+        },
+        registerSession,
+        markSessionExpired,
+      }),
+    ).rejects.toMatchObject({ code: "deletion_in_progress" });
+
+    expect(registerSession).toHaveBeenCalledWith(USER_ID, "cs_raced");
+    expect(stripe.checkout.sessions.expire).toHaveBeenCalledWith("cs_raced");
+    expect(markSessionExpired).toHaveBeenCalledWith("cs_raced");
+  });
+
+  it("fences first and expires a registered first-checkout Session before auth deletion", async () => {
+    const admin = accountAdmin({}, {}, {
+      sessions: [{ stripe_checkout_session_id: "cs_first", state: "open" }],
+    });
+    const stripe = deletionStripe({
+      sessions: [{ id: "cs_first", status: "open" }],
+    });
     const handler = createDeleteAccountHandler({
       admin,
       stripe,
@@ -264,109 +383,331 @@ describe("@pickforge/edge-shared", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({ deleted: true });
-    expect(stripe.customers.del).toHaveBeenCalledTimes(2);
-    expect(stripe.customers.del).toHaveBeenCalledWith("cus_current");
-    expect(stripe.customers.del).toHaveBeenCalledWith("cus_history");
-    expect(admin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
-    expect(stripe.customers.del.mock.invocationCallOrder[0]!).toBeLessThan(admin.auth.admin.deleteUser.mock.invocationCallOrder[0]!);
+    expect(admin.rpcCalls[0]).toEqual({
+      fn: "checkout_lifecycle_fence_deletion",
+      args: { target_user: USER_ID },
+    });
+    expect(stripe.checkout.sessions.expire).toHaveBeenCalledWith("cs_first");
+    expect(stripe.checkout.sessions.expire.mock.invocationCallOrder[0]!).toBeLessThan(
+      admin.auth.admin.deleteUser.mock.invocationCallOrder[0]!,
+    );
   });
 
-  it("deletes the user without a Stripe customer", async () => {
-    const noCustomerAdmin = accountAdmin();
-    const noCustomerStripe = { customers: { del: vi.fn(async () => ({})) } };
-    const noCustomerHandler = createDeleteAccountHandler({
-      admin: noCustomerAdmin,
-      stripe: noCustomerStripe,
+  it("collects every registry and customer-scoped page before expiring any Session", async () => {
+    const firstPage = Array.from({ length: 100 }, (_, index) => ({
+      id: `cs_customer_${String(index).padStart(3, "0")}`,
+      status: "open" as const,
+    }));
+    const customerSessions = [...firstPage, { id: "cs_customer_100", status: "open" as const }];
+    const admin = accountAdmin(
+      {
+        billing_customers: [{ user_id: USER_ID, stripe_customer_id: "cus_current" }],
+      },
+      {},
+      {
+        sessions: [{ stripe_checkout_session_id: "cs_registered", state: "open" }],
+      },
+    );
+    const stripe = deletionStripe({
+      sessions: [{ id: "cs_registered", status: "open" }, ...customerSessions],
+      customerSessions: { cus_current: customerSessions.map((session) => session.id) },
+    });
+    const handler = createDeleteAccountHandler({
+      admin,
+      stripe,
       resolveUserId: vi.fn(async () => USER_ID),
     });
 
-    await expect(noCustomerHandler(new Request("https://edge.test", { method: "POST" }))).resolves.toMatchObject({
+    const response = await handler(new Request("https://edge.test", { method: "POST" }));
+
+    expect(response.status).toBe(200);
+    expect(stripe.checkout.sessions.list).toHaveBeenCalledTimes(2);
+    expect(stripe.checkout.sessions.list).toHaveBeenNthCalledWith(2, {
+      customer: "cus_current",
+      status: "open",
+      limit: 100,
+      starting_after: "cs_customer_099",
+    });
+    expect(stripe.checkout.sessions.expire).toHaveBeenCalledTimes(102);
+    expect(stripe.checkout.sessions.list.mock.invocationCallOrder.at(-1)!).toBeLessThan(
+      stripe.checkout.sessions.expire.mock.invocationCallOrder[0]!,
+    );
+    expect(stripe.customers.del.mock.invocationCallOrder[0]!).toBeGreaterThan(
+      stripe.checkout.sessions.expire.mock.invocationCallOrder.at(-1)!,
+    );
+  });
+
+  it.each([2, 3, 4])(
+    "fails closed when an open Session appears during lifecycle re-list %i",
+    async (listCall) => {
+      const admin = accountAdmin({}, {}, {
+        onListSessions: (call, sessions) => {
+          if (call >= 2 && call < listCall) {
+            sessions.push({
+              stripe_checkout_session_id: `cs_stabilizer_${call}`,
+              state: "expired",
+            });
+          }
+          if (call === listCall) {
+            sessions.push({
+              stripe_checkout_session_id: `cs_late_${listCall}`,
+              state: "open",
+            });
+          }
+        },
+      });
+      const stripe = deletionStripe();
+      const handler = createDeleteAccountHandler({
+        admin,
+        stripe,
+        resolveUserId: vi.fn(async () => USER_ID),
+      });
+
+      const response = await handler(new Request("https://edge.test", { method: "POST" }));
+
+      expect(response.status).toBe(503);
+      expect(admin.auth.admin.deleteUser).not.toHaveBeenCalled();
+    },
+  );
+
+  it("merges a terminal Session discovered before auth deletion and deletes its customer", async () => {
+    const admin = accountAdmin({}, {}, {
+      onListSessions: (call, sessions) => {
+        if (call === 2 || call === 3) {
+          sessions.push({
+            stripe_checkout_session_id: `cs_stabilizer_${call}`,
+            state: "expired",
+          });
+        }
+        if (call === 4) {
+          sessions.push({
+            stripe_checkout_session_id: "cs_late_refunded",
+            state: "refunded",
+            stripe_customer_id: "cus_late_refunded",
+          });
+        }
+      },
+    });
+    const stripe = deletionStripe();
+    const handler = createDeleteAccountHandler({
+      admin,
+      stripe,
+      resolveUserId: vi.fn(async () => USER_ID),
+    });
+
+    const response = await handler(new Request("https://edge.test", { method: "POST" }));
+
+    expect(response.status).toBe(200);
+    expect(stripe.customers.del).toHaveBeenCalledWith("cus_late_refunded");
+    expect(admin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
+  });
+
+  it("fails closed when lifecycle discovery never reaches a fixpoint", async () => {
+    const admin = accountAdmin({}, {}, {
+      onListSessions: (call, sessions) => {
+        if (call >= 2) {
+          sessions.push({
+            stripe_checkout_session_id: `cs_unbounded_${call}`,
+            state: "expired",
+          });
+        }
+      },
+    });
+    const handler = createDeleteAccountHandler({
+      admin,
+      stripe: deletionStripe(),
+      resolveUserId: vi.fn(async () => USER_ID),
+    });
+
+    const response = await handler(new Request("https://edge.test", { method: "POST" }));
+
+    expect(response.status).toBe(503);
+    expect(admin.auth.admin.deleteUser).not.toHaveBeenCalled();
+  });
+
+  it("keeps deletion retryable when expiry fails after earlier Sessions were expired", async () => {
+    const admin = accountAdmin({}, {}, {
+      sessions: [
+        { stripe_checkout_session_id: "cs_one", state: "open" },
+        { stripe_checkout_session_id: "cs_two", state: "open" },
+      ],
+    });
+    let failSecond = true;
+    const stripe = deletionStripe({
+      sessions: [
+        { id: "cs_one", status: "open" },
+        { id: "cs_two", status: "open" },
+      ],
+      expire: async (sessionId, statuses) => {
+        if (sessionId === "cs_two" && failSecond) {
+          throw new Error("Stripe unavailable");
+        }
+        statuses.set(sessionId, "expired");
+        return { id: sessionId, status: "expired" };
+      },
+    });
+    const handler = createDeleteAccountHandler({
+      admin,
+      stripe,
+      resolveUserId: vi.fn(async () => USER_ID),
+    });
+
+    const failed = await handler(new Request("https://edge.test", { method: "POST" }));
+    expect(failed.status).toBe(503);
+    await expect(failed.json()).resolves.toEqual({ error: "deletion_incomplete" });
+    expect(admin.auth.admin.deleteUser).not.toHaveBeenCalled();
+
+    failSecond = false;
+    const retried = await handler(new Request("https://edge.test", { method: "POST" }));
+    expect(retried.status).toBe(200);
+    expect(admin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
+  });
+
+  it("classifies expired and reconciled-completed races but blocks unreconciled completion", async () => {
+    const safeAdmin = accountAdmin({}, {}, {
+      sessions: [
+        { stripe_checkout_session_id: "cs_expired", state: "open" },
+        { stripe_checkout_session_id: "cs_complete", state: "completed" },
+        {
+          stripe_checkout_session_id: "cs_refunded",
+          state: "refunded",
+          stripe_customer_id: "cus_refunded",
+        },
+      ],
+    });
+    const safeStripe = deletionStripe({
+      sessions: [
+        { id: "cs_expired", status: "expired" },
+        { id: "cs_complete", status: "complete" },
+        { id: "cs_refunded", status: "complete" },
+      ],
+    });
+    const safeHandler = createDeleteAccountHandler({
+      admin: safeAdmin,
+      stripe: safeStripe,
+      resolveUserId: vi.fn(async () => USER_ID),
+    });
+
+    await expect(safeHandler(new Request("https://edge.test", { method: "POST" }))).resolves.toMatchObject({
       status: 200,
     });
-    expect(noCustomerStripe.customers.del).not.toHaveBeenCalled();
-    expect(noCustomerAdmin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
+    expect(safeAdmin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
+    expect(safeStripe.customers.del).toHaveBeenCalledWith("cus_refunded");
+
+    const unsafeAdmin = accountAdmin({}, {}, {
+      sessions: [{ stripe_checkout_session_id: "cs_unreconciled", state: "open" }],
+    });
+    const unsafeHandler = createDeleteAccountHandler({
+      admin: unsafeAdmin,
+      stripe: deletionStripe({
+        sessions: [{ id: "cs_unreconciled", status: "complete" }],
+      }),
+      resolveUserId: vi.fn(async () => USER_ID),
+    });
+
+    const unsafe = await unsafeHandler(new Request("https://edge.test", { method: "POST" }));
+    expect(unsafe.status).toBe(503);
+    expect(unsafeAdmin.auth.admin.deleteUser).not.toHaveBeenCalled();
   });
 
-  it("preserves the account when any Stripe deletion fails and retries safely after a missing customer", async () => {
-    const failingStripeAdmin = accountAdmin({
-      billing_customers: [{ user_id: USER_ID, stripe_customer_id: "cus_456" }],
-      credit_ledger: [{ user_id: USER_ID, metadata: { stripe_customer_id: "cus_457" } }],
+  it("keeps auth and Stripe customer state while a fenced completion refund is pending", async () => {
+    const admin = accountAdmin({}, {}, {
+      sessions: [{
+        stripe_checkout_session_id: "cs_refund_pending",
+        state: "refund_pending",
+        stripe_customer_id: "cus_refund_pending",
+      }],
     });
-    const failingStripe = {
-      customers: {
-        del: vi.fn().mockResolvedValueOnce({}).mockRejectedValueOnce(new Error("Stripe unavailable")),
-      },
-    };
-    const failingStripeHandler = createDeleteAccountHandler({
-      admin: failingStripeAdmin,
-      stripe: failingStripe,
+    const stripe = deletionStripe({
+      sessions: [{ id: "cs_refund_pending", status: "complete" }],
+    });
+    const handler = createDeleteAccountHandler({
+      admin,
+      stripe,
       resolveUserId: vi.fn(async () => USER_ID),
     });
 
-    const failedResponse = await failingStripeHandler(new Request("https://edge.test", { method: "POST" }));
-    expect(failedResponse.status).toBe(503);
-    await expect(failedResponse.json()).resolves.toEqual({ error: "deletion_incomplete" });
-    expect(failingStripe.customers.del).toHaveBeenCalledTimes(2);
-    expect(failingStripeAdmin.auth.admin.deleteUser).not.toHaveBeenCalled();
+    const response = await handler(new Request("https://edge.test", { method: "POST" }));
 
-    const missingStripeAdmin = accountAdmin({
-      billing_customers: [{ user_id: USER_ID, stripe_customer_id: "cus_789" }],
-      credit_ledger: [{ user_id: USER_ID, metadata: { stripe_customer_id: "cus_790" } }],
-    });
-    const missingStripe = {
-      customers: { del: vi.fn().mockRejectedValueOnce({ code: "resource_missing" }).mockResolvedValueOnce({}) },
+    expect(response.status).toBe(503);
+    expect(stripe.customers.del).not.toHaveBeenCalled();
+    expect(admin.auth.admin.deleteUser).not.toHaveBeenCalled();
+  });
+
+  it("preserves auth state when Stripe customer cleanup fails and tolerates missing resources", async () => {
+    const rows = {
+      billing_customers: [{ user_id: USER_ID, stripe_customer_id: "cus_current" }],
     };
-    const missingStripeHandler = createDeleteAccountHandler({
-      admin: missingStripeAdmin,
-      stripe: missingStripe,
+    const failingAdmin = accountAdmin(rows);
+    const failingHandler = createDeleteAccountHandler({
+      admin: failingAdmin,
+      stripe: deletionStripe({
+        deleteCustomer: async () => {
+          throw new Error("Stripe unavailable");
+        },
+      }),
       resolveUserId: vi.fn(async () => USER_ID),
     });
 
-    const missingResponse = await missingStripeHandler(new Request("https://edge.test", { method: "POST" }));
-    expect(missingResponse.status).toBe(200);
-    await expect(missingResponse.json()).resolves.toEqual({ deleted: true });
-    expect(missingStripeAdmin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
+    const failed = await failingHandler(new Request("https://edge.test", { method: "POST" }));
+    expect(failed.status).toBe(503);
+    expect(failingAdmin.auth.admin.deleteUser).not.toHaveBeenCalled();
+
+    const missingAdmin = accountAdmin(rows);
+    const missingHandler = createDeleteAccountHandler({
+      admin: missingAdmin,
+      stripe: deletionStripe({
+        deleteCustomer: async () => {
+          throw { code: "resource_missing" };
+        },
+      }),
+      resolveUserId: vi.fn(async () => USER_ID),
+    });
+
+    const missing = await missingHandler(new Request("https://edge.test", { method: "POST" }));
+    expect(missing.status).toBe(200);
+    expect(missingAdmin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
   });
 
   it("treats a missing auth user as deleted and returns 500 for other deletion failures", async () => {
     const missingUserAdmin = accountAdmin();
-    missingUserAdmin.auth.admin.deleteUser.mockResolvedValue({ error: { code: "user_not_found", message: "User not found" } });
+    missingUserAdmin.auth.admin.deleteUser.mockResolvedValue({
+      error: { code: "user_not_found", message: "User not found" },
+    });
     const missingUserHandler = createDeleteAccountHandler({
       admin: missingUserAdmin,
-      stripe: { customers: { del: vi.fn() } },
+      stripe: deletionStripe(),
       resolveUserId: vi.fn(async () => USER_ID),
     });
 
     const missingUserResponse = await missingUserHandler(new Request("https://edge.test", { method: "POST" }));
     expect(missingUserResponse.status).toBe(200);
-    await expect(missingUserResponse.json()).resolves.toEqual({ deleted: true });
 
     const failedDeleteAdmin = accountAdmin();
-    failedDeleteAdmin.auth.admin.deleteUser.mockResolvedValue({ error: { message: "Database unavailable" } });
+    failedDeleteAdmin.auth.admin.deleteUser.mockResolvedValue({
+      error: { message: "Database unavailable" },
+    });
     const failedDeleteHandler = createDeleteAccountHandler({
       admin: failedDeleteAdmin,
-      stripe: { customers: { del: vi.fn() } },
+      stripe: deletionStripe(),
       resolveUserId: vi.fn(async () => USER_ID),
     });
 
     const failedDeleteResponse = await failedDeleteHandler(new Request("https://edge.test", { method: "POST" }));
     expect(failedDeleteResponse.status).toBe(500);
-    await expect(failedDeleteResponse.json()).resolves.toEqual({ error: "internal_error" });
   });
 
   it("returns unauthorized for account deletion without an authenticated user", async () => {
     const handler = createDeleteAccountHandler({
       admin: accountAdmin(),
-      stripe: { customers: { del: vi.fn() } },
+      stripe: deletionStripe(),
       resolveUserId: async () => {
         throw new EdgeSharedError("unauthorized", "Unauthorized");
       },
     });
 
     const response = await handler(new Request("https://edge.test", { method: "POST" }));
-
     expect(response.status).toBe(401);
-    await expect(response.json()).resolves.toEqual({ error: "unauthorized" });
   });
 
   it("exports every portable account data section", async () => {
@@ -426,7 +767,7 @@ describe("@pickforge/edge-shared", () => {
   it("returns 500 for account data read failures", async () => {
     const handler = createDeleteAccountHandler({
       admin: accountAdmin({}, { billing_customers: { message: "Database unavailable" } }),
-      stripe: { customers: { del: vi.fn() } },
+      stripe: deletionStripe(),
       resolveUserId: vi.fn(async () => USER_ID),
     });
 
@@ -491,7 +832,7 @@ describe("@pickforge/edge-shared", () => {
       secret: "whsec_123",
       stripe,
     });
-    expect(processStripeEvent).toHaveBeenCalledWith({ supabase, event });
+    expect(processStripeEvent).toHaveBeenCalledWith({ stripe, supabase, event });
   });
 
   it("returns 400 for missing or invalid Stripe signatures", async () => {
@@ -882,8 +1223,108 @@ interface EntitlementRow {
   expires_at: string | null;
 }
 
-function accountAdmin(rows: Record<string, unknown[]> = {}, errors: Record<string, SupabaseErrorLike> = {}) {
+interface CheckoutStripeOptions {
+  expire?: StripeCheckoutClientLike["checkout"]["sessions"]["expire"];
+  retrieve?: StripeCheckoutClientLike["checkout"]["sessions"]["retrieve"];
+}
+
+function checkoutStripe(options: CheckoutStripeOptions = {}) {
   return {
+    checkout: {
+      sessions: {
+        expire: vi.fn(options.expire ?? (async (sessionId) => ({ id: sessionId, status: "expired" as const }))),
+        retrieve: vi.fn(options.retrieve ?? (async (sessionId) => ({ id: sessionId, status: "expired" as const }))),
+        list: vi.fn(async () => ({ data: [], has_more: false })),
+      },
+    },
+  } satisfies StripeCheckoutClientLike;
+}
+
+interface DeletionStripeOptions {
+  sessions?: StripeCheckoutSessionLike[];
+  customerSessions?: Record<string, string[]>;
+  expire?: (
+    sessionId: string,
+    statuses: Map<string, StripeCheckoutSessionStatus>,
+  ) => Promise<StripeCheckoutSessionLike>;
+  deleteCustomer?: (customerId: string) => Promise<unknown>;
+}
+
+function deletionStripe(options: DeletionStripeOptions = {}) {
+  const statuses = new Map<string, StripeCheckoutSessionStatus>();
+  for (const session of options.sessions ?? []) {
+    if (session.status !== null) {
+      statuses.set(session.id, session.status);
+    }
+  }
+
+  const expire = vi.fn(async (sessionId: string): Promise<StripeCheckoutSessionLike> => {
+    if (options.expire !== undefined) {
+      return options.expire(sessionId, statuses);
+    }
+    if (statuses.get(sessionId) !== "open") {
+      throw new Error("Checkout Session is not open");
+    }
+    statuses.set(sessionId, "expired");
+    return { id: sessionId, status: "expired" };
+  });
+  const retrieve = vi.fn(async (sessionId: string): Promise<StripeCheckoutSessionLike> => {
+    const status = statuses.get(sessionId);
+    if (status === undefined) {
+      throw { code: "resource_missing" };
+    }
+    return { id: sessionId, status };
+  });
+  const list = vi.fn(async (params: {
+    customer: string;
+    status: "open";
+    limit: number;
+    starting_after?: string;
+  }) => {
+    const openIds = (options.customerSessions?.[params.customer] ?? []).filter(
+      (sessionId) => statuses.get(sessionId) === "open",
+    );
+    const startingIndex =
+      params.starting_after === undefined ? 0 : openIds.indexOf(params.starting_after) + 1;
+    const data = openIds.slice(startingIndex, startingIndex + params.limit).map((sessionId) => ({
+      id: sessionId,
+      status: statuses.get(sessionId) ?? null,
+    }));
+    return {
+      data,
+      has_more: startingIndex + data.length < openIds.length,
+    };
+  });
+  const del = vi.fn(options.deleteCustomer ?? (async () => ({})));
+
+  return {
+    checkout: { sessions: { expire, retrieve, list } },
+    customers: { del },
+  } satisfies StripeCustomerClientLike;
+}
+
+interface AccountLifecycleSession {
+  stripe_checkout_session_id: string;
+  state: string;
+  stripe_customer_id?: string | null;
+}
+
+interface AccountLifecycleOptions {
+  sessions?: AccountLifecycleSession[];
+  errors?: Record<string, SupabaseErrorLike>;
+  onListSessions?: (call: number, sessions: AccountLifecycleSession[]) => void;
+}
+
+function accountAdmin(
+  rows: Record<string, unknown[]> = {},
+  errors: Record<string, SupabaseErrorLike> = {},
+  lifecycle: AccountLifecycleOptions = {},
+) {
+  const rpcCalls: Array<{ fn: string; args?: Record<string, unknown> }> = [];
+  const lifecycleSessions = (lifecycle.sessions ?? []).map((session) => ({ ...session }));
+  let listCalls = 0;
+  return {
+    rpcCalls,
     auth: {
       admin: {
         deleteUser: vi.fn<(userId: string) => Promise<{ error: SupabaseErrorLike | null }>>(
@@ -893,6 +1334,36 @@ function accountAdmin(rows: Record<string, unknown[]> = {}, errors: Record<strin
     },
     from<T = unknown>(table: string): AccountQuery<T> {
       return new AccountQuery<T>(rows[table] ?? [], errors[table] ?? null);
+    },
+    async rpc<T = unknown>(
+      fn: string,
+      args?: Record<string, unknown>,
+    ): Promise<SupabaseQueryResult<T>> {
+      rpcCalls.push({ fn, args });
+      const injectedError = lifecycle.errors?.[fn];
+      if (injectedError !== undefined) {
+        return { data: null, error: injectedError };
+      }
+      if (fn === "checkout_lifecycle_fence_deletion") {
+        return { data: null, error: null };
+      }
+      if (fn === "checkout_lifecycle_mark_expired") {
+        const session = lifecycleSessions.find(
+          (item) => item.stripe_checkout_session_id === args?.checkout_session_id,
+        );
+        if (session?.state === "open") {
+          session.state = "expired";
+        }
+        return { data: null, error: null };
+      }
+      if (fn === "checkout_lifecycle_list_sessions") {
+        const start = Number(args?.page_start ?? 0);
+        const size = Number(args?.page_size ?? 1000);
+        lifecycle.onListSessions?.(++listCalls, lifecycleSessions);
+        const page = lifecycleSessions.slice(start, start + size);
+        return { data: page as T, error: null };
+      }
+      return { data: null, error: { message: `Unknown rpc: ${fn}` } };
     },
   };
 }

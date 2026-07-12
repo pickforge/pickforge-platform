@@ -8,6 +8,7 @@ import {
   verifyStripeEvent,
   type StripeClientLike,
   type StripeEventLike,
+  type StripeRefundLike,
   type SupabaseClientLike,
   type SupabaseErrorLike,
   type SupabaseQueryBuilderLike,
@@ -37,10 +38,7 @@ describe("@pickforge/billing", () => {
     const supabase = new MemorySupabase();
 
     await expect(
-      processStripeEvent({
-        supabase,
-        event: checkoutSessionEvent(),
-      }),
+      processStripeEvent({ supabase, stripe: fakeStripe(), event: checkoutSessionEvent() }),
     ).resolves.toEqual({ handled: true, duplicate: false });
 
     expect(supabase.tables.billing_customers).toEqual([
@@ -66,15 +64,187 @@ describe("@pickforge/billing", () => {
     ]);
   });
 
+  it("idempotently refunds a completed Session for a fenced user without granting credits", async () => {
+    const supabase = new MemorySupabase();
+    supabase.fencedUsers.add(USER_ID);
+    const stripe = fakeStripe();
+    const event = checkoutSessionEvent({ sessionId: "cs_fenced" });
+
+    await expect(
+      processStripeEvent({ supabase, stripe, event }),
+    ).resolves.toEqual({
+      handled: true,
+      duplicate: false,
+      reconciliation: "deletion_race_refunded",
+    });
+    await expect(
+      processStripeEvent({ supabase, stripe, event }),
+    ).resolves.toEqual({
+      handled: false,
+      duplicate: true,
+      reconciliation: "deletion_race_refunded",
+    });
+
+    expect(stripe.refunds.create).toHaveBeenCalledOnce();
+    expect(stripe.refunds.create).toHaveBeenCalledWith(
+      { payment_intent: "pi_123" },
+      { idempotencyKey: "checkout-deletion:cs_fenced" },
+    );
+    expect(supabase.tables.credit_ledger).toHaveLength(0);
+    expect(supabase.lifecycleSessions.get("cs_fenced")).toBe("refunded");
+  });
+
+  it("keeps a fenced completion retryable when Stripe refunding fails", async () => {
+    const supabase = new MemorySupabase();
+    supabase.fencedUsers.add(USER_ID);
+    const stripe = fakeStripe();
+    stripe.refunds.create.mockRejectedValueOnce(new Error("Stripe unavailable"));
+    const event = checkoutSessionEvent({ sessionId: "cs_refund_retry" });
+
+    await expect(
+      processStripeEvent({ supabase, stripe, event }),
+    ).rejects.toThrow("Stripe unavailable");
+    expect(supabase.tables.credit_ledger).toHaveLength(0);
+    expect(supabase.lifecycleSessions.get("cs_refund_retry")).toBe("refund_pending");
+
+    await expect(
+      processStripeEvent({ supabase, stripe, event }),
+    ).resolves.toMatchObject({ reconciliation: "deletion_race_refunded" });
+    expect(stripe.refunds.create).toHaveBeenNthCalledWith(
+      2,
+      { payment_intent: "pi_123" },
+      { idempotencyKey: "checkout-deletion:cs_refund_retry" },
+    );
+    expect(supabase.lifecycleSessions.get("cs_refund_retry")).toBe("refunded");
+  });
+
+  it("waits for an asynchronous Stripe refund to succeed before completing reconciliation", async () => {
+    const supabase = new MemorySupabase();
+    supabase.fencedUsers.add(USER_ID);
+    const stripe = fakeStripe();
+    stripe.refunds.create.mockResolvedValue({ id: "re_pending", amount: 1000, status: "pending" });
+    stripe.refunds.retrieve
+      .mockResolvedValueOnce({ id: "re_pending", amount: 1000, status: "pending" })
+      .mockResolvedValueOnce({ id: "re_pending", amount: 1000, status: "succeeded" });
+    const event = checkoutSessionEvent({ sessionId: "cs_async_refund" });
+
+    await expect(
+      processStripeEvent({ supabase, stripe, event }),
+    ).rejects.toMatchObject({ code: "refund_incomplete" });
+    expect(supabase.lifecycleSessions.get("cs_async_refund")).toBe("refund_pending");
+    expect(supabase.tables.credit_ledger).toHaveLength(0);
+
+    await expect(
+      processStripeEvent({ supabase, stripe, event }),
+    ).resolves.toMatchObject({ reconciliation: "deletion_race_refunded" });
+    expect(stripe.refunds.retrieve).toHaveBeenCalledTimes(2);
+    expect(supabase.lifecycleSessions.get("cs_async_refund")).toBe("refunded");
+  });
+
+  it("accepts charge_already_refunded only after verifying a full succeeded refund", async () => {
+    const supabase = new MemorySupabase();
+    supabase.fencedUsers.add(USER_ID);
+    const stripe = fakeStripe();
+    stripe.refunds.create.mockRejectedValue({ code: "charge_already_refunded" });
+    stripe.refunds.list.mockResolvedValue({
+      data: [{ id: "re_existing", amount: 1000, status: "succeeded" }],
+      has_more: false,
+    });
+
+    await expect(
+      processStripeEvent({
+        supabase,
+        stripe,
+        event: checkoutSessionEvent({ sessionId: "cs_already_refunded" }),
+      }),
+    ).resolves.toMatchObject({ reconciliation: "deletion_race_refunded" });
+
+    expect(stripe.refunds.retrieve).not.toHaveBeenCalled();
+    expect(supabase.lifecycleSessions.get("cs_already_refunded")).toBe("refunded");
+  });
+
+  it("does not accept charge_already_refunded when only a partial refund succeeded", async () => {
+    const supabase = new MemorySupabase();
+    supabase.fencedUsers.add(USER_ID);
+    const stripe = fakeStripe();
+    stripe.refunds.create.mockRejectedValue({ code: "charge_already_refunded" });
+    stripe.refunds.list.mockResolvedValue({
+      data: [{ id: "re_partial", amount: 500, status: "succeeded" }],
+      has_more: false,
+    });
+
+    await expect(
+      processStripeEvent({
+        supabase,
+        stripe,
+        event: checkoutSessionEvent({ sessionId: "cs_partially_refunded" }),
+      }),
+    ).rejects.toMatchObject({ code: "charge_already_refunded" });
+
+    expect(supabase.lifecycleSessions.get("cs_partially_refunded")).toBe("refund_pending");
+  });
+
+  it.each(["failed", "canceled"] as const)(
+    "durably records terminal refund status %s without releasing the deletion fence",
+    async (status) => {
+      const supabase = new MemorySupabase();
+      supabase.fencedUsers.add(USER_ID);
+      const stripe = fakeStripe();
+      stripe.refunds.create.mockResolvedValue({ id: "re_terminal", amount: 1000, status });
+      stripe.refunds.retrieve.mockResolvedValue({
+        id: "re_terminal",
+        amount: 1000,
+        status,
+      });
+
+      await expect(
+        processStripeEvent({
+          supabase,
+          stripe,
+          event: checkoutSessionEvent({ sessionId: `cs_${status}` }),
+        }),
+      ).rejects.toMatchObject({ code: "refund_terminal_failure" });
+
+      expect(supabase.lifecycleSessions.get(`cs_${status}`)).toBe("refund_pending");
+      expect(supabase.refundFailures.get(`cs_${status}`)).toEqual({
+        refundId: "re_terminal",
+        status,
+      });
+      expect(supabase.tables.credit_ledger).toHaveLength(0);
+    },
+  );
+
+  it("idempotently refunds a completion whose user is already missing", async () => {
+    const supabase = new MemorySupabase();
+    supabase.deletedUsers.add(USER_ID);
+    const stripe = fakeStripe();
+
+    await expect(
+      processStripeEvent({
+        supabase,
+        stripe,
+        event: checkoutSessionEvent({ sessionId: "cs_deleted" }),
+      }),
+    ).resolves.toMatchObject({ reconciliation: "deletion_race_refunded" });
+
+    expect(stripe.refunds.create).toHaveBeenCalledWith(
+      { payment_intent: "pi_123" },
+      { idempotencyKey: "checkout-deletion:cs_deleted" },
+    );
+    expect(supabase.tables.billing_customers).toHaveLength(0);
+    expect(supabase.tables.credit_ledger).toHaveLength(0);
+    expect(supabase.lifecycleSessions.get("cs_deleted")).toBe("refunded");
+  });
+
   it("lets Stripe retry after a non-unique ledger failure and creates exactly one ledger row", async () => {
     const supabase = new MemorySupabase();
     supabase.failNextInsert("credit_ledger", transientDatabaseError());
     const event = checkoutSessionEvent();
 
-    await expect(processStripeEvent({ supabase, event })).rejects.toMatchObject({
+    await expect(processStripeEvent({ supabase, stripe: fakeStripe(), event })).rejects.toMatchObject({
       code: "database_error",
     } satisfies Partial<BillingError>);
-    await expect(processStripeEvent({ supabase, event })).resolves.toEqual({
+    await expect(processStripeEvent({ supabase, stripe: fakeStripe(), event })).resolves.toEqual({
       handled: true,
       duplicate: false,
     });
@@ -87,8 +257,8 @@ describe("@pickforge/billing", () => {
     const supabase = new MemorySupabase();
     const event = checkoutSessionEvent();
 
-    await processStripeEvent({ supabase, event });
-    await expect(processStripeEvent({ supabase, event })).resolves.toEqual({
+    await processStripeEvent({ supabase, stripe: fakeStripe(), event });
+    await expect(processStripeEvent({ supabase, stripe: fakeStripe(), event })).resolves.toEqual({
       handled: false,
       duplicate: true,
     });
@@ -99,18 +269,12 @@ describe("@pickforge/billing", () => {
   it("dedupes completed and async payment events for the same checkout session", async () => {
     const supabase = new MemorySupabase();
 
-    await processStripeEvent({
-      supabase,
-      event: checkoutSessionEvent(),
-    });
+    await processStripeEvent({ supabase, stripe: fakeStripe(), event: checkoutSessionEvent() });
     await expect(
-      processStripeEvent({
-        supabase,
-        event: checkoutSessionEvent({
-          id: "evt_async",
-          type: "checkout.session.async_payment_succeeded",
-        }),
-      }),
+      processStripeEvent({ supabase, stripe: fakeStripe(), event: checkoutSessionEvent({
+        id: "evt_async",
+        type: "checkout.session.async_payment_succeeded",
+      }) }),
     ).resolves.toEqual({ handled: false, duplicate: true });
 
     expect(supabase.tables.credit_ledger).toHaveLength(1);
@@ -121,23 +285,33 @@ describe("@pickforge/billing", () => {
     const supabase = new MemorySupabase();
 
     await expect(
-      processStripeEvent({
-        supabase,
-        event: checkoutSessionEvent({ paymentStatus: "unpaid" }),
-      }),
+      processStripeEvent({ supabase, stripe: fakeStripe(), event: checkoutSessionEvent({ paymentStatus: "unpaid" }) }),
     ).resolves.toEqual({ handled: false, duplicate: false });
 
     expect(supabase.tables.credit_ledger).toHaveLength(0);
+  });
+
+  it("requires payment_intent on paid credit-pack Checkout Sessions", async () => {
+    const supabase = new MemorySupabase();
+    const stripe = fakeStripe();
+
+    await expect(
+      processStripeEvent({
+        supabase,
+        stripe,
+        event: checkoutSessionEvent({ paymentIntent: undefined }),
+      }),
+    ).rejects.toMatchObject({ code: "invalid_string" });
+
+    expect(supabase.tables.credit_ledger).toHaveLength(0);
+    expect(stripe.refunds.create).not.toHaveBeenCalled();
   });
 
   it("mints paid sessions with a null customer without upserting billing_customers", async () => {
     const supabase = new MemorySupabase();
 
     await expect(
-      processStripeEvent({
-        supabase,
-        event: checkoutSessionEvent({ customer: null }),
-      }),
+      processStripeEvent({ supabase, stripe: fakeStripe(), event: checkoutSessionEvent({ customer: null }) }),
     ).resolves.toEqual({ handled: true, duplicate: false });
 
     expect(supabase.tables.billing_customers).toHaveLength(0);
@@ -158,10 +332,7 @@ describe("@pickforge/billing", () => {
     const supabase = new MemorySupabase();
 
     await expect(
-      processStripeEvent({
-        supabase,
-        event: checkoutSessionEvent({ amountTotal }),
-      }),
+      processStripeEvent({ supabase, stripe: fakeStripe(), event: checkoutSessionEvent({ amountTotal }) }),
     ).rejects.toMatchObject({
       code: "invalid_checkout_amount",
     } satisfies Partial<BillingError>);
@@ -175,11 +346,11 @@ describe("@pickforge/billing", () => {
     supabase.failNextInsert("stripe_events", transientDatabaseError());
     const event = checkoutSessionEvent();
 
-    await expect(processStripeEvent({ supabase, event })).resolves.toEqual({
+    await expect(processStripeEvent({ supabase, stripe: fakeStripe(), event })).resolves.toEqual({
       handled: true,
       duplicate: false,
     });
-    await expect(processStripeEvent({ supabase, event })).resolves.toEqual({
+    await expect(processStripeEvent({ supabase, stripe: fakeStripe(), event })).resolves.toEqual({
       handled: false,
       duplicate: true,
     });
@@ -200,11 +371,11 @@ describe("@pickforge/billing", () => {
       data: { object: { id: "cus_123" } },
     };
 
-    await expect(processStripeEvent({ supabase, event })).resolves.toEqual({
+    await expect(processStripeEvent({ supabase, stripe: fakeStripe(), event })).resolves.toEqual({
       handled: false,
       duplicate: false,
     });
-    await expect(processStripeEvent({ supabase, event })).resolves.toEqual({
+    await expect(processStripeEvent({ supabase, stripe: fakeStripe(), event })).resolves.toEqual({
       handled: false,
       duplicate: true,
     });
@@ -258,15 +429,15 @@ describe("@pickforge/billing", () => {
 
   it("reads balances through the credit_balance_cents rpc", async () => {
     const supabase = new MemorySupabase();
-    await processStripeEvent({ supabase, event: checkoutSessionEvent() });
+    await processStripeEvent({ supabase, stripe: fakeStripe(), event: checkoutSessionEvent() });
 
     await expect(getCreditBalanceCents({ supabase, userId: USER_ID })).resolves.toBe(1000);
   });
 
   it("lists ledger entries newest first with an optional limit", async () => {
     const supabase = new MemorySupabase();
-    await processStripeEvent({ supabase, event: checkoutSessionEvent({ id: "evt_old", sessionId: "cs_old", amountTotal: 1000 }) });
-    await processStripeEvent({ supabase, event: checkoutSessionEvent({ id: "evt_new", sessionId: "cs_new", amountTotal: 2500 }) });
+    await processStripeEvent({ supabase, stripe: fakeStripe(), event: checkoutSessionEvent({ id: "evt_old", sessionId: "cs_old", amountTotal: 1000 }) });
+    await processStripeEvent({ supabase, stripe: fakeStripe(), event: checkoutSessionEvent({ id: "evt_new", sessionId: "cs_new", amountTotal: 2500 }) });
 
     await expect(listLedgerEntries({ supabase, userId: USER_ID, limit: 1 })).resolves.toEqual([
       expect.objectContaining({
@@ -283,6 +454,7 @@ function checkoutSessionEvent(
     amountTotal: unknown;
     customer: unknown;
     id: string;
+    paymentIntent: unknown;
     paymentStatus: string;
     sessionId: string;
     type: string;
@@ -294,6 +466,7 @@ function checkoutSessionEvent(
     customer: "customer" in overrides ? overrides.customer : "cus_123",
     client_reference_id: USER_ID,
     payment_status: overrides.paymentStatus ?? "paid",
+    payment_intent: "paymentIntent" in overrides ? overrides.paymentIntent : "pi_123",
   };
 
   return {
@@ -315,6 +488,11 @@ function fakeStripe(options: { event?: StripeEventLike } = {}) {
         })),
       },
     },
+    refunds: {
+      create: vi.fn(async () => ({ id: "re_123", amount: 1000, status: "succeeded" })),
+      retrieve: vi.fn(async (refundId: string) => ({ id: refundId, amount: 1000, status: "succeeded" })),
+      list: vi.fn(async () => ({ data: [] as StripeRefundLike[], has_more: false })),
+    },
     webhooks: {
       constructEventAsync: vi.fn(async () => options.event ?? checkoutSessionEvent()),
     },
@@ -333,6 +511,10 @@ class MemorySupabase implements SupabaseClientLike {
     credit_ledger: [],
     stripe_events: [],
   };
+  readonly fencedUsers = new Set<string>();
+  readonly deletedUsers = new Set<string>();
+  readonly lifecycleSessions = new Map<string, "completed" | "refund_pending" | "refunded">();
+  readonly refundFailures = new Map<string, { refundId: string; status: string }>();
 
   private readonly insertFailures: Record<keyof Tables, SupabaseErrorLike[]> = {
     billing_customers: [],
@@ -351,20 +533,86 @@ class MemorySupabase implements SupabaseClientLike {
   }
 
   async rpc<T = unknown>(fn: string, args?: Record<string, unknown>): Promise<SupabaseQueryResult<T>> {
-    if (fn !== "credit_balance_cents") {
+    if (fn === "checkout_lifecycle_reconcile_completion") {
+      const sessionId = String(args?.checkout_session_id);
+      const userId = String(args?.target_user);
+      const existing = this.lifecycleSessions.get(sessionId);
+      if (existing === "completed") {
+        return { data: "duplicate" as T, error: null };
+      }
+      if (existing === "refunded") {
+        return { data: "refunded" as T, error: null };
+      }
+      if (this.deletedUsers.has(userId) || this.fencedUsers.has(userId)) {
+        this.lifecycleSessions.set(sessionId, "refund_pending");
+        return { data: "refund" as T, error: null };
+      }
+
+      const customerId = args?.stripe_customer_id;
+      if (typeof customerId === "string") {
+        const customerResult = this.upsertRow(
+          "billing_customers",
+          {
+            user_id: userId,
+            stripe_customer_id: customerId,
+            updated_at: new Date().toISOString(),
+          },
+          "user_id",
+        );
+        if (customerResult.error !== null) {
+          return { data: null, error: customerResult.error };
+        }
+      }
+
+      const ledgerResult = this.insertRow("credit_ledger", {
+        user_id: userId,
+        amount_cents: args?.amount_total_cents,
+        kind: "purchase",
+        description: "Credit purchase",
+        stripe_event_id: args?.event_id,
+        stripe_checkout_session_id: sessionId,
+        metadata: {
+          amount_total: args?.amount_total_cents,
+          stripe_customer_id: customerId,
+          stripe_checkout_session_id: sessionId,
+          stripe_event_type: args?.event_type,
+          stripe_payment_intent_id: args?.stripe_payment_intent_id,
+        },
+      });
+      if (ledgerResult.error !== null && ledgerResult.error.code !== "23505") {
+        return { data: null, error: ledgerResult.error };
+      }
+
+      this.lifecycleSessions.set(sessionId, "completed");
       return {
-        data: null,
-        error: { message: `Unknown rpc: ${fn}` },
+        data: (ledgerResult.error === null ? "credited" : "duplicate") as T,
+        error: null,
+      };
+    }
+    if (fn === "checkout_lifecycle_mark_refunded") {
+      this.lifecycleSessions.set(String(args?.checkout_session_id), "refunded");
+      return { data: null, error: null };
+    }
+    if (fn === "checkout_lifecycle_record_refund_failure") {
+      this.refundFailures.set(String(args?.checkout_session_id), {
+        refundId: String(args?.refund_id),
+        status: String(args?.failure_status),
+      });
+      return { data: null, error: null };
+    }
+    if (fn === "credit_balance_cents") {
+      const total = this.tables.credit_ledger
+        .filter((row) => row.user_id === args?.target_user)
+        .reduce((sum, row) => sum + Number(row.amount_cents), 0);
+      return {
+        data: total as T,
+        error: null,
       };
     }
 
-    const total = this.tables.credit_ledger
-      .filter((row) => row.user_id === args?.target_user)
-      .reduce((sum, row) => sum + Number(row.amount_cents), 0);
-
     return {
-      data: total as T,
-      error: null,
+      data: null,
+      error: { message: `Unknown rpc: ${fn}` },
     };
   }
 

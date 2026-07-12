@@ -59,7 +59,7 @@ Deno.serve(async (req) => {
 
 ## Prerequisites
 
-- Apply the platform Supabase migrations, including `20260709030000_debit_credits.sql`.
+- Apply the platform Supabase migrations, including `20260712193633_checkout_deletion_lifecycle.sql`.
 - Use `SUPABASE_SERVICE_ROLE_KEY` only in server-side Edge Functions.
 - Deploy app Edge Functions with access to `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`.
 
@@ -69,7 +69,11 @@ Deno.serve(async (req) => {
 
 `create-credit-checkout` uses `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_PRICE_PACK_10`, `STRIPE_PRICE_PACK_25`, `STRIPE_PRICE_PACK_50`, `CHECKOUT_SUCCESS_URL`, and `CHECKOUT_CANCEL_URL`. Its accepted body is `{ "pack": "p10" | "p25" | "p50" }`.
 
-The new edge-shared exports require a `0.7.0` package publish before deploying functions that import them.
+`delete-account` also uses `STRIPE_SECRET_KEY`. It fences checkout first, expires the fully collected registered and customer-scoped open Sessions, then runs a bounded registry/customer cleanup fixpoint. Each refresh rejects unsafe lifecycle states and deletes only newly discovered customers; failure to stabilize preserves auth and returns retryable `deletion_incomplete`. Auth is removed only after a stable snapshot containing exclusively expired, credited, or refunded terminal Sessions.
+Requesting deletion is terminal: once the fence exists, checkout stays disabled and the deletion endpoint is retry-only until every cleanup or refund finishes and auth deletion succeeds.
+Registry state `open` means “registered and not yet reconciled or durably marked expired”; it does not assert that Stripe still reports the Session as open.
+
+The lifecycle-aware helpers require a `0.9.0` package publish before deploying functions that import them.
 
 ## Cross-repo imports
 

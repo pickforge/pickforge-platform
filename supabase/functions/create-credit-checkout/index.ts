@@ -5,6 +5,7 @@ import {
   corsHeaders,
   corsPreflightResponse,
   EdgeSharedError,
+  createRegisteredCheckoutSession,
   getUserFromRequest,
   jsonResponse,
 } from "@pickforge/edge-shared";
@@ -28,22 +29,34 @@ Deno.serve(async (req) => {
     const { userId } = await getUserFromRequest({ supabase: createCallerSupabase(req), req });
     const { pack } = await readCheckoutRequest(req);
     const existingCustomerId = await readExistingCustomerId(userId);
-    const session = await createCreditCheckoutSession<{ url: string | null }>({
+    const session = await createRegisteredCheckoutSession({
       stripe,
       userId,
-      priceId: priceIdForPack(pack),
-      successUrl: requiredEnv("CHECKOUT_SUCCESS_URL"),
-      cancelUrl: requiredEnv("CHECKOUT_CANCEL_URL"),
-      existingCustomerId,
+      isDeletionFenced,
+      createSession: async () => {
+        const created = await createCreditCheckoutSession({
+          stripe,
+          userId,
+          priceId: priceIdForPack(pack),
+          successUrl: requiredEnv("CHECKOUT_SUCCESS_URL"),
+          cancelUrl: requiredEnv("CHECKOUT_CANCEL_URL"),
+          existingCustomerId,
+        });
+        if (!isRecord(created)) {
+          throw new Error("Stripe returned an invalid Checkout Session");
+        }
+        return { id: created.id, url: created.url };
+      },
+      registerSession: registerCheckoutSession,
+      markSessionExpired: markCheckoutSessionExpired,
     });
-    if (typeof session.url !== "string" || session.url.length === 0) {
-      throw new Error("Stripe checkout session did not include a URL");
-    }
 
     return respond(200, { url: session.url });
   } catch (error) {
     if (error instanceof EdgeSharedError) {
-      return respond(error.code === "unauthorized" ? 401 : 400, { error: error.code });
+      const status =
+        error.code === "unauthorized" ? 401 : error.code === "deletion_in_progress" ? 409 : 400;
+      return respond(status, { error: error.code });
     }
 
     if (error instanceof SyntaxError) {
@@ -63,10 +76,11 @@ function createCallerSupabase(req: Request) {
 
 async function readExistingCustomerId(userId: string): Promise<string | undefined> {
   const { data, error } = await serviceSupabase
-    .from<{ stripe_customer_id: string | null }>("billing_customers")
+    .from("billing_customers")
     .select("stripe_customer_id")
     .eq("user_id", userId)
-    .maybeSingle();
+    .maybeSingle()
+    .overrideTypes<{ stripe_customer_id: string | null }, { merge: false }>();
   if (error !== null) {
     throw new Error("Failed to read billing customer", { cause: error });
   }
@@ -74,6 +88,40 @@ async function readExistingCustomerId(userId: string): Promise<string | undefine
   return typeof data?.stripe_customer_id === "string" && data.stripe_customer_id.length > 0
     ? data.stripe_customer_id
     : undefined;
+}
+
+async function isDeletionFenced(userId: string): Promise<boolean> {
+  const { data, error } = await serviceSupabase
+    .rpc("checkout_lifecycle_is_deletion_fenced", { target_user: userId })
+    .overrideTypes<boolean, { merge: false }>();
+  if (error !== null || typeof data !== "boolean") {
+    throw new Error("Failed to read account deletion fence", { cause: error });
+  }
+
+  return data;
+}
+
+async function registerCheckoutSession(userId: string, sessionId: string): Promise<boolean> {
+  const { data, error } = await serviceSupabase
+    .rpc("checkout_lifecycle_register_session", {
+      target_user: userId,
+      checkout_session_id: sessionId,
+    })
+    .overrideTypes<boolean, { merge: false }>();
+  if (error !== null || typeof data !== "boolean") {
+    throw new Error("Failed to register Checkout Session", { cause: error });
+  }
+
+  return data;
+}
+
+async function markCheckoutSessionExpired(sessionId: string): Promise<void> {
+  const { error } = await serviceSupabase.rpc("checkout_lifecycle_mark_expired", {
+    checkout_session_id: sessionId,
+  });
+  if (error !== null) {
+    throw new Error("Failed to mark Checkout Session expired", { cause: error });
+  }
 }
 
 function respond(status: number, body: unknown): Response {
@@ -109,4 +157,8 @@ function requiredEnv(name: string): string {
   }
 
   return value;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

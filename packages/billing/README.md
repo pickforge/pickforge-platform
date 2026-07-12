@@ -26,13 +26,15 @@ const event = await verifyStripeEvent({
 
 const result = await processStripeEvent({
   supabase: serviceRoleSupabase,
+  stripe,
   event,
 });
 ```
 
-Prerequisites: apply the billing migration first, use a service-role Supabase client for `processStripeEvent`, and call `verifyStripeEvent` before `processStripeEvent`; processing trusts the verified event input.
+Prerequisites: apply the billing and checkout lifecycle migrations first, use a service-role Supabase client for `processStripeEvent`, and call `verifyStripeEvent` before `processStripeEvent`; processing trusts the verified event input.
 
 The credit ledger is the source of truth for balance; balances are sums of ledger rows.
-Refunds are manual v1 operator adjustments through service-role `adjustment` ledger rows.
+General refunds remain manual v1 operator adjustments. The lifecycle invariant separately issues an idempotent full refund when a Checkout Session completes after account deletion has been fenced or its user is already missing, and never grants credits in either path.
+Pending or action-required Refunds keep deletion fenced and retryable. Terminal `failed`/`canceled` Refunds remain `refund_pending` with the Refund id and status in the private registry. The service-only manual resolution path is: verify or complete the full PaymentIntent refund in Stripe, then invoke `checkout_lifecycle_mark_refunded(checkout_session_id, event_id)` with the service role; never expose that RPC to clients.
 The package is UI-free and secret-free: Stripe is injected, and service-role Supabase clients stay server-side.
 App UI, offline behavior, and purchase presentation stay in app repos.

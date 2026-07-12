@@ -94,6 +94,24 @@ describe("@pickforge/billing", () => {
     expect(supabase.lifecycleSessions.get("cs_fenced")).toBe("refunded");
   });
 
+  it("refunds and cleans a late customer after deletion finalization while auth still exists", async () => {
+    const supabase = new MemorySupabase();
+    supabase.fencedUsers.add(USER_ID);
+    supabase.finalizedUsers.add(USER_ID);
+    const stripe = fakeStripe();
+    const event = checkoutSessionEvent({ sessionId: "cs_after_finalize" });
+
+    await expect(processStripeEvent({ supabase, stripe, event })).resolves.toMatchObject({
+      reconciliation: "deletion_race_refunded",
+    });
+
+    expect(stripe.refunds.create).toHaveBeenCalledOnce();
+    expect(stripe.customers.del).toHaveBeenCalledWith("cus_123");
+    expect(supabase.customerCleanupPending.has("cs_after_finalize")).toBe(false);
+    expect(supabase.lifecycleSessions.get("cs_after_finalize")).toBe("refunded");
+    expect(supabase.tables.credit_ledger).toHaveLength(0);
+  });
+
   it("keeps a fenced completion retryable when Stripe refunding fails", async () => {
     const supabase = new MemorySupabase();
     supabase.fencedUsers.add(USER_ID);
@@ -232,8 +250,40 @@ describe("@pickforge/billing", () => {
       { idempotencyKey: "checkout-deletion:cs_deleted" },
     );
     expect(supabase.tables.billing_customers).toHaveLength(0);
+    expect(stripe.customers.del).toHaveBeenCalledWith("cus_123");
+    expect(supabase.customerCleanupPending.has("cs_deleted")).toBe(false);
     expect(supabase.tables.credit_ledger).toHaveLength(0);
     expect(supabase.lifecycleSessions.get("cs_deleted")).toBe("refunded");
+  });
+
+  it("retries missing-user customer cleanup without issuing a second refund", async () => {
+    const supabase = new MemorySupabase();
+    supabase.deletedUsers.add(USER_ID);
+    const stripe = fakeStripe();
+    stripe.customers.del.mockRejectedValueOnce(new Error("Stripe unavailable"));
+    const event = checkoutSessionEvent({ sessionId: "cs_cleanup_retry" });
+
+    await expect(processStripeEvent({ supabase, stripe, event })).rejects.toThrow(
+      "Stripe unavailable",
+    );
+    expect(supabase.lifecycleSessions.get("cs_cleanup_retry")).toBe("refunded");
+    expect(supabase.customerCleanupPending.has("cs_cleanup_retry")).toBe(true);
+
+    const replayWithWrongCustomer = checkoutSessionEvent({
+      id: "evt_cleanup_retry",
+      sessionId: "cs_cleanup_retry",
+      customer: "cus_wrong",
+    });
+    await expect(
+      processStripeEvent({ supabase, stripe, event: replayWithWrongCustomer }),
+    ).resolves.toMatchObject({
+      reconciliation: "deletion_race_refunded",
+    });
+    expect(stripe.refunds.create).toHaveBeenCalledOnce();
+    expect(stripe.customers.del).toHaveBeenCalledTimes(2);
+    expect(stripe.customers.del).toHaveBeenNthCalledWith(2, "cus_123");
+    expect(stripe.customers.del).not.toHaveBeenCalledWith("cus_wrong");
+    expect(supabase.customerCleanupPending.has("cs_cleanup_retry")).toBe(false);
   });
 
   it("lets Stripe retry after a non-unique ledger failure and creates exactly one ledger row", async () => {
@@ -279,6 +329,29 @@ describe("@pickforge/billing", () => {
 
     expect(supabase.tables.credit_ledger).toHaveLength(1);
     expect(supabase.tables.stripe_events).toHaveLength(2);
+  });
+
+  it("terminalizes checkout.session.async_payment_failed without granting credits", async () => {
+    const supabase = new MemorySupabase();
+    supabase.lifecycleSessions.set("cs_async_failed", "open");
+    const event = checkoutSessionEvent({
+      id: "evt_async_failed",
+      sessionId: "cs_async_failed",
+      type: "checkout.session.async_payment_failed",
+    });
+
+    await expect(processStripeEvent({ supabase, stripe: fakeStripe(), event })).resolves.toEqual({
+      handled: true,
+      duplicate: false,
+    });
+    await expect(processStripeEvent({ supabase, stripe: fakeStripe(), event })).resolves.toEqual({
+      handled: false,
+      duplicate: true,
+    });
+
+    expect(supabase.lifecycleSessions.get("cs_async_failed")).toBe("payment_failed");
+    expect(supabase.lifecycleCustomerIds.get("cs_async_failed")).toBe("cus_123");
+    expect(supabase.tables.credit_ledger).toHaveLength(0);
   });
 
   it("does not mint credits for completed sessions that are not paid", async () => {
@@ -488,6 +561,9 @@ function fakeStripe(options: { event?: StripeEventLike } = {}) {
         })),
       },
     },
+    customers: {
+      del: vi.fn(async () => ({})),
+    },
     refunds: {
       create: vi.fn(async () => ({ id: "re_123", amount: 1000, status: "succeeded" })),
       retrieve: vi.fn(async (refundId: string) => ({ id: refundId, amount: 1000, status: "succeeded" })),
@@ -512,8 +588,15 @@ class MemorySupabase implements SupabaseClientLike {
     stripe_events: [],
   };
   readonly fencedUsers = new Set<string>();
+  readonly finalizedUsers = new Set<string>();
   readonly deletedUsers = new Set<string>();
-  readonly lifecycleSessions = new Map<string, "completed" | "refund_pending" | "refunded">();
+  readonly lifecycleSessions = new Map<
+    string,
+    "open" | "payment_failed" | "completed" | "refund_pending" | "refunded"
+  >();
+  readonly lifecycleCustomerIds = new Map<string, string>();
+  readonly customerCleanupPending = new Set<string>();
+  readonly cleanupCustomerIds = new Map<string, string | null>();
   readonly refundFailures = new Map<string, { refundId: string; status: string }>();
 
   private readonly insertFailures: Record<keyof Tables, SupabaseErrorLike[]> = {
@@ -541,10 +624,33 @@ class MemorySupabase implements SupabaseClientLike {
         return { data: "duplicate" as T, error: null };
       }
       if (existing === "refunded") {
-        return { data: "refunded" as T, error: null };
+        return {
+          data: (this.customerCleanupPending.has(sessionId)
+            ? "refunded_cleanup_pending"
+            : "refunded") as T,
+          error: null,
+        };
       }
-      if (this.deletedUsers.has(userId) || this.fencedUsers.has(userId)) {
+      if (this.deletedUsers.has(userId)) {
         this.lifecycleSessions.set(sessionId, "refund_pending");
+        this.customerCleanupPending.add(sessionId);
+        this.cleanupCustomerIds.set(
+          sessionId,
+          typeof args?.stripe_customer_id === "string" ? args.stripe_customer_id : null,
+        );
+        return { data: "refund_missing_user" as T, error: null };
+      }
+      if (this.fencedUsers.has(userId)) {
+        this.lifecycleSessions.set(sessionId, "refund_pending");
+        if (this.finalizedUsers.has(userId)) {
+          this.customerCleanupPending.add(sessionId);
+          this.cleanupCustomerIds.set(
+            sessionId,
+            typeof args?.stripe_customer_id === "string" ? args.stripe_customer_id : null,
+          );
+          this.finalizedUsers.delete(userId);
+          return { data: "refund_missing_user" as T, error: null };
+        }
         return { data: "refund" as T, error: null };
       }
 
@@ -589,8 +695,37 @@ class MemorySupabase implements SupabaseClientLike {
         error: null,
       };
     }
+    if (fn === "checkout_lifecycle_mark_async_payment_failed") {
+      const sessionId = String(args?.checkout_session_id);
+      const state = this.lifecycleSessions.get(sessionId);
+      if (state === undefined) {
+        return { data: "missing" as T, error: null };
+      }
+      if (state !== "open") {
+        return { data: "duplicate" as T, error: null };
+      }
+      this.lifecycleSessions.set(sessionId, "payment_failed");
+      if (typeof args?.stripe_customer_id === "string") {
+        this.lifecycleCustomerIds.set(sessionId, args.stripe_customer_id);
+      }
+      return { data: "terminalized" as T, error: null };
+    }
     if (fn === "checkout_lifecycle_mark_refunded") {
       this.lifecycleSessions.set(String(args?.checkout_session_id), "refunded");
+      return { data: null, error: null };
+    }
+    if (fn === "checkout_lifecycle_get_customer_cleanup") {
+      const sessionId = String(args?.checkout_session_id);
+      return {
+        data: {
+          pending: this.customerCleanupPending.has(sessionId),
+          customer_id: this.cleanupCustomerIds.get(sessionId) ?? null,
+        } as T,
+        error: null,
+      };
+    }
+    if (fn === "checkout_lifecycle_complete_customer_cleanup") {
+      this.customerCleanupPending.delete(String(args?.checkout_session_id));
       return { data: null, error: null };
     }
     if (fn === "checkout_lifecycle_record_refund_failure") {

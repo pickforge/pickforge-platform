@@ -292,7 +292,7 @@ interface StripeCustomerMetadataRow {
 
 interface CheckoutLifecycleSessionRow {
   stripe_checkout_session_id: string;
-  state: "open" | "expired" | "completed" | "refund_pending" | "refunded";
+  state: "open" | "expired" | "payment_failed" | "completed" | "refund_pending" | "refunded";
   stripe_customer_id: string | null;
 }
 
@@ -613,12 +613,25 @@ export async function expireCheckoutSession(
   stripe: StripeCheckoutClientLike,
   sessionId: string,
 ): Promise<Exclude<StripeCheckoutSessionStatus, "open"> | "missing"> {
+  let session: StripeCheckoutSessionLike;
+  try {
+    session = await stripe.checkout.sessions.retrieve(sessionId);
+  } catch (retrieveError) {
+    if (isStripeResourceMissingError(retrieveError)) {
+      return "missing";
+    }
+    throw retrieveError;
+  }
+  if (session.status === "expired" || session.status === "complete") {
+    return session.status;
+  }
+
   try {
     await stripe.checkout.sessions.expire(sessionId);
     return "expired";
   } catch (expireError) {
     try {
-      const session = await stripe.checkout.sessions.retrieve(sessionId);
+      session = await stripe.checkout.sessions.retrieve(sessionId);
       if (session.status === "expired" || session.status === "complete") {
         return session.status;
       }
@@ -628,7 +641,6 @@ export async function expireCheckoutSession(
       }
       throw retrieveError;
     }
-
     throw expireError;
   }
 }
@@ -660,6 +672,7 @@ export function createDeleteAccountHandler({
       }
 
       const customerIds = new Set<string>();
+      const deletedCustomerIds = new Set<string>();
       addStripeCustomerId(customerIds, billingCustomer?.stripe_customer_id);
       for (const row of ledgerRows) {
         addStripeCustomerId(customerIds, isRecord(row.metadata) ? row.metadata.stripe_customer_id : undefined);
@@ -694,7 +707,8 @@ export function createDeleteAccountHandler({
         if (
           disposition === "complete" &&
           registeredState !== "completed" &&
-          registeredState !== "refunded"
+          registeredState !== "refunded" &&
+          registeredState !== "payment_failed"
         ) {
           throw new EdgeSharedError(
             "deletion_incomplete",
@@ -711,7 +725,12 @@ export function createDeleteAccountHandler({
         }
       }
 
-      await settleDeletionFixpoint(admin, stripe, userId, sessionIds, customerIds);
+      await settleDeletionFixpoint(admin, userId, sessionIds, customerIds);
+      await finalizeAccountDeletion(admin, userId, customerIds);
+      await deleteStripeCustomers(stripe, customerIds, deletedCustomerIds);
+      await settleDeletionFixpoint(admin, userId, sessionIds, customerIds);
+      await finalizeAccountDeletion(admin, userId, customerIds);
+      await deleteStripeCustomers(stripe, customerIds, deletedCustomerIds);
 
       const { error } = await admin.auth.admin.deleteUser(userId);
       if (error !== null && !isUserNotFoundError(error)) {
@@ -1060,24 +1079,20 @@ async function markCheckoutSessionExpired(
 
 async function settleDeletionFixpoint(
   admin: AccountAdminClientLike,
-  stripe: StripeCustomerClientLike,
   userId: string,
   sessionIds: Set<string>,
   customerIds: Set<string>,
 ): Promise<void> {
-  const deletedCustomerIds = new Set<string>();
   const maxRefreshes = 8;
 
   for (let refresh = 0; refresh < maxRefreshes; refresh += 1) {
     const previousSessionCount = sessionIds.size;
     const previousCustomerCount = customerIds.size;
     await refreshSettledLifecycle(admin, userId, sessionIds, customerIds);
-    await deleteNewStripeCustomers(stripe, customerIds, deletedCustomerIds);
 
     if (
       sessionIds.size === previousSessionCount &&
-      customerIds.size === previousCustomerCount &&
-      deletedCustomerIds.size === customerIds.size
+      customerIds.size === previousCustomerCount
     ) {
       return;
     }
@@ -1108,7 +1123,35 @@ async function refreshSettledLifecycle(
   }
 }
 
-async function deleteNewStripeCustomers(
+async function finalizeAccountDeletion(
+  admin: Pick<AccountAdminClientLike, "rpc">,
+  userId: string,
+  customerIds: Set<string>,
+): Promise<void> {
+  const { data, error } = await accountRpc<unknown>(
+    admin,
+    "checkout_lifecycle_finalize_deletion",
+    { target_user: userId },
+  );
+  if (error !== null) {
+    throw databaseError("Failed to finalize account deletion", error);
+  }
+  if (
+    !isRecord(data) ||
+    data.status !== "finalized" ||
+    !Array.isArray(data.customer_ids)
+  ) {
+    throw new EdgeSharedError(
+      "deletion_incomplete",
+      "Checkout Session lifecycle changed before deletion finalization",
+    );
+  }
+  for (const customerId of data.customer_ids) {
+    addStripeCustomerId(customerIds, customerId);
+  }
+}
+
+async function deleteStripeCustomers(
   stripe: StripeCustomerClientLike,
   customerIds: Set<string>,
   deletedCustomerIds: Set<string>,

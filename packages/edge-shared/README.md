@@ -69,7 +69,7 @@ Deno.serve(async (req) => {
 
 `create-credit-checkout` uses `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_PRICE_PACK_10`, `STRIPE_PRICE_PACK_25`, `STRIPE_PRICE_PACK_50`, `CHECKOUT_SUCCESS_URL`, and `CHECKOUT_CANCEL_URL`. Its accepted body is `{ "pack": "p10" | "p25" | "p50" }`.
 
-`delete-account` also uses `STRIPE_SECRET_KEY`. It fences checkout first, expires the fully collected registered and customer-scoped open Sessions, then runs a bounded registry/customer cleanup fixpoint. Each refresh rejects unsafe lifecycle states and deletes only newly discovered customers; failure to stabilize preserves auth and returns retryable `deletion_incomplete`. Auth is removed only after a stable snapshot containing exclusively expired, credited, or refunded terminal Sessions.
+`delete-account` also uses `STRIPE_SECRET_KEY`. It fences checkout first, expires the fully collected registered and customer-scoped open Sessions, then runs a bounded registry discovery fixpoint. After discovery stabilizes, a database finalizer takes the same per-user advisory lock as registration and reconciliation, rejects any unsafe row, and prevents later registrations from creating pending work. Stripe customers are deleted only after that locked finalization; failure to stabilize or finalize preserves both customers and auth with retryable `deletion_incomplete`.
 Requesting deletion is terminal: once the fence exists, checkout stays disabled and the deletion endpoint is retry-only until every cleanup or refund finishes and auth deletion succeeds.
 Registry state `open` means “registered and not yet reconciled or durably marked expired”; it does not assert that Stripe still reports the Session as open.
 

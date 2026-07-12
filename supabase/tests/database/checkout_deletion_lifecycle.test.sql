@@ -1,6 +1,6 @@
 begin;
 
-select plan(45);
+select plan(63);
 
 select ok(
   not has_schema_privilege('anon', 'checkout_lifecycle_private', 'usage'),
@@ -364,7 +364,7 @@ select is(
     from checkout_lifecycle_private.checkout_sessions
     where stripe_checkout_session_id = 'cs_raced'
   ),
-  null,
+  null::text,
   'successful manual or automatic resolution clears the terminal refund error'
 );
 select is(
@@ -380,6 +380,135 @@ select is(
   'refunded',
   'a compensated completion is idempotently terminal'
 );
+
+select is(
+  (
+    public.checkout_lifecycle_finalize_deletion(
+      '00000000-0000-0000-0000-000000000201'
+    ) ->> 'status'
+  ),
+  'unsafe',
+  'locked deletion finalization rejects an existing open registry row'
+);
+select lives_ok(
+  $$select public.checkout_lifecycle_mark_expired('cs_owner_guard')$$,
+  'settled open Sessions can be durably marked expired'
+);
+
+do $$
+begin
+  perform public.checkout_lifecycle_register_session(
+    '00000000-0000-0000-0000-000000000201',
+    'cs_async_failed'
+  );
+end;
+$$;
+
+select is(
+  public.checkout_lifecycle_mark_async_payment_failed(
+    '00000000-0000-0000-0000-000000000201',
+    'cs_async_failed',
+    'evt_async_failed',
+    'cus_async_failed'
+  ),
+  'terminalized',
+  'failed asynchronous payment terminalizes its registered Session'
+);
+select is(
+  (
+    select state
+    from checkout_lifecycle_private.checkout_sessions
+    where stripe_checkout_session_id = 'cs_async_failed'
+  ),
+  'payment_failed',
+  'failed asynchronous payment is a terminal non-credit state'
+);
+select is(
+  (
+    select stripe_customer_id
+    from checkout_lifecycle_private.checkout_sessions
+    where stripe_checkout_session_id = 'cs_async_failed'
+  ),
+  'cus_async_failed',
+  'failed asynchronous payment durably retains its Stripe customer'
+);
+select is(
+  (
+    public.checkout_lifecycle_finalize_deletion(
+      '00000000-0000-0000-0000-000000000201'
+    ) ->> 'status'
+  ),
+  'finalized',
+  'locked deletion finalization succeeds only after every row is terminal'
+);
+select ok(
+  (
+    public.checkout_lifecycle_finalize_deletion(
+      '00000000-0000-0000-0000-000000000201'
+    ) -> 'customer_ids'
+  ) @> '["cus_raced"]'::jsonb,
+  'locked deletion finalization returns the authoritative customer snapshot'
+);
+select is(
+  public.checkout_lifecycle_register_session(
+    '00000000-0000-0000-0000-000000000201',
+    'cs_after_finalize'
+  ),
+  true,
+  'registration after finalization is fenced without creating new pending work'
+);
+select is(
+  public.checkout_lifecycle_reconcile_completion(
+    '00000000-0000-0000-0000-000000000201',
+    'cs_after_finalize',
+    'evt_after_finalize',
+    'checkout.session.completed',
+    5000,
+    'cus_after_finalize',
+    'pi_after_finalize'
+  ),
+  'refund_missing_user',
+  'a completion after finalization requires refund and customer cleanup while auth exists'
+);
+select is(
+  (
+    select finalized_at is null
+    from checkout_lifecycle_private.deletion_fences
+    where user_id = '00000000-0000-0000-0000-000000000201'
+  ),
+  true,
+  'late completion invalidates the frozen deletion snapshot'
+);
+select lives_ok(
+  $$select public.checkout_lifecycle_mark_refunded('cs_after_finalize', 'evt_after_finalize')$$,
+  'late finalized-fence refund can become terminal'
+);
+select is(
+  public.checkout_lifecycle_get_customer_cleanup('cs_after_finalize') ->> 'customer_id',
+  'cus_after_finalize',
+  'late finalized-fence cleanup stores its authoritative customer'
+);
+select lives_ok(
+  $$select public.checkout_lifecycle_complete_customer_cleanup('cs_after_finalize')$$,
+  'late finalized-fence customer cleanup can become terminal'
+);
+select is(
+  (
+    public.checkout_lifecycle_finalize_deletion(
+      '00000000-0000-0000-0000-000000000201'
+    ) ->> 'status'
+  ),
+  'finalized',
+  'deletion can be finalized again after late refund cleanup'
+);
+select ok(
+  (
+    public.checkout_lifecycle_finalize_deletion(
+      '00000000-0000-0000-0000-000000000201'
+    ) -> 'customer_ids'
+  ) @> '["cus_after_finalize"]'::jsonb,
+  'refinalization returns the late customer in its authoritative snapshot'
+);
 select is(
   (
     select count(*)::integer
@@ -389,7 +518,7 @@ select is(
       1000
     )
   ),
-  3,
+  5,
   'deletion can discover every registered Session'
 );
 
@@ -407,8 +536,8 @@ select is(
     'cus_after_delete',
     'pi_after_delete'
   ),
-  'refund',
-  'a payment for a missing user enters the same compensation path'
+  'refund_missing_user',
+  'a payment for a missing user enters refund plus customer-cleanup compensation'
 );
 select is(
   (
@@ -442,8 +571,30 @@ select is(
     'cus_after_delete',
     'pi_after_delete'
   ),
+  'refunded_cleanup_pending',
+  'missing-user refund remains nonterminal until late customer cleanup succeeds'
+);
+select is(
+  public.checkout_lifecycle_get_customer_cleanup('cs_after_delete') ->> 'customer_id',
+  'cus_after_delete',
+  'late customer cleanup reads the customer id stored by reconciliation'
+);
+select lives_ok(
+  $$select public.checkout_lifecycle_complete_customer_cleanup('cs_after_delete')$$,
+  'late missing-user Stripe customer cleanup can be durably acknowledged'
+);
+select is(
+  public.checkout_lifecycle_reconcile_completion(
+    '00000000-0000-0000-0000-000000000201',
+    'cs_after_delete',
+    'evt_after_delete_final',
+    'checkout.session.completed',
+    5000,
+    'cus_after_delete',
+    'pi_after_delete'
+  ),
   'refunded',
-  'missing-user compensation is idempotently terminal'
+  'missing-user compensation becomes terminal only after customer cleanup'
 );
 
 select * from finish();

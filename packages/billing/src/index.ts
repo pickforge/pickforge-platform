@@ -76,6 +76,9 @@ export interface StripeClientLike {
       create<TSession = unknown>(params: StripeCheckoutSessionCreateParams): Promise<TSession>;
     };
   };
+  customers: {
+    del(customerId: string): Promise<unknown>;
+  };
   refunds: {
     create(
       params: { payment_intent: string },
@@ -155,7 +158,7 @@ export interface VerifyStripeEventOptions {
 
 export interface ProcessStripeEventOptions {
   supabase: SupabaseClientLike;
-  stripe: Pick<StripeClientLike, "refunds">;
+  stripe: Pick<StripeClientLike, "customers" | "refunds">;
   event: StripeEventLike;
 }
 
@@ -169,6 +172,8 @@ type CheckoutCompletionReconciliation =
   | "credited"
   | "refund"
   | "refunded"
+  | "refund_missing_user"
+  | "refunded_cleanup_pending"
   | "duplicate";
 
 interface CheckoutCompletionReconciliationArgs extends Record<string, unknown> {
@@ -240,6 +245,12 @@ export async function processStripeEvent({
   event,
 }: ProcessStripeEventOptions): Promise<ProcessStripeEventResult> {
   assertStripeEvent(event);
+
+  if (event.type === "checkout.session.async_payment_failed") {
+    const result = await processCheckoutSessionAsyncPaymentFailed(supabase, event);
+    await recordStripeEventBestEffort(supabase, event);
+    return result;
+  }
 
   if (isCheckoutMoneyEvent(event.type)) {
     const result = await processCheckoutSessionMoneyEvent({ supabase, stripe, event });
@@ -321,6 +332,39 @@ export async function listLedgerEntries({
   return (data ?? []).map(toCreditLedgerEntry);
 }
 
+async function processCheckoutSessionAsyncPaymentFailed(
+  supabase: SupabaseClientLike,
+  event: StripeEventLike,
+): Promise<ProcessStripeEventResult> {
+  const session = getObject<StripeCheckoutSessionObject>(event);
+  const sessionId = validateNonEmptyString(session.id, "checkout session id");
+  const userId = validateUuid(session.client_reference_id, "client_reference_id");
+  const { data, error } = await (supabase.rpc(
+    "checkout_lifecycle_mark_async_payment_failed",
+    {
+      target_user: userId,
+      checkout_session_id: sessionId,
+      event_id: event.id,
+      stripe_customer_id: readStripeObjectId(session.customer),
+    },
+  ) as PromiseLike<SupabaseQueryResult<string>>);
+  if (error !== null) {
+    throw databaseError("Failed to terminalize failed asynchronous Checkout Session", error);
+  }
+  if (data === "terminalized") {
+    return { handled: true, duplicate: false };
+  }
+  if (data === "duplicate") {
+    return { handled: false, duplicate: true };
+  }
+  if (data === "missing") {
+    return { handled: false, duplicate: false };
+  }
+  throw databaseError("Invalid asynchronous Checkout Session failure response", {
+    message: "checkout_lifecycle_mark_async_payment_failed returned an unknown result",
+  });
+}
+
 async function processCheckoutSessionMoneyEvent({
   supabase,
   stripe,
@@ -361,7 +405,16 @@ async function processCheckoutSessionMoneyEvent({
       reconciliation: "deletion_race_refunded",
     };
   }
-  if (reconciliation === "refund") {
+  if (reconciliation === "refunded_cleanup_pending") {
+    await completeLateCustomerCleanup(supabase, stripe, sessionId);
+    return {
+      handled: true,
+      duplicate: false,
+      reconciliation: "deletion_race_refunded",
+    };
+  }
+  if (reconciliation === "refund" || reconciliation === "refund_missing_user") {
+    const cleanupLateCustomer = reconciliation === "refund_missing_user";
     let createdRefund: StripeRefundLike;
     try {
       createdRefund = await stripe.refunds.create(
@@ -376,6 +429,9 @@ async function processCheckoutSessionMoneyEvent({
         throw error;
       }
       await markCheckoutRefunded(supabase, sessionId, event.id);
+      if (cleanupLateCustomer) {
+        await completeLateCustomerCleanup(supabase, stripe, sessionId);
+      }
       return {
         handled: true,
         duplicate: false,
@@ -399,6 +455,9 @@ async function processCheckoutSessionMoneyEvent({
       );
     }
     await markCheckoutRefunded(supabase, sessionId, event.id);
+    if (cleanupLateCustomer) {
+      await completeLateCustomerCleanup(supabase, stripe, sessionId);
+    }
     return {
       handled: true,
       duplicate: false,
@@ -424,6 +483,8 @@ async function reconcileCheckoutCompletion(
     data === "credited" ||
     data === "refund" ||
     data === "refunded" ||
+    data === "refund_missing_user" ||
+    data === "refunded_cleanup_pending" ||
     data === "duplicate"
   ) {
     return data;
@@ -445,6 +506,47 @@ async function markCheckoutRefunded(
   }) as PromiseLike<SupabaseQueryResult<unknown>>);
   if (error !== null) {
     throw databaseError("Failed to mark Checkout Session refunded", error);
+  }
+}
+
+async function completeLateCustomerCleanup(
+  supabase: SupabaseClientLike,
+  stripe: Pick<StripeClientLike, "customers">,
+  sessionId: string,
+): Promise<void> {
+  const cleanupResult = await (supabase.rpc("checkout_lifecycle_get_customer_cleanup", {
+    checkout_session_id: sessionId,
+  }) as PromiseLike<SupabaseQueryResult<unknown>>);
+  if (cleanupResult.error !== null) {
+    throw databaseError("Failed to read late Stripe customer cleanup", cleanupResult.error);
+  }
+  if (
+    !isRecord(cleanupResult.data) ||
+    cleanupResult.data.pending !== true ||
+    (
+      cleanupResult.data.customer_id !== null &&
+      typeof cleanupResult.data.customer_id !== "string"
+    )
+  ) {
+    throw databaseError("Invalid late Stripe customer cleanup response", {
+      message: "checkout_lifecycle_get_customer_cleanup returned an invalid result",
+    });
+  }
+  const customerId = cleanupResult.data.customer_id;
+  if (customerId !== null) {
+    try {
+      await stripe.customers.del(customerId);
+    } catch (error) {
+      if (!isStripeResourceMissingError(error)) {
+        throw error;
+      }
+    }
+  }
+  const { error } = await (supabase.rpc("checkout_lifecycle_complete_customer_cleanup", {
+    checkout_session_id: sessionId,
+  }) as PromiseLike<SupabaseQueryResult<unknown>>);
+  if (error !== null) {
+    throw databaseError("Failed to complete late Stripe customer cleanup", error);
   }
 }
 
@@ -603,6 +705,10 @@ function validateNonEmptyString(value: unknown, field: string): string {
 
 function isStripeAlreadyRefundedError(error: unknown): boolean {
   return isRecord(error) && error.code === "charge_already_refunded";
+}
+
+function isStripeResourceMissingError(error: unknown): boolean {
+  return isRecord(error) && error.code === "resource_missing";
 }
 
 function validateCheckoutAmount(value: unknown): number {

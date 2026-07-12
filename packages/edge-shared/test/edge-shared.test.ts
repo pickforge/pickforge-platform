@@ -10,6 +10,7 @@ import {
   createStripeWebhookHandler,
   debitCredits,
   getBearerToken,
+  expireCheckoutSession,
   getUserFromRequest,
   jsonResponse,
   newIdempotencyKey,
@@ -366,6 +367,18 @@ describe("@pickforge/edge-shared", () => {
     expect(markSessionExpired).toHaveBeenCalledWith("cs_raced");
   });
 
+  it("recognizes a completed Session without trying to expire it", async () => {
+    const stripe = checkoutStripe();
+    stripe.checkout.sessions.retrieve = vi.fn(async () => ({
+      id: "cs_complete",
+      status: "complete" as const,
+    }));
+
+    await expect(expireCheckoutSession(stripe, "cs_complete")).resolves.toBe("complete");
+
+    expect(stripe.checkout.sessions.expire).not.toHaveBeenCalled();
+  });
+
   it("fences first and expires a registered first-checkout Session before auth deletion", async () => {
     const admin = accountAdmin({}, {}, {
       sessions: [{ stripe_checkout_session_id: "cs_first", state: "open" }],
@@ -525,6 +538,106 @@ describe("@pickforge/edge-shared", () => {
     expect(admin.auth.admin.deleteUser).not.toHaveBeenCalled();
   });
 
+  it("holds customer and auth deletion when the locked finalizer observes a late unsafe Session", async () => {
+    const admin = accountAdmin({}, {}, {
+      sessions: [{
+        stripe_checkout_session_id: "cs_completed",
+        state: "completed",
+        stripe_customer_id: "cus_preserved",
+      }],
+      onFinalize: (sessions) => {
+        sessions.push({
+          stripe_checkout_session_id: "cs_late_refund",
+          state: "refund_pending",
+          stripe_customer_id: "cus_preserved",
+        });
+      },
+    });
+    const stripe = deletionStripe({
+      sessions: [{ id: "cs_completed", status: "complete" }],
+    });
+    const handler = createDeleteAccountHandler({
+      admin,
+      stripe,
+      resolveUserId: vi.fn(async () => USER_ID),
+    });
+
+    const response = await handler(new Request("https://edge.test", { method: "POST" }));
+
+    expect(response.status).toBe(503);
+    expect(stripe.customers.del).not.toHaveBeenCalled();
+    expect(admin.auth.admin.deleteUser).not.toHaveBeenCalled();
+  });
+
+  it("deletes a refunded customer discovered inside the locked finalizer snapshot", async () => {
+    const admin = accountAdmin({}, {}, {
+      onFinalize: (sessions) => {
+        sessions.push({
+          stripe_checkout_session_id: "cs_locked_refunded",
+          state: "refunded",
+          stripe_customer_id: "cus_locked_refunded",
+        });
+      },
+    });
+    const stripe = deletionStripe();
+    const handler = createDeleteAccountHandler({
+      admin,
+      stripe,
+      resolveUserId: vi.fn(async () => USER_ID),
+    });
+
+    const response = await handler(new Request("https://edge.test", { method: "POST" }));
+
+    expect(response.status).toBe(200);
+    expect(stripe.customers.del).toHaveBeenCalledWith("cus_locked_refunded");
+    expect(admin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
+  });
+
+  it("rechecks and deletes a customer terminalized after the first frozen snapshot", async () => {
+    let lateTerminalized = false;
+    const admin = accountAdmin({}, {}, {
+      sessions: [{
+        stripe_checkout_session_id: "cs_initial_terminal",
+        state: "completed",
+        stripe_customer_id: "cus_initial",
+      }],
+      onListSessions: (_call, sessions) => {
+        if (
+          lateTerminalized &&
+          !sessions.some((session) =>
+            session.stripe_checkout_session_id === "cs_late_terminal"
+          )
+        ) {
+          sessions.push({
+            stripe_checkout_session_id: "cs_late_terminal",
+            state: "refunded",
+            stripe_customer_id: "cus_late",
+          });
+        }
+      },
+    });
+    const stripe = deletionStripe({
+      deleteCustomer: async (customerId) => {
+        if (customerId === "cus_initial") {
+          lateTerminalized = true;
+        }
+        return {};
+      },
+    });
+    const handler = createDeleteAccountHandler({
+      admin,
+      stripe,
+      resolveUserId: vi.fn(async () => USER_ID),
+    });
+
+    const response = await handler(new Request("https://edge.test", { method: "POST" }));
+
+    expect(response.status).toBe(200);
+    expect(stripe.customers.del).toHaveBeenCalledWith("cus_initial");
+    expect(stripe.customers.del).toHaveBeenCalledWith("cus_late");
+    expect(admin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
+  });
+
   it("keeps deletion retryable when expiry fails after earlier Sessions were expired", async () => {
     const admin = accountAdmin({}, {}, {
       sessions: [
@@ -568,6 +681,7 @@ describe("@pickforge/edge-shared", () => {
       sessions: [
         { stripe_checkout_session_id: "cs_expired", state: "open" },
         { stripe_checkout_session_id: "cs_complete", state: "completed" },
+        { stripe_checkout_session_id: "cs_payment_failed", state: "payment_failed" },
         {
           stripe_checkout_session_id: "cs_refunded",
           state: "refunded",
@@ -580,6 +694,7 @@ describe("@pickforge/edge-shared", () => {
         { id: "cs_expired", status: "expired" },
         { id: "cs_complete", status: "complete" },
         { id: "cs_refunded", status: "complete" },
+        { id: "cs_payment_failed", status: "complete" },
       ],
     });
     const safeHandler = createDeleteAccountHandler({
@@ -1233,7 +1348,7 @@ function checkoutStripe(options: CheckoutStripeOptions = {}) {
     checkout: {
       sessions: {
         expire: vi.fn(options.expire ?? (async (sessionId) => ({ id: sessionId, status: "expired" as const }))),
-        retrieve: vi.fn(options.retrieve ?? (async (sessionId) => ({ id: sessionId, status: "expired" as const }))),
+        retrieve: vi.fn(options.retrieve ?? (async (sessionId) => ({ id: sessionId, status: "open" as const }))),
         list: vi.fn(async () => ({ data: [], has_more: false })),
       },
     },
@@ -1313,6 +1428,7 @@ interface AccountLifecycleOptions {
   sessions?: AccountLifecycleSession[];
   errors?: Record<string, SupabaseErrorLike>;
   onListSessions?: (call: number, sessions: AccountLifecycleSession[]) => void;
+  onFinalize?: (sessions: AccountLifecycleSession[]) => void;
 }
 
 function accountAdmin(
@@ -1355,6 +1471,25 @@ function accountAdmin(
           session.state = "expired";
         }
         return { data: null, error: null };
+      }
+      if (fn === "checkout_lifecycle_finalize_deletion") {
+        lifecycle.onFinalize?.(lifecycleSessions);
+        const unsafe = lifecycleSessions.some(
+          (session) => session.state === "open" || session.state === "refund_pending",
+        );
+        const customerIds = [
+          ...new Set(
+            lifecycleSessions
+              .map((session) => session.stripe_customer_id)
+              .filter((customerId): customerId is string => typeof customerId === "string"),
+          ),
+        ];
+        return {
+          data: (unsafe
+            ? { status: "unsafe" }
+            : { status: "finalized", customer_ids: customerIds }) as T,
+          error: null,
+        };
       }
       if (fn === "checkout_lifecycle_list_sessions") {
         const start = Number(args?.page_start ?? 0);

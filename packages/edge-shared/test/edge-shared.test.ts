@@ -569,6 +569,56 @@ describe("@pickforge/edge-shared", () => {
     expect(admin.auth.admin.deleteUser).not.toHaveBeenCalled();
   });
 
+  it("atomically blocks auth deletion when completion starts after the final snapshot", async () => {
+    const admin = accountAdmin({}, {}, {
+      sessions: [{
+        stripe_checkout_session_id: "cs_terminal",
+        state: "completed",
+        stripe_customer_id: "cus_terminal",
+      }],
+      onAtomicDelete: (sessions) => {
+        sessions.push({
+          stripe_checkout_session_id: "cs_atomic_race",
+          state: "refund_pending",
+          stripe_customer_id: "cus_atomic_race",
+        });
+      },
+    });
+    const handler = createDeleteAccountHandler({
+      admin,
+      stripe: deletionStripe(),
+      resolveUserId: vi.fn(async () => USER_ID),
+    });
+
+    const response = await handler(new Request("https://edge.test", { method: "POST" }));
+
+    expect(response.status).toBe(503);
+    expect(admin.auth.admin.deleteUser).not.toHaveBeenCalled();
+  });
+
+  it("keeps refunded customer cleanup pending until it is durably cleared", async () => {
+    const admin = accountAdmin({}, {}, {
+      sessions: [{
+        stripe_checkout_session_id: "cs_cleanup_pending",
+        state: "refunded",
+        stripe_customer_id: "cus_cleanup_pending",
+        customer_cleanup_pending: true,
+      }],
+    });
+    const stripe = deletionStripe();
+    const handler = createDeleteAccountHandler({
+      admin,
+      stripe,
+      resolveUserId: vi.fn(async () => USER_ID),
+    });
+
+    const response = await handler(new Request("https://edge.test", { method: "POST" }));
+
+    expect(response.status).toBe(503);
+    expect(stripe.customers.del).not.toHaveBeenCalled();
+    expect(admin.auth.admin.deleteUser).not.toHaveBeenCalled();
+  });
+
   it("deletes a refunded customer discovered inside the locked finalizer snapshot", async () => {
     const admin = accountAdmin({}, {}, {
       onFinalize: (sessions) => {
@@ -1422,6 +1472,7 @@ interface AccountLifecycleSession {
   stripe_checkout_session_id: string;
   state: string;
   stripe_customer_id?: string | null;
+  customer_cleanup_pending?: boolean;
 }
 
 interface AccountLifecycleOptions {
@@ -1429,6 +1480,7 @@ interface AccountLifecycleOptions {
   errors?: Record<string, SupabaseErrorLike>;
   onListSessions?: (call: number, sessions: AccountLifecycleSession[]) => void;
   onFinalize?: (sessions: AccountLifecycleSession[]) => void;
+  onAtomicDelete?: (sessions: AccountLifecycleSession[]) => void;
 }
 
 function accountAdmin(
@@ -1439,13 +1491,14 @@ function accountAdmin(
   const rpcCalls: Array<{ fn: string; args?: Record<string, unknown> }> = [];
   const lifecycleSessions = (lifecycle.sessions ?? []).map((session) => ({ ...session }));
   let listCalls = 0;
+  const deleteUser = vi.fn<(userId: string) => Promise<{ error: SupabaseErrorLike | null }>>(
+    async (_userId) => ({ error: null }),
+  );
   return {
     rpcCalls,
     auth: {
       admin: {
-        deleteUser: vi.fn<(userId: string) => Promise<{ error: SupabaseErrorLike | null }>>(
-          async (_userId) => ({ error: null }),
-        ),
+        deleteUser,
       },
     },
     from<T = unknown>(table: string): AccountQuery<T> {
@@ -1475,7 +1528,10 @@ function accountAdmin(
       if (fn === "checkout_lifecycle_finalize_deletion") {
         lifecycle.onFinalize?.(lifecycleSessions);
         const unsafe = lifecycleSessions.some(
-          (session) => session.state === "open" || session.state === "refund_pending",
+          (session) =>
+            session.state === "open" ||
+            session.state === "refund_pending" ||
+            session.customer_cleanup_pending === true,
         );
         const customerIds = [
           ...new Set(
@@ -1490,6 +1546,26 @@ function accountAdmin(
             : { status: "finalized", customer_ids: customerIds }) as T,
           error: null,
         };
+      }
+      if (fn === "checkout_lifecycle_delete_auth_user") {
+        lifecycle.onAtomicDelete?.(lifecycleSessions);
+        const unsafe = lifecycleSessions.some(
+          (session) =>
+            session.state === "open" ||
+            session.state === "refund_pending" ||
+            session.customer_cleanup_pending === true,
+        );
+        if (unsafe) {
+          return { data: "unsafe" as T, error: null };
+        }
+        const result = await deleteUser(String(args?.target_user));
+        if (result.error?.code === "user_not_found") {
+          return { data: "deleted" as T, error: null };
+        }
+        if (result.error !== null) {
+          return { data: null, error: result.error };
+        }
+        return { data: "deleted" as T, error: null };
       }
       if (fn === "checkout_lifecycle_list_sessions") {
         const start = Number(args?.page_start ?? 0);

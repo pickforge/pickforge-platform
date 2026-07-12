@@ -476,7 +476,10 @@ begin
     select 1
     from checkout_lifecycle_private.checkout_sessions
     where user_id = target_user
-      and state in ('open', 'refund_pending')
+      and (
+        state in ('open', 'refund_pending')
+        or customer_cleanup_pending
+      )
   ) then
     return pg_catalog.jsonb_build_object('status', 'unsafe');
   end if;
@@ -499,6 +502,39 @@ begin
     'status', 'finalized',
     'customer_ids', customer_ids
   );
+end;
+$$;
+
+create or replace function public.checkout_lifecycle_delete_auth_user(target_user uuid)
+returns text
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext(target_user::text));
+
+  if not exists (
+    select 1
+    from checkout_lifecycle_private.deletion_fences
+    where user_id = target_user
+      and finalized_at is not null
+  ) or exists (
+    select 1
+    from checkout_lifecycle_private.checkout_sessions
+    where user_id = target_user
+      and (
+        state in ('open', 'refund_pending')
+        or customer_cleanup_pending
+      )
+  ) then
+    return 'unsafe';
+  end if;
+
+  delete from auth.users
+  where id = target_user;
+
+  return 'deleted';
 end;
 $$;
 
@@ -555,6 +591,8 @@ revoke all on function public.checkout_lifecycle_mark_async_payment_failed(uuid,
   from public, anon, authenticated, service_role;
 revoke all on function public.checkout_lifecycle_finalize_deletion(uuid)
   from public, anon, authenticated, service_role;
+revoke all on function public.checkout_lifecycle_delete_auth_user(uuid)
+  from public, anon, authenticated, service_role;
 revoke all on function public.checkout_lifecycle_complete_customer_cleanup(text)
   from public, anon, authenticated, service_role;
 revoke all on function public.checkout_lifecycle_get_customer_cleanup(text)
@@ -570,5 +608,6 @@ grant execute on function public.checkout_lifecycle_mark_expired(text) to servic
 grant execute on function public.checkout_lifecycle_record_refund_failure(text, text, text, text) to service_role;
 grant execute on function public.checkout_lifecycle_mark_async_payment_failed(uuid, text, text, text) to service_role;
 grant execute on function public.checkout_lifecycle_finalize_deletion(uuid) to service_role;
+grant execute on function public.checkout_lifecycle_delete_auth_user(uuid) to service_role;
 grant execute on function public.checkout_lifecycle_complete_customer_cleanup(text) to service_role;
 grant execute on function public.checkout_lifecycle_get_customer_cleanup(text) to service_role;

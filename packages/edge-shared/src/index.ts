@@ -732,10 +732,7 @@ export function createDeleteAccountHandler({
       await finalizeAccountDeletion(admin, userId, customerIds);
       await deleteStripeCustomers(stripe, customerIds, deletedCustomerIds);
 
-      const { error } = await admin.auth.admin.deleteUser(userId);
-      if (error !== null && !isUserNotFoundError(error)) {
-        throw new Error("Failed to delete user", { cause: error });
-      }
+      await deleteAuthUserAtomically(admin, userId);
 
       return jsonResponse(200, { deleted: true });
     } catch (error) {
@@ -1033,9 +1030,6 @@ function accountErrorResponse(error: unknown): Response {
   return jsonResponse(500, { error: "internal_error" });
 }
 
-function isUserNotFoundError(error: SupabaseErrorLike): boolean {
-  return error.code === "user_not_found" || /user not found/i.test(error.message);
-}
 
 function isStripeResourceMissingError(error: unknown): boolean {
   return isRecord(error) && error.code === "resource_missing";
@@ -1148,6 +1142,26 @@ async function finalizeAccountDeletion(
   }
   for (const customerId of data.customer_ids) {
     addStripeCustomerId(customerIds, customerId);
+  }
+}
+
+async function deleteAuthUserAtomically(
+  admin: Pick<AccountAdminClientLike, "rpc">,
+  userId: string,
+): Promise<void> {
+  const { data, error } = await accountRpc<string>(
+    admin,
+    "checkout_lifecycle_delete_auth_user",
+    { target_user: userId },
+  );
+  if (error !== null) {
+    throw databaseError("Failed to atomically delete auth user", error);
+  }
+  if (data !== "deleted") {
+    throw new EdgeSharedError(
+      "deletion_incomplete",
+      "Checkout Session lifecycle changed before atomic auth deletion",
+    );
   }
 }
 

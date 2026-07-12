@@ -1,6 +1,6 @@
 begin;
 
-select plan(63);
+select plan(71);
 
 select ok(
   not has_schema_privilege('anon', 'checkout_lifecycle_private', 'usage'),
@@ -510,6 +510,75 @@ select ok(
   'refinalization returns the late customer in its authoritative snapshot'
 );
 select is(
+  public.checkout_lifecycle_reconcile_completion(
+    '00000000-0000-0000-0000-000000000201',
+    'cs_atomic_race',
+    'evt_atomic_race',
+    'checkout.session.completed',
+    5000,
+    'cus_atomic_race',
+    'pi_atomic_race'
+  ),
+  'refund_missing_user',
+  'completion can start customer cleanup after the frozen snapshot'
+);
+select is(
+  public.checkout_lifecycle_delete_auth_user(
+    '00000000-0000-0000-0000-000000000201'
+  ),
+  'unsafe',
+  'atomic auth deletion rejects completion work started after finalization'
+);
+select ok(
+  exists (
+    select 1
+    from auth.users
+    where id = '00000000-0000-0000-0000-000000000201'
+  ),
+  'the user survives the finalization-to-auth deletion race'
+);
+select lives_ok(
+  $$select public.checkout_lifecycle_mark_refunded('cs_atomic_race', 'evt_atomic_race')$$,
+  'the racing completion refund can become terminal'
+);
+select is(
+  (
+    public.checkout_lifecycle_finalize_deletion(
+      '00000000-0000-0000-0000-000000000201'
+    ) ->> 'status'
+  ),
+  'unsafe',
+  'refunded customer cleanup remains unsafe until durably cleared'
+);
+select lives_ok(
+  $$select public.checkout_lifecycle_complete_customer_cleanup('cs_atomic_race')$$,
+  'the racing completion customer cleanup can become terminal'
+);
+select is(
+  (
+    public.checkout_lifecycle_finalize_deletion(
+      '00000000-0000-0000-0000-000000000201'
+    ) ->> 'status'
+  ),
+  'finalized',
+  'deletion refinalizes after the racing completion is fully cleaned'
+);
+select is(
+  public.checkout_lifecycle_delete_auth_user(
+    '00000000-0000-0000-0000-000000000201'
+  ),
+  'deleted',
+  'auth deletion linearizes under the lifecycle advisory lock'
+);
+select ok(
+  not exists (
+    select 1
+    from auth.users
+    where id = '00000000-0000-0000-0000-000000000201'
+  ),
+  'atomic lifecycle deletion removes auth only after cleanup'
+);
+select is(
   (
     select count(*)::integer
     from public.checkout_lifecycle_list_sessions(
@@ -518,14 +587,10 @@ select is(
       1000
     )
   ),
-  5,
+  6,
   'deletion can discover every registered Session'
 );
 
-select lives_ok(
-  $$delete from auth.users where id = '00000000-0000-0000-0000-000000000201'$$,
-  'lifecycle tombstones survive auth deletion'
-);
 select is(
   public.checkout_lifecycle_reconcile_completion(
     '00000000-0000-0000-0000-000000000201',

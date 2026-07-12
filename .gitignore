@@ -1,6 +1,8 @@
 node_modules/
 dist/
 coverage/
+supabase/.branches/
+supabase/.temp/
 .DS_Store
 *.log
 .env

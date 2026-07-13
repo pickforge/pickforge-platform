@@ -1,0 +1,1096 @@
+create schema if not exists checkout_lifecycle_private;
+
+revoke all on schema checkout_lifecycle_private from public, anon, authenticated, service_role;
+
+create table checkout_lifecycle_private.deletion_fences (
+  user_id uuid primary key,
+  started_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  finalized_at timestamptz
+);
+
+create table checkout_lifecycle_private.checkout_sessions (
+  stripe_checkout_session_id text primary key check (length(btrim(stripe_checkout_session_id)) > 0),
+  user_id uuid not null,
+  state text not null default 'open'
+    check (state in ('open', 'expired', 'payment_failed', 'completed', 'refund_pending', 'refunded')),
+  stripe_event_id text,
+  amount_total_cents integer check (amount_total_cents is null or amount_total_cents > 0),
+  stripe_customer_id text,
+  stripe_payment_intent_id text,
+  stripe_refund_id text,
+  refund_attempt_count integer not null default 0 check (refund_attempt_count >= 0),
+  refund_attempt_claimed boolean not null default false,
+  refund_error_code text check (refund_error_code is null or refund_error_code in ('failed', 'canceled', 'partial')),
+  refund_error_at timestamptz,
+  customer_cleanup_pending boolean not null default false,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index checkout_lifecycle_sessions_user_id_idx
+  on checkout_lifecycle_private.checkout_sessions(user_id, stripe_checkout_session_id);
+
+create unique index checkout_lifecycle_sessions_refund_id_idx
+  on checkout_lifecycle_private.checkout_sessions(stripe_refund_id)
+  where stripe_refund_id is not null;
+
+create table checkout_lifecycle_private.refund_attempts (
+  stripe_checkout_session_id text not null
+    references checkout_lifecycle_private.checkout_sessions(stripe_checkout_session_id),
+  attempt integer not null check (attempt > 0),
+  stripe_refund_id text check (
+    stripe_refund_id is null or length(btrim(stripe_refund_id)) > 0
+  ),
+  amount_cents integer not null check (amount_cents > 0),
+  status text not null default 'pending'
+    check (status in ('pending', 'succeeded', 'failed', 'canceled')),
+  stripe_event_id text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  primary key (stripe_checkout_session_id, attempt)
+);
+
+create unique index checkout_lifecycle_refund_attempts_refund_id_idx
+  on checkout_lifecycle_private.refund_attempts(stripe_refund_id)
+  where stripe_refund_id is not null;
+
+insert into checkout_lifecycle_private.checkout_sessions (
+  stripe_checkout_session_id,
+  user_id,
+  state,
+  stripe_event_id,
+  amount_total_cents,
+  stripe_customer_id,
+  stripe_payment_intent_id
+)
+select
+  ledger.stripe_checkout_session_id,
+  ledger.user_id,
+  'completed',
+  ledger.stripe_event_id,
+  ledger.amount_cents,
+  nullif(ledger.metadata ->> 'stripe_customer_id', ''),
+  nullif(ledger.metadata ->> 'stripe_payment_intent_id', '')
+from public.credit_ledger as ledger
+where ledger.kind = 'purchase'
+  and ledger.stripe_checkout_session_id is not null
+on conflict (stripe_checkout_session_id) do nothing;
+
+alter table checkout_lifecycle_private.deletion_fences enable row level security;
+alter table checkout_lifecycle_private.checkout_sessions enable row level security;
+alter table checkout_lifecycle_private.refund_attempts enable row level security;
+
+revoke all on all tables in schema checkout_lifecycle_private from public, anon, authenticated, service_role;
+revoke all on all sequences in schema checkout_lifecycle_private from public, anon, authenticated, service_role;
+
+create or replace function public.checkout_lifecycle_is_deletion_fenced(target_user uuid)
+returns boolean
+language sql
+security definer
+stable
+set search_path = ''
+as $$
+  select exists (
+    select 1
+    from checkout_lifecycle_private.deletion_fences
+    where user_id = target_user
+  );
+$$;
+
+create or replace function public.checkout_lifecycle_register_session(
+  target_user uuid,
+  checkout_session_id text
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext(target_user::text));
+
+  if exists (
+    select 1
+    from checkout_lifecycle_private.deletion_fences
+    where user_id = target_user
+      and finalized_at is not null
+  ) then
+    return true;
+  end if;
+
+  insert into checkout_lifecycle_private.checkout_sessions (
+    stripe_checkout_session_id,
+    user_id
+  )
+  values (checkout_session_id, target_user)
+  on conflict (stripe_checkout_session_id) do update
+    set updated_at = now()
+    where checkout_lifecycle_private.checkout_sessions.user_id = excluded.user_id;
+
+  if not found then
+    raise integrity_constraint_violation using
+      message = 'Checkout Session is already registered to another user';
+  end if;
+
+  return exists (
+    select 1
+    from checkout_lifecycle_private.deletion_fences
+    where user_id = target_user
+  );
+end;
+$$;
+
+create or replace function public.checkout_lifecycle_fence_deletion(target_user uuid)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext(target_user::text));
+
+  insert into checkout_lifecycle_private.deletion_fences (user_id)
+  values (target_user)
+  on conflict (user_id) do update
+    set updated_at = now();
+end;
+$$;
+
+create or replace function public.checkout_lifecycle_list_sessions(
+  target_user uuid,
+  page_start integer default 0,
+  page_size integer default 1000
+)
+returns table (stripe_checkout_session_id text, state text, stripe_customer_id text)
+language sql
+security definer
+stable
+set search_path = ''
+as $$
+  select
+    sessions.stripe_checkout_session_id,
+    sessions.state,
+    sessions.stripe_customer_id
+  from checkout_lifecycle_private.checkout_sessions as sessions
+  where sessions.user_id = target_user
+  order by sessions.stripe_checkout_session_id
+  offset greatest(page_start, 0)
+  limit least(greatest(page_size, 1), 1000);
+$$;
+
+create or replace function public.checkout_lifecycle_reconcile_completion(
+  target_user uuid,
+  checkout_session_id text,
+  event_id text,
+  event_type text,
+  amount_total_cents integer,
+  stripe_customer_id text,
+  stripe_payment_intent_id text
+)
+returns text
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  existing_user uuid;
+  existing_state text;
+  existing_cleanup_pending boolean;
+  deletion_finalized boolean := false;
+  credited_user uuid;
+  credited_id uuid;
+begin
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext(target_user::text));
+
+  select sessions.user_id, sessions.state, sessions.customer_cleanup_pending
+  into existing_user, existing_state, existing_cleanup_pending
+  from checkout_lifecycle_private.checkout_sessions as sessions
+  where sessions.stripe_checkout_session_id = checkout_session_id;
+
+  if existing_user is not null and existing_user <> target_user then
+    raise integrity_constraint_violation using
+      message = 'Checkout Session is already registered to another user';
+  end if;
+
+  select ledger.user_id
+  into credited_user
+  from public.credit_ledger as ledger
+  where ledger.kind = 'purchase'
+    and ledger.stripe_checkout_session_id = checkout_session_id;
+
+  if found then
+    if credited_user <> target_user then
+      raise integrity_constraint_violation using
+        message = 'Checkout Session credit belongs to another user';
+    end if;
+
+    insert into checkout_lifecycle_private.checkout_sessions (
+      stripe_checkout_session_id,
+      user_id,
+      state,
+      stripe_event_id,
+      amount_total_cents,
+      stripe_customer_id,
+      stripe_payment_intent_id,
+      customer_cleanup_pending
+    )
+    select
+      ledger.stripe_checkout_session_id,
+      ledger.user_id,
+      'completed',
+      ledger.stripe_event_id,
+      ledger.amount_cents,
+      nullif(ledger.metadata ->> 'stripe_customer_id', ''),
+      nullif(ledger.metadata ->> 'stripe_payment_intent_id', ''),
+      false
+    from public.credit_ledger as ledger
+    where ledger.kind = 'purchase'
+      and ledger.stripe_checkout_session_id = checkout_session_id
+    on conflict (stripe_checkout_session_id) do update
+      set state = 'completed',
+          customer_cleanup_pending = false,
+          updated_at = now();
+
+    return 'duplicate';
+  end if;
+
+  if existing_state = 'completed' then
+    return 'duplicate';
+  end if;
+  if existing_state = 'refunded' then
+    if existing_cleanup_pending then
+      return 'refunded_cleanup_pending';
+    end if;
+    return 'refunded';
+  end if;
+  if existing_state in ('payment_failed', 'expired') then
+    return 'duplicate';
+  end if;
+
+  if not exists (
+    select 1
+    from auth.users
+    where id = target_user
+  ) then
+    insert into checkout_lifecycle_private.checkout_sessions (
+      stripe_checkout_session_id,
+      user_id,
+      state,
+      stripe_event_id,
+      amount_total_cents,
+      stripe_customer_id,
+      stripe_payment_intent_id,
+      customer_cleanup_pending
+    )
+    values (
+      checkout_session_id,
+      target_user,
+      'refund_pending',
+      event_id,
+      amount_total_cents,
+      stripe_customer_id,
+      stripe_payment_intent_id,
+      true
+    )
+    on conflict (stripe_checkout_session_id) do update
+      set state = 'refund_pending',
+          stripe_event_id = excluded.stripe_event_id,
+          amount_total_cents = excluded.amount_total_cents,
+          stripe_customer_id = excluded.stripe_customer_id,
+          stripe_payment_intent_id = excluded.stripe_payment_intent_id,
+          customer_cleanup_pending = true,
+          updated_at = now();
+
+    return 'refund_missing_user';
+  end if;
+
+  select fences.finalized_at is not null
+  into deletion_finalized
+  from checkout_lifecycle_private.deletion_fences as fences
+  where fences.user_id = target_user;
+
+  if found then
+    insert into checkout_lifecycle_private.checkout_sessions (
+      stripe_checkout_session_id,
+      user_id,
+      state,
+      stripe_event_id,
+      amount_total_cents,
+      stripe_customer_id,
+      stripe_payment_intent_id,
+      customer_cleanup_pending
+    )
+    values (
+      checkout_session_id,
+      target_user,
+      'refund_pending',
+      event_id,
+      amount_total_cents,
+      stripe_customer_id,
+      stripe_payment_intent_id,
+      deletion_finalized
+    )
+    on conflict (stripe_checkout_session_id) do update
+      set state = 'refund_pending',
+          stripe_event_id = excluded.stripe_event_id,
+          amount_total_cents = excluded.amount_total_cents,
+          stripe_customer_id = excluded.stripe_customer_id,
+          stripe_payment_intent_id = excluded.stripe_payment_intent_id,
+          customer_cleanup_pending =
+            checkout_lifecycle_private.checkout_sessions.customer_cleanup_pending
+            or excluded.customer_cleanup_pending,
+          updated_at = now();
+
+    if deletion_finalized then
+      update checkout_lifecycle_private.deletion_fences
+      set finalized_at = null,
+          updated_at = now()
+      where user_id = target_user;
+      return 'refund_missing_user';
+    end if;
+
+    return 'refund';
+  end if;
+
+  if stripe_customer_id is not null then
+    insert into public.billing_customers (
+      user_id,
+      stripe_customer_id,
+      updated_at
+    )
+    values (
+      target_user,
+      stripe_customer_id,
+      now()
+    )
+    on conflict (user_id) do update
+      set stripe_customer_id = excluded.stripe_customer_id,
+          updated_at = excluded.updated_at;
+  end if;
+
+  insert into public.credit_ledger (
+    user_id,
+    amount_cents,
+    kind,
+    description,
+    stripe_event_id,
+    stripe_checkout_session_id,
+    idempotency_key,
+    metadata
+  )
+  values (
+    target_user,
+    amount_total_cents,
+    'purchase',
+    'Credit purchase',
+    event_id,
+    checkout_session_id,
+    'stripe:' || checkout_session_id,
+    pg_catalog.jsonb_build_object(
+      'amount_total', amount_total_cents,
+      'stripe_customer_id', stripe_customer_id,
+      'stripe_checkout_session_id', checkout_session_id,
+      'stripe_event_type', event_type,
+      'stripe_payment_intent_id', stripe_payment_intent_id
+    )
+  )
+  on conflict do nothing
+  returning id into credited_id;
+
+  if credited_id is null and not exists (
+    select 1
+    from public.credit_ledger
+    where user_id = target_user
+      and kind = 'purchase'
+      and (
+        stripe_checkout_session_id = checkout_session_id
+        or stripe_event_id = event_id
+      )
+  ) then
+    raise integrity_constraint_violation using
+      message = 'Stripe completion conflicts with another ledger entry';
+  end if;
+
+  insert into checkout_lifecycle_private.checkout_sessions (
+    stripe_checkout_session_id,
+    user_id,
+    state,
+    stripe_event_id,
+    amount_total_cents,
+    stripe_customer_id,
+    stripe_payment_intent_id
+  )
+  values (
+    checkout_session_id,
+    target_user,
+    'completed',
+    event_id,
+    amount_total_cents,
+    stripe_customer_id,
+    stripe_payment_intent_id
+  )
+  on conflict (stripe_checkout_session_id) do update
+    set state = 'completed',
+        stripe_event_id = excluded.stripe_event_id,
+        amount_total_cents = excluded.amount_total_cents,
+        stripe_customer_id = excluded.stripe_customer_id,
+        stripe_payment_intent_id = excluded.stripe_payment_intent_id,
+        updated_at = now();
+
+  if credited_id is null then
+    return 'duplicate';
+  end if;
+  return 'credited';
+end;
+$$;
+
+create or replace function public.checkout_lifecycle_mark_refunded(
+  checkout_session_id text,
+  event_id text
+)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  session_row checkout_lifecycle_private.checkout_sessions%rowtype;
+  succeeded_cents bigint;
+begin
+  select *
+  into session_row
+  from checkout_lifecycle_private.checkout_sessions
+  where stripe_checkout_session_id = checkout_session_id
+  for update;
+
+  if not found or session_row.state not in ('refund_pending', 'refunded') then
+    raise no_data_found using message = 'Checkout Session refund is not pending';
+  end if;
+
+  select coalesce(sum(amount_cents), 0)
+  into succeeded_cents
+  from checkout_lifecycle_private.refund_attempts
+  where stripe_checkout_session_id = checkout_lifecycle_mark_refunded.checkout_session_id
+    and status = 'succeeded';
+
+  if session_row.amount_total_cents is null
+    or succeeded_cents < session_row.amount_total_cents
+  then
+    raise integrity_constraint_violation using
+      message = 'Refund attempt history does not cover the full Checkout Session amount';
+  end if;
+
+  update checkout_lifecycle_private.checkout_sessions
+  set state = 'refunded',
+      stripe_event_id = event_id,
+      refund_attempt_claimed = false,
+      refund_error_code = null,
+      refund_error_at = null,
+      updated_at = now()
+  where stripe_checkout_session_id = checkout_session_id;
+end;
+$$;
+
+create or replace function public.checkout_lifecycle_record_refund_failure(
+  checkout_session_id text,
+  event_id text,
+  refund_id text,
+  failure_status text
+)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if failure_status not in ('failed', 'canceled', 'partial') then
+    raise check_violation using message = 'Invalid Checkout Session refund failure status';
+  end if;
+
+  update checkout_lifecycle_private.checkout_sessions
+  set state = 'refund_pending',
+      stripe_event_id = event_id,
+      stripe_refund_id = refund_id,
+      refund_error_code = failure_status,
+      refund_error_at = now(),
+      refund_attempt_claimed = false,
+      updated_at = now()
+  where stripe_checkout_session_id = checkout_session_id
+    and state = 'refund_pending';
+
+  if not found then
+    raise no_data_found using message = 'Checkout Session refund failure is not pending';
+  end if;
+
+  update checkout_lifecycle_private.refund_attempts
+  set status = case when failure_status = 'partial' then 'succeeded' else failure_status end,
+      stripe_event_id = event_id,
+      updated_at = now()
+  where stripe_checkout_session_id = checkout_session_id
+    and stripe_refund_id = refund_id;
+
+  if not found then
+    raise no_data_found using message = 'Checkout Session refund attempt is not registered';
+  end if;
+end;
+$$;
+
+create or replace function public.checkout_lifecycle_mark_expired(
+  checkout_session_id text
+)
+returns void
+language sql
+security definer
+set search_path = ''
+as $$
+  update checkout_lifecycle_private.checkout_sessions
+  set state = 'expired',
+      updated_at = now()
+  where stripe_checkout_session_id = checkout_session_id
+    and state in ('open', 'expired');
+$$;
+
+create or replace function public.checkout_lifecycle_mark_async_payment_failed(
+  target_user uuid,
+  checkout_session_id text,
+  event_id text,
+  stripe_customer_id text
+)
+returns text
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  existing_state text;
+begin
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext(target_user::text));
+
+  select state
+  into existing_state
+  from checkout_lifecycle_private.checkout_sessions
+  where stripe_checkout_session_id = checkout_session_id
+    and user_id = target_user;
+
+  if existing_state is null then
+    return 'missing';
+  end if;
+  if existing_state <> 'open' then
+    return 'duplicate';
+  end if;
+
+  update checkout_lifecycle_private.checkout_sessions
+  set state = 'payment_failed',
+      stripe_event_id = event_id,
+      stripe_customer_id = coalesce(
+        checkout_lifecycle_mark_async_payment_failed.stripe_customer_id,
+        checkout_lifecycle_private.checkout_sessions.stripe_customer_id
+      ),
+      updated_at = now()
+  where stripe_checkout_session_id = checkout_session_id
+    and user_id = target_user
+    and state = 'open';
+
+  return 'terminalized';
+end;
+$$;
+
+create or replace function public.checkout_lifecycle_prepare_refund_attempt(
+  checkout_session_id text
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  session_row checkout_lifecycle_private.checkout_sessions%rowtype;
+  next_attempt integer;
+begin
+  select *
+  into session_row
+  from checkout_lifecycle_private.checkout_sessions
+  where stripe_checkout_session_id = checkout_session_id
+  for update;
+
+  if not found or session_row.state <> 'refund_pending' then
+    return null;
+  end if;
+
+  if session_row.stripe_refund_id is not null
+    and session_row.refund_error_code is null
+  then
+    return pg_catalog.jsonb_build_object(
+      'action', 'attached',
+      'attempt', session_row.refund_attempt_count,
+      'refund_id', session_row.stripe_refund_id,
+      'payment_intent_id', session_row.stripe_payment_intent_id,
+      'amount_cents', session_row.amount_total_cents,
+      'customer_cleanup_pending', session_row.customer_cleanup_pending
+    );
+  end if;
+
+  if session_row.refund_attempt_claimed then
+    next_attempt := session_row.refund_attempt_count;
+  else
+    select coalesce(max(attempt), 0) + 1
+    into next_attempt
+    from checkout_lifecycle_private.refund_attempts
+    where stripe_checkout_session_id = checkout_lifecycle_prepare_refund_attempt.checkout_session_id;
+  end if;
+
+  update checkout_lifecycle_private.checkout_sessions
+  set refund_attempt_count = next_attempt,
+      refund_attempt_claimed = true,
+      updated_at = now()
+  where stripe_checkout_session_id = checkout_session_id;
+  return pg_catalog.jsonb_build_object(
+    'action', 'create',
+    'attempt', next_attempt,
+    'payment_intent_id', session_row.stripe_payment_intent_id,
+    'amount_cents', session_row.amount_total_cents,
+    'customer_cleanup_pending', session_row.customer_cleanup_pending
+  );
+end;
+$$;
+
+create or replace function public.checkout_lifecycle_record_refund_attempt(
+  checkout_session_id text,
+  event_id text,
+  refund_id text,
+  attempt integer,
+  amount_cents integer
+)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  existing_attempt checkout_lifecycle_private.refund_attempts%rowtype;
+begin
+  update checkout_lifecycle_private.checkout_sessions
+  set stripe_event_id = event_id,
+      stripe_refund_id = refund_id,
+      refund_attempt_count = attempt,
+      refund_attempt_claimed = false,
+      refund_error_code = null,
+      refund_error_at = null,
+      updated_at = now()
+  where stripe_checkout_session_id = checkout_session_id
+    and state = 'refund_pending'
+    and refund_attempt_count = attempt;
+
+  if not found then
+    raise no_data_found using message = 'Checkout Session refund attempt is not pending';
+  end if;
+
+  insert into checkout_lifecycle_private.refund_attempts (
+    stripe_checkout_session_id,
+    attempt,
+    stripe_refund_id,
+    amount_cents,
+    stripe_event_id
+  )
+  values (
+    checkout_lifecycle_record_refund_attempt.checkout_session_id,
+    checkout_lifecycle_record_refund_attempt.attempt,
+    refund_id,
+    amount_cents,
+    event_id
+  )
+  on conflict on constraint refund_attempts_pkey do nothing;
+
+  select attempts.*
+  into existing_attempt
+  from checkout_lifecycle_private.refund_attempts as attempts
+  where attempts.stripe_checkout_session_id = checkout_lifecycle_record_refund_attempt.checkout_session_id
+    and attempts.attempt = checkout_lifecycle_record_refund_attempt.attempt;
+
+  if existing_attempt.stripe_refund_id <> refund_id
+    or existing_attempt.amount_cents <> amount_cents
+  then
+    raise integrity_constraint_violation using
+      message = 'Checkout Session refund attempt conflicts with its durable history';
+  end if;
+end;
+$$;
+
+create or replace function public.checkout_lifecycle_record_observed_refund(
+  checkout_session_id text,
+  event_id text,
+  refund_id text,
+  amount_cents integer,
+  payment_intent_id text
+)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  session_row checkout_lifecycle_private.checkout_sessions%rowtype;
+  existing_attempt checkout_lifecycle_private.refund_attempts%rowtype;
+  next_attempt integer;
+begin
+  select *
+  into session_row
+  from checkout_lifecycle_private.checkout_sessions
+  where stripe_checkout_session_id = checkout_session_id
+  for update;
+
+  if not found
+    or session_row.state not in ('refund_pending', 'refunded')
+    or session_row.stripe_payment_intent_id <> payment_intent_id
+    or amount_cents <= 0
+    or amount_cents > session_row.amount_total_cents
+  then
+    raise integrity_constraint_violation using
+      message = 'Observed Stripe Refund does not belong to the Checkout Session';
+  end if;
+
+  select attempts.*
+  into existing_attempt
+  from checkout_lifecycle_private.refund_attempts as attempts
+  where attempts.stripe_refund_id = refund_id
+  for update;
+
+  if found then
+    if existing_attempt.stripe_checkout_session_id <> checkout_session_id
+      or existing_attempt.amount_cents <> amount_cents
+      or existing_attempt.status in ('failed', 'canceled')
+    then
+      raise integrity_constraint_violation using
+        message = 'Observed Stripe Refund conflicts with its durable history';
+    end if;
+
+    update checkout_lifecycle_private.refund_attempts
+    set status = 'succeeded',
+        stripe_event_id = event_id,
+        updated_at = now()
+    where stripe_checkout_session_id = existing_attempt.stripe_checkout_session_id
+      and attempt = existing_attempt.attempt;
+    return;
+  end if;
+
+  select greatest(
+    coalesce(max(attempt), 0),
+    session_row.refund_attempt_count
+  ) + 1
+  into next_attempt
+  from checkout_lifecycle_private.refund_attempts
+  where stripe_checkout_session_id = checkout_lifecycle_record_observed_refund.checkout_session_id;
+
+  insert into checkout_lifecycle_private.refund_attempts (
+    stripe_checkout_session_id,
+    attempt,
+    stripe_refund_id,
+    amount_cents,
+    status,
+    stripe_event_id
+  )
+  values (
+    checkout_session_id,
+    next_attempt,
+    refund_id,
+    amount_cents,
+    'succeeded',
+    event_id
+  );
+end;
+$$;
+
+create or replace function public.checkout_lifecycle_reconcile_refund_event(
+  refund_id text,
+  event_id text,
+  refund_status text,
+  refund_amount integer,
+  payment_intent_id text
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  attempt_row checkout_lifecycle_private.refund_attempts%rowtype;
+  session_row checkout_lifecycle_private.checkout_sessions%rowtype;
+  result_status text;
+begin
+  select attempts.*
+  into attempt_row
+  from checkout_lifecycle_private.refund_attempts as attempts
+  where attempts.stripe_refund_id = refund_id;
+
+  if not found then
+    return pg_catalog.jsonb_build_object('status', 'ignored');
+  end if;
+
+  select *
+  into session_row
+  from checkout_lifecycle_private.checkout_sessions
+  where stripe_checkout_session_id = attempt_row.stripe_checkout_session_id
+  for update;
+
+  select attempts.*
+  into attempt_row
+  from checkout_lifecycle_private.refund_attempts as attempts
+  where attempts.stripe_refund_id = refund_id
+    and attempts.stripe_checkout_session_id = session_row.stripe_checkout_session_id
+  for update;
+
+  if not found
+    or session_row.state not in ('refund_pending', 'refunded')
+    or refund_status is null
+    or length(btrim(refund_status)) = 0
+    or refund_amount is null
+    or refund_amount <= 0
+    or refund_amount <> attempt_row.amount_cents
+    or payment_intent_id is null
+    or length(btrim(payment_intent_id)) = 0
+    or session_row.stripe_payment_intent_id <> payment_intent_id
+  then
+    return pg_catalog.jsonb_build_object('status', 'ignored');
+  end if;
+
+  if refund_status = 'succeeded' then
+    if attempt_row.status in ('failed', 'canceled') then
+      return pg_catalog.jsonb_build_object('status', 'ignored');
+    end if;
+
+    update checkout_lifecycle_private.refund_attempts
+    set status = 'succeeded',
+        stripe_event_id = event_id,
+        updated_at = now()
+    where stripe_checkout_session_id = attempt_row.stripe_checkout_session_id
+      and attempt = attempt_row.attempt;
+
+    update checkout_lifecycle_private.checkout_sessions
+    set stripe_event_id = event_id,
+        refund_attempt_claimed = false,
+        refund_error_code = null,
+        refund_error_at = null,
+        updated_at = now()
+    where stripe_checkout_session_id = session_row.stripe_checkout_session_id;
+    result_status := 'succeeded';
+  elsif refund_status in ('failed', 'canceled') then
+    if attempt_row.status in ('failed', 'canceled') then
+      if session_row.state = 'refund_pending' then
+        result_status := 'retry_required';
+      else
+        return pg_catalog.jsonb_build_object('status', 'ignored');
+      end if;
+    else
+      update checkout_lifecycle_private.refund_attempts
+      set status = refund_status,
+          stripe_event_id = event_id,
+          updated_at = now()
+      where stripe_checkout_session_id = attempt_row.stripe_checkout_session_id
+        and attempt = attempt_row.attempt;
+
+      update checkout_lifecycle_private.checkout_sessions
+      set stripe_event_id = event_id,
+          stripe_refund_id = refund_id,
+          state = 'refund_pending',
+          refund_attempt_claimed = false,
+          refund_error_code = refund_status,
+          refund_error_at = now(),
+          updated_at = now()
+      where stripe_checkout_session_id = session_row.stripe_checkout_session_id;
+      result_status := 'retry_required';
+    end if;
+  elsif attempt_row.status = 'succeeded' then
+    result_status := 'succeeded';
+  elsif attempt_row.status in ('failed', 'canceled') then
+    if session_row.state = 'refund_pending' then
+      result_status := 'retry_required';
+    else
+      return pg_catalog.jsonb_build_object('status', 'ignored');
+    end if;
+  else
+    update checkout_lifecycle_private.refund_attempts
+    set stripe_event_id = event_id,
+        updated_at = now()
+    where stripe_checkout_session_id = attempt_row.stripe_checkout_session_id
+      and attempt = attempt_row.attempt;
+    result_status := 'pending';
+  end if;
+
+  return pg_catalog.jsonb_build_object(
+    'status', result_status,
+    'checkout_session_id', session_row.stripe_checkout_session_id,
+    'payment_intent_id', session_row.stripe_payment_intent_id,
+    'amount_cents', session_row.amount_total_cents,
+    'customer_cleanup_pending', session_row.customer_cleanup_pending
+  );
+end;
+$$;
+
+
+create or replace function public.checkout_lifecycle_finalize_deletion(target_user uuid)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  customer_ids jsonb;
+begin
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext(target_user::text));
+
+  if not exists (
+    select 1
+    from checkout_lifecycle_private.deletion_fences
+    where user_id = target_user
+  ) or exists (
+    select 1
+    from checkout_lifecycle_private.checkout_sessions
+    where user_id = target_user
+      and (
+        state in ('open', 'refund_pending')
+        or customer_cleanup_pending
+      )
+  ) then
+    return pg_catalog.jsonb_build_object('status', 'unsafe');
+  end if;
+
+  select coalesce(
+    pg_catalog.jsonb_agg(distinct sessions.stripe_customer_id)
+      filter (where sessions.stripe_customer_id is not null),
+    '[]'::jsonb
+  )
+  into customer_ids
+  from checkout_lifecycle_private.checkout_sessions as sessions
+  where sessions.user_id = target_user;
+
+  update checkout_lifecycle_private.deletion_fences
+  set finalized_at = coalesce(finalized_at, now()),
+      updated_at = now()
+  where user_id = target_user;
+
+  return pg_catalog.jsonb_build_object(
+    'status', 'finalized',
+    'customer_ids', customer_ids
+  );
+end;
+$$;
+
+create or replace function public.checkout_lifecycle_delete_auth_user(target_user uuid)
+returns text
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext(target_user::text));
+
+  if not exists (
+    select 1
+    from checkout_lifecycle_private.deletion_fences
+    where user_id = target_user
+      and finalized_at is not null
+  ) or exists (
+    select 1
+    from checkout_lifecycle_private.checkout_sessions
+    where user_id = target_user
+      and (
+        state in ('open', 'refund_pending')
+        or customer_cleanup_pending
+      )
+  ) then
+    return 'unsafe';
+  end if;
+
+  delete from auth.users
+  where id = target_user;
+
+  return 'deleted';
+end;
+$$;
+
+create or replace function public.checkout_lifecycle_get_customer_cleanup(
+  checkout_session_id text
+)
+returns jsonb
+language sql
+security definer
+stable
+set search_path = ''
+as $$
+  select pg_catalog.jsonb_build_object(
+    'pending', customer_cleanup_pending,
+    'customer_id', stripe_customer_id
+  )
+  from checkout_lifecycle_private.checkout_sessions
+  where stripe_checkout_session_id = checkout_session_id
+    and state = 'refunded';
+$$;
+
+create or replace function public.checkout_lifecycle_complete_customer_cleanup(
+  checkout_session_id text
+)
+returns void
+language sql
+security definer
+set search_path = ''
+as $$
+  update checkout_lifecycle_private.checkout_sessions
+  set customer_cleanup_pending = false,
+      updated_at = now()
+  where stripe_checkout_session_id = checkout_session_id
+    and state = 'refunded';
+$$;
+
+revoke all on function public.checkout_lifecycle_is_deletion_fenced(uuid)
+  from public, anon, authenticated, service_role;
+revoke all on function public.checkout_lifecycle_register_session(uuid, text)
+  from public, anon, authenticated, service_role;
+revoke all on function public.checkout_lifecycle_fence_deletion(uuid)
+  from public, anon, authenticated, service_role;
+revoke all on function public.checkout_lifecycle_list_sessions(uuid, integer, integer)
+  from public, anon, authenticated, service_role;
+revoke all on function public.checkout_lifecycle_reconcile_completion(uuid, text, text, text, integer, text, text)
+  from public, anon, authenticated, service_role;
+revoke all on function public.checkout_lifecycle_mark_refunded(text, text)
+  from public, anon, authenticated, service_role;
+revoke all on function public.checkout_lifecycle_mark_expired(text)
+  from public, anon, authenticated, service_role;
+revoke all on function public.checkout_lifecycle_record_refund_failure(text, text, text, text)
+  from public, anon, authenticated, service_role;
+revoke all on function public.checkout_lifecycle_prepare_refund_attempt(text)
+  from public, anon, authenticated, service_role;
+revoke all on function public.checkout_lifecycle_record_refund_attempt(text, text, text, integer, integer)
+  from public, anon, authenticated, service_role;
+revoke all on function public.checkout_lifecycle_record_observed_refund(text, text, text, integer, text)
+  from public, anon, authenticated, service_role;
+revoke all on function public.checkout_lifecycle_reconcile_refund_event(text, text, text, integer, text)
+  from public, anon, authenticated, service_role;
+revoke all on function public.checkout_lifecycle_mark_async_payment_failed(uuid, text, text, text)
+  from public, anon, authenticated, service_role;
+revoke all on function public.checkout_lifecycle_finalize_deletion(uuid)
+  from public, anon, authenticated, service_role;
+revoke all on function public.checkout_lifecycle_delete_auth_user(uuid)
+  from public, anon, authenticated, service_role;
+revoke all on function public.checkout_lifecycle_complete_customer_cleanup(text)
+  from public, anon, authenticated, service_role;
+revoke all on function public.checkout_lifecycle_get_customer_cleanup(text)
+  from public, anon, authenticated, service_role;
+
+grant execute on function public.checkout_lifecycle_is_deletion_fenced(uuid) to service_role;
+grant execute on function public.checkout_lifecycle_register_session(uuid, text) to service_role;
+grant execute on function public.checkout_lifecycle_fence_deletion(uuid) to service_role;
+grant execute on function public.checkout_lifecycle_list_sessions(uuid, integer, integer) to service_role;
+grant execute on function public.checkout_lifecycle_reconcile_completion(uuid, text, text, text, integer, text, text) to service_role;
+grant execute on function public.checkout_lifecycle_mark_refunded(text, text) to service_role;
+grant execute on function public.checkout_lifecycle_mark_expired(text) to service_role;
+grant execute on function public.checkout_lifecycle_record_refund_failure(text, text, text, text) to service_role;
+grant execute on function public.checkout_lifecycle_prepare_refund_attempt(text) to service_role;
+grant execute on function public.checkout_lifecycle_record_refund_attempt(text, text, text, integer, integer) to service_role;
+grant execute on function public.checkout_lifecycle_record_observed_refund(text, text, text, integer, text) to service_role;
+grant execute on function public.checkout_lifecycle_reconcile_refund_event(text, text, text, integer, text) to service_role;
+grant execute on function public.checkout_lifecycle_mark_async_payment_failed(uuid, text, text, text) to service_role;
+grant execute on function public.checkout_lifecycle_finalize_deletion(uuid) to service_role;
+grant execute on function public.checkout_lifecycle_delete_auth_user(uuid) to service_role;
+grant execute on function public.checkout_lifecycle_complete_customer_cleanup(text) to service_role;
+grant execute on function public.checkout_lifecycle_get_customer_cleanup(text) to service_role;

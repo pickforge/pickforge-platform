@@ -26,7 +26,7 @@ Deno.serve(async (req) => {
   const handler = createDeleteAccountHandler({
     admin: serviceSupabase,
     stripe,
-    resolveUserId: async (request) => {
+    resolveUserId: async (request: Request) => {
       const { userId } = await getUserFromRequest({ supabase: createCallerSupabase(request), req: request });
       return userId;
     },

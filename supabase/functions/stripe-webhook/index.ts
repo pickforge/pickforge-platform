@@ -1,7 +1,7 @@
 import Stripe from "npm:stripe@19.1.0";
 import { createClient } from "npm:@supabase/supabase-js@2.110.0";
-import { processStripeEvent, verifyStripeEvent } from "npm:@pickforge/billing@0.7.0";
-import { createStripeWebhookHandler } from "npm:@pickforge/edge-shared@0.7.0";
+import { processStripeEvent, verifyStripeEvent } from "npm:@pickforge/billing@0.9.0";
+import { createStripeWebhookHandler } from "npm:@pickforge/edge-shared@0.9.0";
 
 const stripe = new Stripe(requiredEnv("STRIPE_SECRET_KEY"));
 const supabase = createClient(requiredEnv("SUPABASE_URL"), requiredEnv("SUPABASE_SERVICE_ROLE_KEY"), {

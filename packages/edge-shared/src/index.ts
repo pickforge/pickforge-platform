@@ -1,5 +1,6 @@
 export type EdgeSharedErrorCode =
   | "database_error"
+  | "deletion_in_progress"
   | "deletion_incomplete"
   | "entitlement_required"
   | "insufficient_credits"
@@ -121,7 +122,8 @@ export interface VerifyStripeEventOptions<TStripe = unknown> {
   stripe: TStripe;
 }
 
-export interface ProcessStripeEventOptions<TSupabase = unknown> {
+export interface ProcessStripeEventOptions<TStripe = unknown, TSupabase = unknown> {
+  stripe: TStripe;
   supabase: TSupabase;
   event: StripeEventLike;
 }
@@ -136,7 +138,7 @@ export interface CreateStripeWebhookHandlerOptions<TStripe = unknown, TSupabase 
   supabase: TSupabase;
   webhookSecret: string;
   verifyStripeEvent(options: VerifyStripeEventOptions<TStripe>): Promise<StripeEventLike>;
-  processStripeEvent(options: ProcessStripeEventOptions<TSupabase>): Promise<StripeWebhookProcessResult>;
+  processStripeEvent(options: ProcessStripeEventOptions<TStripe, TSupabase>): Promise<StripeWebhookProcessResult>;
 }
 
 export interface RouteRequestContext {
@@ -186,13 +188,57 @@ export interface AccountAdminClientLike {
       deleteUser(userId: string): PromiseLike<{ error: SupabaseErrorLike | null }>;
     };
   };
-  from<T = unknown>(table: string): SupabaseQueryBuilderLike<T>;
+  from(table: string): unknown;
+  rpc(fn: string, args?: Record<string, unknown>): unknown;
 }
 
-export interface StripeCustomerClientLike {
+export type StripeCheckoutSessionStatus = "open" | "complete" | "expired";
+
+export interface StripeCheckoutSessionLike {
+  id: string;
+  status: StripeCheckoutSessionStatus | null;
+}
+
+export interface StripeCheckoutSessionListParams {
+  customer: string;
+  status: "open";
+  limit: number;
+  starting_after?: string;
+}
+
+export interface StripeCheckoutSessionListResult {
+  data: StripeCheckoutSessionLike[];
+  has_more: boolean;
+}
+
+export interface StripeCheckoutClientLike {
+  checkout: {
+    sessions: {
+      expire(sessionId: string): PromiseLike<StripeCheckoutSessionLike>;
+      retrieve(sessionId: string): PromiseLike<StripeCheckoutSessionLike>;
+      list(params: StripeCheckoutSessionListParams): PromiseLike<StripeCheckoutSessionListResult>;
+    };
+  };
+}
+
+export interface StripeCustomerClientLike extends StripeCheckoutClientLike {
   customers: {
     del(customerId: string): PromiseLike<unknown>;
   };
+}
+
+export interface RegisteredCheckoutSession {
+  id: string;
+  url: string;
+}
+
+export interface CreateRegisteredCheckoutSessionOptions {
+  stripe: StripeCheckoutClientLike;
+  userId: string;
+  isDeletionFenced(userId: string): Promise<boolean>;
+  createSession(): Promise<{ id: unknown; url: unknown }>;
+  registerSession(userId: string, sessionId: string): Promise<boolean>;
+  markSessionExpired(sessionId: string): Promise<void>;
 }
 
 export interface CreateDeleteAccountHandlerOptions {
@@ -242,6 +288,12 @@ interface AccountCreditLedgerRow {
 
 interface StripeCustomerMetadataRow {
   metadata: EdgeSharedJson;
+}
+
+interface CheckoutLifecycleSessionRow {
+  stripe_checkout_session_id: string;
+  state: "open" | "expired" | "payment_failed" | "completed" | "refund_pending" | "refunded";
+  stripe_customer_id: string | null;
 }
 
 interface AccountSyncedSettingRow {
@@ -515,6 +567,84 @@ export function createOperatorRouterHandler({
   };
 }
 
+export async function createRegisteredCheckoutSession({
+  stripe,
+  userId,
+  isDeletionFenced,
+  createSession,
+  registerSession,
+  markSessionExpired,
+}: CreateRegisteredCheckoutSessionOptions): Promise<RegisteredCheckoutSession> {
+  if (await isDeletionFenced(userId)) {
+    throw new EdgeSharedError("deletion_in_progress", "Account deletion is in progress");
+  }
+
+  const session = await createSession();
+  const sessionId = validateNonEmptyString(session.id, "checkout session id", "invalid_string");
+  let sessionUrl: string;
+  let deletionFenced: boolean;
+  try {
+    sessionUrl = validateNonEmptyString(session.url, "checkout session url", "invalid_string");
+    deletionFenced = await registerSession(userId, sessionId);
+  } catch (error) {
+    try {
+      const disposition = await expireCheckoutSession(stripe, sessionId);
+      if (disposition === "expired" || disposition === "missing") {
+        await markSessionExpired(sessionId);
+      }
+    } catch {
+      // The original registration error remains the actionable failure; the Checkout URL is never returned.
+    }
+    throw error;
+  }
+
+  if (deletionFenced) {
+    const disposition = await expireCheckoutSession(stripe, sessionId);
+    if (disposition === "expired" || disposition === "missing") {
+      await markSessionExpired(sessionId);
+    }
+    throw new EdgeSharedError("deletion_in_progress", "Account deletion started during checkout");
+  }
+
+  return { id: sessionId, url: sessionUrl };
+}
+
+export async function expireCheckoutSession(
+  stripe: StripeCheckoutClientLike,
+  sessionId: string,
+): Promise<Exclude<StripeCheckoutSessionStatus, "open"> | "missing"> {
+  let session: StripeCheckoutSessionLike;
+  try {
+    session = await stripe.checkout.sessions.retrieve(sessionId);
+  } catch (retrieveError) {
+    if (isStripeResourceMissingError(retrieveError)) {
+      return "missing";
+    }
+    throw retrieveError;
+  }
+  if (session.status === "expired" || session.status === "complete") {
+    return session.status;
+  }
+
+  try {
+    await stripe.checkout.sessions.expire(sessionId);
+    return "expired";
+  } catch (expireError) {
+    try {
+      session = await stripe.checkout.sessions.retrieve(sessionId);
+      if (session.status === "expired" || session.status === "complete") {
+        return session.status;
+      }
+    } catch (retrieveError) {
+      if (isStripeResourceMissingError(retrieveError)) {
+        return "missing";
+      }
+      throw retrieveError;
+    }
+    throw expireError;
+  }
+}
+
 export function createDeleteAccountHandler({
   admin,
   stripe,
@@ -523,39 +653,86 @@ export function createDeleteAccountHandler({
   return async (req: Request): Promise<Response> => {
     try {
       const userId = await resolveUserId(req);
-      const [{ data: billingCustomer, error: billingCustomerError }, ledgerRows] = await Promise.all([
-        admin
-          .from<BillingCustomerRow>("billing_customers")
+      await fenceAccountDeletion(admin, userId);
+
+      const [
+        { data: billingCustomer, error: billingCustomerError },
+        ledgerRows,
+        registeredSessions,
+      ] = await Promise.all([
+        accountTable<BillingCustomerRow>(admin, "billing_customers")
           .select("stripe_customer_id")
           .eq("user_id", userId)
           .maybeSingle(),
         readCreditLedgerPages<StripeCustomerMetadataRow>(admin, userId, "metadata"),
+        readCheckoutLifecycleSessions(admin, userId),
       ]);
       if (billingCustomerError !== null) {
         throw databaseError("Failed to read billing customer", billingCustomerError);
       }
 
       const customerIds = new Set<string>();
+      const deletedCustomerIds = new Set<string>();
       addStripeCustomerId(customerIds, billingCustomer?.stripe_customer_id);
       for (const row of ledgerRows) {
         addStripeCustomerId(customerIds, isRecord(row.metadata) ? row.metadata.stripe_customer_id : undefined);
       }
 
+      const sessionStates = new Map<string, CheckoutLifecycleSessionRow["state"]>();
+      const sessionIds = new Set<string>();
+      for (const session of registeredSessions) {
+        sessionStates.set(session.stripe_checkout_session_id, session.state);
+        addStripeCustomerId(customerIds, session.stripe_customer_id);
+        sessionIds.add(session.stripe_checkout_session_id);
+      }
+
+      // Stripe list pagination is mutable: collect every page before expiring any Session.
       for (const customerId of customerIds) {
-        try {
-          // One-time credit packs have no recurring charges; delete Stripe first to avoid orphaning customer PII.
-          await stripe.customers.del(customerId);
-        } catch (error) {
-          if (!isStripeCustomerMissingError(error)) {
-            throw new EdgeSharedError("deletion_incomplete", "Failed to delete Stripe customer", { cause: error });
-          }
+        for (const sessionId of await collectOpenCheckoutSessionIds(stripe, customerId)) {
+          sessionIds.add(sessionId);
         }
       }
 
-      const { error } = await admin.auth.admin.deleteUser(userId);
-      if (error !== null && !isUserNotFoundError(error)) {
-        throw new Error("Failed to delete user", { cause: error });
+      for (const sessionId of sessionIds) {
+        let disposition: Exclude<StripeCheckoutSessionStatus, "open"> | "missing";
+        try {
+          disposition = await expireCheckoutSession(stripe, sessionId);
+        } catch (error) {
+          throw new EdgeSharedError("deletion_incomplete", "Failed to expire Checkout Session", {
+            cause: error,
+          });
+        }
+
+        const registeredState = sessionStates.get(sessionId);
+        if (
+          disposition === "complete" &&
+          registeredState !== "completed" &&
+          registeredState !== "refunded" &&
+          registeredState !== "payment_failed"
+        ) {
+          throw new EdgeSharedError(
+            "deletion_incomplete",
+            "Completed Checkout Session is awaiting credit or refund reconciliation",
+          );
+        }
+
+        if (
+          registeredState === "open" &&
+          (disposition === "expired" || disposition === "missing")
+        ) {
+          await markCheckoutSessionExpired(admin, sessionId);
+          sessionStates.set(sessionId, "expired");
+        }
       }
+
+      await settleDeletionFixpoint(admin, userId, sessionIds, customerIds);
+      await finalizeAccountDeletion(admin, userId, customerIds);
+      await deleteStripeCustomers(stripe, customerIds, deletedCustomerIds);
+      await settleDeletionFixpoint(admin, userId, sessionIds, customerIds);
+      await finalizeAccountDeletion(admin, userId, customerIds);
+      await deleteStripeCustomers(stripe, customerIds, deletedCustomerIds);
+
+      await deleteAuthUserAtomically(admin, userId);
 
       return jsonResponse(200, { deleted: true });
     } catch (error) {
@@ -572,23 +749,19 @@ export function createExportAccountHandler({
     try {
       const userId = await resolveUserId(req);
       const [profileResult, entitlementsResult, creditLedger, syncedSettingsResult, billingResult] = await Promise.all([
-        admin
-          .from<AccountProfileRow>("profiles")
+        accountTable<AccountProfileRow>(admin, "profiles")
           .select("id,email,display_name,avatar_url,created_at,updated_at")
           .eq("id", userId)
           .maybeSingle(),
-        admin
-          .from<AccountEntitlementRow>("entitlements")
+        accountTable<AccountEntitlementRow>(admin, "entitlements")
           .select("id,key,value,granted_at,expires_at,source")
           .eq("user_id", userId),
         readCreditLedgerExport(admin, userId),
-        admin
-          .from<AccountSyncedSettingRow>("settings_sync")
+        accountTable<AccountSyncedSettingRow>(admin, "settings_sync")
           .select("field_group,payload,updated_at")
           .eq("user_id", userId)
           .is("deleted_at", null),
-        admin
-          .from<BillingCustomerRow>("billing_customers")
+        accountTable<BillingCustomerRow>(admin, "billing_customers")
           .select("stripe_customer_id")
           .eq("user_id", userId)
           .maybeSingle(),
@@ -673,7 +846,7 @@ export function createStripeWebhookHandler<TStripe = unknown, TSupabase = unknow
     }
 
     try {
-      return jsonResponse(200, await processStripeEvent({ supabase, event }));
+      return jsonResponse(200, await processStripeEvent({ stripe, supabase, event }));
     } catch (error) {
       return jsonResponse(500, { error: "webhook_processing_failed" });
     }
@@ -857,12 +1030,236 @@ function accountErrorResponse(error: unknown): Response {
   return jsonResponse(500, { error: "internal_error" });
 }
 
-function isUserNotFoundError(error: SupabaseErrorLike): boolean {
-  return error.code === "user_not_found" || /user not found/i.test(error.message);
+
+function isStripeResourceMissingError(error: unknown): boolean {
+  return isRecord(error) && error.code === "resource_missing";
 }
 
-function isStripeCustomerMissingError(error: unknown): boolean {
-  return typeof error === "object" && error !== null && (error as { code?: unknown }).code === "resource_missing";
+function accountTable<T>(
+  admin: Pick<AccountAdminClientLike, "from">,
+  table: string,
+): SupabaseQueryBuilderLike<T> {
+  return admin.from(table) as SupabaseQueryBuilderLike<T>;
+}
+
+function accountRpc<T = unknown>(
+  admin: Pick<AccountAdminClientLike, "rpc">,
+  fn: string,
+  args?: Record<string, unknown>,
+): PromiseLike<SupabaseQueryResult<T>> {
+  return admin.rpc(fn, args) as PromiseLike<SupabaseQueryResult<T>>;
+}
+
+async function fenceAccountDeletion(admin: AccountAdminClientLike, userId: string): Promise<void> {
+  const { error } = await accountRpc(admin, "checkout_lifecycle_fence_deletion", {
+    target_user: userId,
+  });
+  if (error !== null) {
+    throw databaseError("Failed to fence account deletion", error);
+  }
+}
+
+async function markCheckoutSessionExpired(
+  admin: Pick<AccountAdminClientLike, "rpc">,
+  sessionId: string,
+): Promise<void> {
+  const { error } = await accountRpc(admin, "checkout_lifecycle_mark_expired", {
+    checkout_session_id: sessionId,
+  });
+  if (error !== null) {
+    throw databaseError("Failed to mark Checkout Session expired", error);
+  }
+}
+
+async function settleDeletionFixpoint(
+  admin: AccountAdminClientLike,
+  userId: string,
+  sessionIds: Set<string>,
+  customerIds: Set<string>,
+): Promise<void> {
+  const maxRefreshes = 8;
+
+  for (let refresh = 0; refresh < maxRefreshes; refresh += 1) {
+    const previousSessionCount = sessionIds.size;
+    const previousCustomerCount = customerIds.size;
+    await refreshSettledLifecycle(admin, userId, sessionIds, customerIds);
+
+    if (
+      sessionIds.size === previousSessionCount &&
+      customerIds.size === previousCustomerCount
+    ) {
+      return;
+    }
+  }
+
+  throw new EdgeSharedError(
+    "deletion_incomplete",
+    "Checkout Session cleanup did not reach a stable lifecycle snapshot",
+  );
+}
+
+async function refreshSettledLifecycle(
+  admin: AccountAdminClientLike,
+  userId: string,
+  sessionIds: Set<string>,
+  customerIds: Set<string>,
+): Promise<void> {
+  const sessions = await readCheckoutLifecycleSessions(admin, userId);
+  for (const session of sessions) {
+    sessionIds.add(session.stripe_checkout_session_id);
+    addStripeCustomerId(customerIds, session.stripe_customer_id);
+    if (session.state === "open" || session.state === "refund_pending") {
+      throw new EdgeSharedError(
+        "deletion_incomplete",
+        "Checkout Session cleanup or refund reconciliation is still pending",
+      );
+    }
+  }
+}
+
+async function finalizeAccountDeletion(
+  admin: Pick<AccountAdminClientLike, "rpc">,
+  userId: string,
+  customerIds: Set<string>,
+): Promise<void> {
+  const { data, error } = await accountRpc<unknown>(
+    admin,
+    "checkout_lifecycle_finalize_deletion",
+    { target_user: userId },
+  );
+  if (error !== null) {
+    throw databaseError("Failed to finalize account deletion", error);
+  }
+  if (
+    !isRecord(data) ||
+    data.status !== "finalized" ||
+    !Array.isArray(data.customer_ids)
+  ) {
+    throw new EdgeSharedError(
+      "deletion_incomplete",
+      "Checkout Session lifecycle changed before deletion finalization",
+    );
+  }
+  for (const customerId of data.customer_ids) {
+    addStripeCustomerId(customerIds, customerId);
+  }
+}
+
+async function deleteAuthUserAtomically(
+  admin: Pick<AccountAdminClientLike, "rpc">,
+  userId: string,
+): Promise<void> {
+  const { data, error } = await accountRpc<string>(
+    admin,
+    "checkout_lifecycle_delete_auth_user",
+    { target_user: userId },
+  );
+  if (error !== null) {
+    throw databaseError("Failed to atomically delete auth user", error);
+  }
+  if (data !== "deleted") {
+    throw new EdgeSharedError(
+      "deletion_incomplete",
+      "Checkout Session lifecycle changed before atomic auth deletion",
+    );
+  }
+}
+
+async function deleteStripeCustomers(
+  stripe: StripeCustomerClientLike,
+  customerIds: Set<string>,
+  deletedCustomerIds: Set<string>,
+): Promise<void> {
+  for (const customerId of customerIds) {
+    if (deletedCustomerIds.has(customerId)) {
+      continue;
+    }
+    try {
+      await stripe.customers.del(customerId);
+      deletedCustomerIds.add(customerId);
+    } catch (error) {
+      if (isStripeResourceMissingError(error)) {
+        deletedCustomerIds.add(customerId);
+        continue;
+      }
+      throw new EdgeSharedError("deletion_incomplete", "Failed to delete Stripe customer", {
+        cause: error,
+      });
+    }
+  }
+}
+
+async function readCheckoutLifecycleSessions(
+  admin: AccountAdminClientLike,
+  userId: string,
+): Promise<CheckoutLifecycleSessionRow[]> {
+  const sessions: CheckoutLifecycleSessionRow[] = [];
+  const pageSize = 1000;
+
+  for (let pageStart = 0; ; pageStart += pageSize) {
+    const { data, error } = await accountRpc<CheckoutLifecycleSessionRow[]>(
+      admin,
+      "checkout_lifecycle_list_sessions",
+      {
+        target_user: userId,
+        page_start: pageStart,
+        page_size: pageSize,
+      },
+    );
+    if (error !== null) {
+      throw databaseError("Failed to read registered Checkout Sessions", error);
+    }
+
+    const page = data ?? [];
+    sessions.push(...page);
+    if (page.length < pageSize) {
+      return sessions;
+    }
+  }
+}
+
+async function collectOpenCheckoutSessionIds(
+  stripe: StripeCheckoutClientLike,
+  customerId: string,
+): Promise<string[]> {
+  const sessionIds: string[] = [];
+  const pageSize = 100;
+  let startingAfter: string | undefined;
+
+  for (;;) {
+    let page: StripeCheckoutSessionListResult;
+    try {
+      page = await stripe.checkout.sessions.list({
+        customer: customerId,
+        status: "open",
+        limit: pageSize,
+        ...(startingAfter === undefined ? {} : { starting_after: startingAfter }),
+      });
+    } catch (error) {
+      if (isStripeResourceMissingError(error)) {
+        return sessionIds;
+      }
+      throw new EdgeSharedError("deletion_incomplete", "Failed to list open Checkout Sessions", {
+        cause: error,
+      });
+    }
+
+    for (const session of page.data) {
+      sessionIds.push(session.id);
+    }
+    if (!page.has_more) {
+      return sessionIds;
+    }
+
+    const lastSession = page.data.at(-1);
+    if (lastSession === undefined) {
+      throw new EdgeSharedError(
+        "deletion_incomplete",
+        "Stripe Checkout Session pagination did not advance",
+      );
+    }
+    startingAfter = lastSession.id;
+  }
 }
 
 async function readCreditLedgerExport(
@@ -885,8 +1282,7 @@ async function readCreditLedgerPages<T>(
   const pageSize = 1000;
 
   for (let from = 0; ; from += pageSize) {
-    const { data, error } = await admin
-      .from<T[]>("credit_ledger")
+    const { data, error } = await accountTable<T[]>(admin, "credit_ledger")
       .select(columns)
       .eq("user_id", userId)
       .order("id")

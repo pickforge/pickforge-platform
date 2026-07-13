@@ -547,6 +547,19 @@ begin
     return null;
   end if;
 
+  if session_row.stripe_refund_id is not null
+    and session_row.refund_error_code is null
+  then
+    return pg_catalog.jsonb_build_object(
+      'action', 'attached',
+      'attempt', session_row.refund_attempt_count,
+      'refund_id', session_row.stripe_refund_id,
+      'payment_intent_id', session_row.stripe_payment_intent_id,
+      'amount_cents', session_row.amount_total_cents,
+      'customer_cleanup_pending', session_row.customer_cleanup_pending
+    );
+  end if;
+
   if session_row.stripe_refund_id is null and session_row.refund_error_code is null then
     next_attempt := greatest(session_row.refund_attempt_count, 1);
   elsif session_row.refund_error_code in ('failed', 'canceled') then
@@ -564,6 +577,7 @@ begin
       updated_at = now()
   where stripe_checkout_session_id = checkout_session_id;
   return pg_catalog.jsonb_build_object(
+    'action', 'create',
     'attempt', next_attempt,
     'payment_intent_id', session_row.stripe_payment_intent_id,
     'amount_cents', session_row.amount_total_cents,
@@ -626,7 +640,8 @@ begin
 
   if not found
     or session_row.state not in ('refund_pending', 'refunded')
-    or session_row.amount_total_cents <> refund_amount
+    or refund_amount <= 0
+    or refund_amount > session_row.amount_total_cents
     or session_row.stripe_payment_intent_id <> payment_intent_id
   then
     return pg_catalog.jsonb_build_object('status', 'ignored');
@@ -634,17 +649,13 @@ begin
 
   if refund_status = 'succeeded' then
     update checkout_lifecycle_private.checkout_sessions
-    set state = 'refunded',
-        stripe_event_id = event_id,
+    set stripe_event_id = event_id,
         refund_attempt_claimed = false,
         refund_error_code = null,
         refund_error_at = null,
         updated_at = now()
     where stripe_checkout_session_id = session_row.stripe_checkout_session_id;
-    result_status := case
-      when session_row.customer_cleanup_pending then 'refunded_cleanup_pending'
-      else 'refunded'
-    end;
+    result_status := 'succeeded';
   elsif refund_status in ('failed', 'canceled') then
     update checkout_lifecycle_private.checkout_sessions
     set stripe_event_id = event_id,

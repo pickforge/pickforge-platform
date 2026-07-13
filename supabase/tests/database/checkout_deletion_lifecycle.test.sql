@@ -1,6 +1,6 @@
 begin;
 
-select plan(82);
+select plan(85);
 
 select ok(
   not has_schema_privilege('anon', 'checkout_lifecycle_private', 'usage'),
@@ -412,15 +412,33 @@ select lives_ok(
   'the retry persists a distinct Stripe Refund id'
 );
 select is(
+  public.checkout_lifecycle_prepare_refund_attempt('cs_raced') ->> 'refund_id',
+  're_retry',
+  'an attached Refund remains recoverable after a crash before retrieval'
+);
+select is(
   public.checkout_lifecycle_reconcile_refund_event(
     're_retry',
     'evt_refund_succeeded',
     'succeeded',
-    2500,
+    1000,
     'pi_raced'
   ) ->> 'status',
-  'refunded',
-  'a signed full succeeded Refund terminalizes compensation'
+  'succeeded',
+  'a signed partial succeeded Refund remains attached for aggregate verification'
+);
+select is(
+  (
+    select state
+    from checkout_lifecycle_private.checkout_sessions
+    where stripe_checkout_session_id = 'cs_raced'
+  ),
+  'refund_pending',
+  'an individual partial Refund cannot terminalize compensation'
+);
+select lives_ok(
+  $$select public.checkout_lifecycle_mark_refunded('cs_raced', 'evt_aggregate_full')$$,
+  'aggregate full-refund verification can terminalize compensation'
 );
 select is(
   (

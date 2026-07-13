@@ -301,6 +301,7 @@ describe("@pickforge/billing", () => {
   });
 
   it("retries a signed terminal Refund with a new durable attempt key", async () => {
+
     const supabase = new MemorySupabase();
     supabase.fencedUsers.add(USER_ID);
     const stripe = fakeStripe();
@@ -333,6 +334,41 @@ describe("@pickforge/billing", () => {
       { idempotencyKey: "checkout-deletion:cs_signed_retry:attempt:2" },
     );
     expect(supabase.lifecycleSessions.get("cs_signed_retry")).toBe("refunded");
+  });
+
+  it("reopens a formerly succeeded Refund that later fails and compensates again", async () => {
+    const supabase = new MemorySupabase();
+    supabase.deletedUsers.add(USER_ID);
+    supabase.lifecycleSessions.set("cs_late_failure", "refunded");
+    supabase.refundAttempts.set("cs_late_failure", 1);
+    supabase.refundIds.set("cs_late_failure", "re_late_failure");
+    const stripe = fakeStripe();
+    stripe.refunds.create.mockResolvedValue({
+      id: "re_late_recovery",
+      amount: 1000,
+      status: "succeeded",
+    });
+    stripe.refunds.retrieve.mockResolvedValue({
+      id: "re_late_recovery",
+      amount: 1000,
+      status: "succeeded",
+    });
+
+    await expect(processStripeEvent({
+      supabase,
+      stripe,
+      event: refundEvent({
+        refundId: "re_late_failure",
+        status: "failed",
+        type: "refund.failed",
+      }),
+    })).resolves.toMatchObject({ reconciliation: "deletion_race_refunded" });
+
+    expect(stripe.refunds.create).toHaveBeenCalledWith(
+      { payment_intent: "pi_123", amount: 1000 },
+      { idempotencyKey: "checkout-deletion:cs_late_failure:attempt:2" },
+    );
+    expect(supabase.lifecycleSessions.get("cs_late_failure")).toBe("refunded");
   });
 
   it("ignores an unknown signed Refund without mutating lifecycle", async () => {
@@ -538,6 +574,15 @@ describe("@pickforge/billing", () => {
       handled: false,
       duplicate: true,
     });
+    await expect(processStripeEvent({
+      supabase,
+      stripe: fakeStripe(),
+      event: checkoutSessionEvent({
+        id: "evt_paid_after_async_failure",
+        sessionId: "cs_async_failed",
+        type: "checkout.session.completed",
+      }),
+    })).resolves.toEqual({ handled: false, duplicate: true });
 
     expect(supabase.lifecycleSessions.get("cs_async_failed")).toBe("payment_failed");
     expect(supabase.lifecycleCustomerIds.get("cs_async_failed")).toBe("cus_123");
@@ -803,13 +848,15 @@ class MemorySupabase implements SupabaseClientLike {
   readonly deletedUsers = new Set<string>();
   readonly lifecycleSessions = new Map<
     string,
-    "open" | "payment_failed" | "completed" | "refund_pending" | "refunded"
+    "open" | "expired" | "payment_failed" | "completed" | "refund_pending" | "refunded"
   >();
   readonly lifecycleCustomerIds = new Map<string, string>();
   readonly customerCleanupPending = new Set<string>();
   readonly cleanupCustomerIds = new Map<string, string | null>();
   readonly refundFailures = new Map<string, { refundId: string; status: string }>();
   readonly refundAttempts = new Map<string, number>();
+  readonly lifecycleAmounts = new Map<string, number>();
+  readonly lifecyclePaymentIntents = new Map<string, string>();
   readonly refundIds = new Map<string, string>();
 
   private readonly insertFailures: Record<keyof Tables, SupabaseErrorLike[]> = {
@@ -832,6 +879,8 @@ class MemorySupabase implements SupabaseClientLike {
     if (fn === "checkout_lifecycle_reconcile_completion") {
       const sessionId = String(args?.checkout_session_id);
       const userId = String(args?.target_user);
+      this.lifecycleAmounts.set(sessionId, Number(args?.amount_total_cents));
+      this.lifecyclePaymentIntents.set(sessionId, String(args?.stripe_payment_intent_id));
       const existing = this.lifecycleSessions.get(sessionId);
       if (existing === "completed") {
         return { data: "duplicate" as T, error: null };
@@ -843,6 +892,9 @@ class MemorySupabase implements SupabaseClientLike {
             : "refunded") as T,
           error: null,
         };
+      }
+      if (existing === "payment_failed" || existing === "expired") {
+        return { data: "duplicate" as T, error: null };
       }
       const creditedPurchase = this.tables.credit_ledger.find(
         (row) =>
@@ -957,20 +1009,21 @@ class MemorySupabase implements SupabaseClientLike {
             status: "succeeded",
             checkout_session_id: sessionId,
             payment_intent_id: String(args?.payment_intent_id),
-            amount_cents: 1000,
+            amount_cents: this.lifecycleAmounts.get(sessionId) ?? 1000,
             customer_cleanup_pending: cleanupPending,
           } as T,
           error: null,
         };
       }
       if (status === "failed" || status === "canceled") {
+        this.lifecycleSessions.set(sessionId, "refund_pending");
         this.refundFailures.set(sessionId, { refundId, status });
         return {
           data: {
             status: "retry_required",
             checkout_session_id: sessionId,
             payment_intent_id: String(args?.payment_intent_id),
-            amount_cents: 1000,
+            amount_cents: this.lifecycleAmounts.get(sessionId) ?? 1000,
             customer_cleanup_pending: cleanupPending,
           } as T,
           error: null,
@@ -981,7 +1034,7 @@ class MemorySupabase implements SupabaseClientLike {
           status: "pending",
           checkout_session_id: sessionId,
           payment_intent_id: String(args?.payment_intent_id),
-          amount_cents: 1000,
+          amount_cents: this.lifecycleAmounts.get(sessionId) ?? 1000,
           customer_cleanup_pending: cleanupPending,
         } as T,
         error: null,
@@ -999,8 +1052,8 @@ class MemorySupabase implements SupabaseClientLike {
             action: "attached",
             attempt: this.refundAttempts.get(sessionId) ?? 1,
             refund_id: this.refundIds.get(sessionId),
-            payment_intent_id: "pi_123",
-            amount_cents: 1000,
+            payment_intent_id: this.lifecyclePaymentIntents.get(sessionId) ?? "pi_123",
+            amount_cents: this.lifecycleAmounts.get(sessionId) ?? 1000,
             customer_cleanup_pending: this.customerCleanupPending.has(sessionId),
           } as T,
           error: null,
@@ -1015,8 +1068,8 @@ class MemorySupabase implements SupabaseClientLike {
         data: {
           action: "create",
           attempt,
-          payment_intent_id: "pi_123",
-          amount_cents: 1000,
+          payment_intent_id: this.lifecyclePaymentIntents.get(sessionId) ?? "pi_123",
+          amount_cents: this.lifecycleAmounts.get(sessionId) ?? 1000,
           customer_cleanup_pending: this.customerCleanupPending.has(sessionId),
         } as T,
         error: null,

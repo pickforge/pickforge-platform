@@ -512,6 +512,7 @@ async function processRefundLifecycleEvent({
       paymentIntentId,
       amountCents: Number(data.amount_cents),
       cleanupLateCustomer,
+      knownSucceededCents: summary.succeededCents + amountCents,
     });
     return { handled: true, duplicate: false, reconciliation: "deletion_race_refunded" };
   }
@@ -555,6 +556,7 @@ async function performDeletionRefund({
   paymentIntentId,
   amountCents,
   cleanupLateCustomer,
+  knownSucceededCents = 0,
 }: {
   supabase: SupabaseClientLike;
   stripe: Pick<StripeClientLike, "customers" | "refunds">;
@@ -563,6 +565,7 @@ async function performDeletionRefund({
   paymentIntentId: string;
   amountCents: number;
   cleanupLateCustomer: boolean;
+  knownSucceededCents?: number;
 }): Promise<void> {
   const prepared = await (supabase.rpc("checkout_lifecycle_prepare_refund_attempt", {
     checkout_session_id: sessionId,
@@ -591,7 +594,8 @@ async function performDeletionRefund({
         "The PaymentIntent still has a nonterminal Refund and is not safe to retry",
       );
     }
-    const remainingCents = amountCents - summary.succeededCents;
+    const succeededCents = Math.max(summary.succeededCents, knownSucceededCents);
+    const remainingCents = amountCents - succeededCents;
     if (remainingCents <= 0) {
       await markCheckoutRefunded(supabase, sessionId, eventId);
       if (mustCleanupCustomer) {
@@ -646,8 +650,22 @@ async function performDeletionRefund({
     throw new BillingError("refund_incomplete", "The deletion-race refund has not succeeded");
   }
   const otherRefunds = await inspectPaymentIntentRefunds(stripe, paymentIntentId, refundId);
-  if (otherRefunds.succeededCents + refund.amount < amountCents) {
-    throw new BillingError("refund_incomplete", "The PaymentIntent is not yet fully refunded");
+  const cumulativeSucceededCents = Math.max(
+    otherRefunds.succeededCents + refund.amount,
+    knownSucceededCents + refund.amount,
+  );
+  if (cumulativeSucceededCents < amountCents) {
+    await recordCheckoutRefundFailure(supabase, sessionId, eventId, refundId, "partial");
+    return performDeletionRefund({
+      supabase,
+      stripe,
+      sessionId,
+      eventId,
+      paymentIntentId,
+      amountCents,
+      cleanupLateCustomer: mustCleanupCustomer,
+      knownSucceededCents: cumulativeSucceededCents,
+    });
   }
   await markCheckoutRefunded(supabase, sessionId, eventId);
   if (mustCleanupCustomer) {

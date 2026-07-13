@@ -1,6 +1,6 @@
 begin;
 
-select plan(86);
+select plan(99);
 
 select ok(
   not has_schema_privilege('anon', 'checkout_lifecycle_private', 'usage'),
@@ -437,8 +437,91 @@ select is(
   'an individual partial Refund cannot terminalize compensation'
 );
 select lives_ok(
+  $$select public.checkout_lifecycle_record_refund_failure(
+    'cs_raced', 'evt_refund_partial', 're_retry', 'partial'
+  )$$,
+  'aggregate shortfall is durably retryable'
+);
+select is(
+  (public.checkout_lifecycle_prepare_refund_attempt('cs_raced') ->> 'attempt')::integer,
+  3,
+  'a partial succeeded Refund claims the next attempt'
+);
+select lives_ok(
+  $$select public.checkout_lifecycle_record_refund_attempt(
+    'cs_raced', 'evt_remaining_attempt', 're_remaining', 3
+  )$$,
+  'the remaining-amount attempt is durably attached'
+);
+select is(
+  public.checkout_lifecycle_reconcile_refund_event(
+    're_remaining',
+    'evt_remaining_succeeded',
+    'succeeded',
+    1500,
+    'pi_raced'
+  ) ->> 'status',
+  'succeeded',
+  'the remaining Refund is accepted for aggregate verification'
+);
+select lives_ok(
   $$select public.checkout_lifecycle_mark_refunded('cs_raced', 'evt_aggregate_full')$$,
   'aggregate full-refund verification can terminalize compensation'
+);
+select is(
+  public.checkout_lifecycle_reconcile_refund_event(
+    're_remaining',
+    'evt_late_refund_failure',
+    'failed',
+    1500,
+    'pi_raced'
+  ) ->> 'status',
+  'retry_required',
+  'a formerly succeeded Refund that later fails reopens compensation'
+);
+select is(
+  (
+    select state
+    from checkout_lifecycle_private.checkout_sessions
+    where stripe_checkout_session_id = 'cs_raced'
+  ),
+  'refund_pending',
+  'late Refund failure blocks finalization again'
+);
+select is(
+  (
+    public.checkout_lifecycle_finalize_deletion(
+      '00000000-0000-0000-0000-000000000201'
+    ) ->> 'status'
+  ),
+  'unsafe',
+  'reopened compensation prevents account deletion'
+);
+select is(
+  (public.checkout_lifecycle_prepare_refund_attempt('cs_raced') ->> 'attempt')::integer,
+  4,
+  'late Refund failure claims a new persisted attempt'
+);
+select lives_ok(
+  $$select public.checkout_lifecycle_record_refund_attempt(
+    'cs_raced', 'evt_late_recovery', 're_late_recovery', 4
+  )$$,
+  'late Refund recovery attaches its replacement Refund'
+);
+select is(
+  public.checkout_lifecycle_reconcile_refund_event(
+    're_late_recovery',
+    'evt_late_recovery_succeeded',
+    'succeeded',
+    2500,
+    'pi_raced'
+  ) ->> 'status',
+  'succeeded',
+  'the replacement full Refund is accepted for aggregate verification'
+);
+select lives_ok(
+  $$select public.checkout_lifecycle_mark_refunded('cs_raced', 'evt_late_recovery_full')$$,
+  'late Refund recovery can terminalize compensation again'
 );
 select is(
   (
@@ -535,6 +618,28 @@ select is(
   ),
   'cus_async_failed',
   'failed asynchronous payment durably retains its Stripe customer'
+);
+select is(
+  public.checkout_lifecycle_reconcile_completion(
+    '00000000-0000-0000-0000-000000000201',
+    'cs_async_failed',
+    'evt_paid_after_async_failure',
+    'checkout.session.completed',
+    1000,
+    'cus_async_failed',
+    'pi_async_failed'
+  ),
+  'duplicate',
+  'a delayed paid event after async failure remains non-credit terminal'
+);
+select is(
+  (
+    select count(*)::integer
+    from public.credit_ledger
+    where stripe_checkout_session_id = 'cs_async_failed'
+  ),
+  0,
+  'a delayed paid event after async failure cannot mint credits'
 );
 select is(
   (

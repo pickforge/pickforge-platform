@@ -31,6 +31,10 @@ create table checkout_lifecycle_private.checkout_sessions (
 create index checkout_lifecycle_sessions_user_id_idx
   on checkout_lifecycle_private.checkout_sessions(user_id, stripe_checkout_session_id);
 
+create unique index checkout_lifecycle_sessions_refund_id_idx
+  on checkout_lifecycle_private.checkout_sessions(stripe_refund_id)
+  where stripe_refund_id is not null;
+
 insert into checkout_lifecycle_private.checkout_sessions (
   stripe_checkout_session_id,
   user_id,
@@ -238,6 +242,9 @@ begin
       return 'refunded_cleanup_pending';
     end if;
     return 'refunded';
+  end if;
+  if existing_state in ('payment_failed', 'expired') then
+    return 'duplicate';
   end if;
 
   if not exists (
@@ -665,6 +672,7 @@ begin
   elsif refund_status in ('failed', 'canceled') then
     update checkout_lifecycle_private.checkout_sessions
     set stripe_event_id = event_id,
+        state = 'refund_pending',
         refund_error_code = refund_status,
         refund_error_at = now(),
         updated_at = now()

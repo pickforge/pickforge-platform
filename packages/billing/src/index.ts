@@ -456,22 +456,24 @@ async function processRefundLifecycleEvent({
 }: ProcessStripeEventOptions): Promise<ProcessStripeEventResult> {
   const refund = getObject<StripeRefundEventObject>(event);
   const refundId = validateNonEmptyString(refund.id, "refund id");
-  const paymentIntentId = validateNonEmptyString(
-    readStripeObjectId(refund.payment_intent),
-    "payment_intent",
-  );
-  const amountCents = validateCheckoutAmount(refund.amount);
-  const status = validateNonEmptyString(refund.status, "refund status");
+  const rawPaymentIntentId = readStripeObjectId(refund.payment_intent);
+  const rawAmountCents = Number.isSafeInteger(refund.amount) ? refund.amount : null;
+  const rawStatus = typeof refund.status === "string" && refund.status.length > 0
+    ? refund.status
+    : null;
   const data = await reconcileRefundLifecycleEvent(supabase, {
     refund_id: refundId,
     event_id: event.id,
-    refund_status: status,
-    refund_amount: amountCents,
-    payment_intent_id: paymentIntentId,
+    refund_status: rawStatus,
+    refund_amount: rawAmountCents,
+    payment_intent_id: rawPaymentIntentId,
   });
   if (data.status === "ignored") {
     return { handled: false, duplicate: false };
   }
+
+  const paymentIntentId = validateNonEmptyString(rawPaymentIntentId, "payment_intent");
+  const amountCents = validateCheckoutAmount(rawAmountCents);
   if (data.status === "pending") {
     return { handled: true, duplicate: false };
   }
@@ -556,9 +558,9 @@ async function reconcileRefundLifecycleEvent(
   args: {
     refund_id: string;
     event_id: string;
-    refund_status: string;
-    refund_amount: number;
-    payment_intent_id: string;
+    refund_status: string | null;
+    refund_amount: number | null;
+    payment_intent_id: string | null;
   },
 ): Promise<Record<string, unknown>> {
   const { data, error } = await (supabase.rpc(

@@ -1,6 +1,6 @@
 begin;
 
-select plan(110);
+select plan(112);
 
 select ok(
   not has_schema_privilege('anon', 'checkout_lifecycle_private', 'usage'),
@@ -438,6 +438,27 @@ select is(
   public.checkout_lifecycle_prepare_refund_attempt('cs_raced') ->> 'refund_id',
   're_retry',
   'an attached Refund remains recoverable after a crash before retrieval'
+);
+select is(
+  public.checkout_lifecycle_reconcile_refund_event(
+    're_retry',
+    'evt_refund_missing_payment_intent',
+    'succeeded',
+    1000,
+    null
+  ) ->> 'status',
+  'ignored',
+  'an owned Refund event with missing checkout-specific fields is ignored'
+);
+select is(
+  (
+    select status
+    from checkout_lifecycle_private.refund_attempts
+    where stripe_checkout_session_id = 'cs_raced'
+      and attempt = 2
+  ),
+  'pending',
+  'an invalid owned Refund event cannot mutate attempt state'
 );
 select is(
   public.checkout_lifecycle_reconcile_refund_event(

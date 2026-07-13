@@ -164,6 +164,20 @@ describe("@pickforge/billing", () => {
     expect(supabase.lifecycleSessions.get("cs_refund_retry")).toBe("refunded");
   });
 
+  it("ignores untracked Refunds before validating checkout-specific fields", async () => {
+    const supabase = new MemorySupabase();
+
+    await expect(processStripeEvent({
+      supabase,
+      stripe: fakeStripe(),
+      event: refundEvent({
+        refundId: "re_untracked",
+        amount: 100_001,
+        paymentIntent: null,
+      }),
+    })).resolves.toEqual({ handled: false, duplicate: false });
+  });
+
   it("waits for an asynchronous Stripe refund to succeed before completing reconciliation", async () => {
     const supabase = new MemorySupabase();
     supabase.fencedUsers.add(USER_ID);
@@ -853,7 +867,7 @@ function refundEvent(overrides: {
   refundId?: string;
   status?: string;
   amount?: number;
-  paymentIntent?: string;
+  paymentIntent?: unknown;
   type?: string;
 } = {}): StripeEventLike {
   return {
@@ -864,7 +878,7 @@ function refundEvent(overrides: {
         id: overrides.refundId ?? "re_123",
         amount: overrides.amount ?? 1000,
         status: overrides.status ?? "succeeded",
-        payment_intent: overrides.paymentIntent ?? "pi_123",
+        payment_intent: "paymentIntent" in overrides ? overrides.paymentIntent : "pi_123",
       },
     },
   };

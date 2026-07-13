@@ -842,7 +842,13 @@ begin
 
   if not found
     or session_row.state not in ('refund_pending', 'refunded')
+    or refund_status is null
+    or length(btrim(refund_status)) = 0
+    or refund_amount is null
+    or refund_amount <= 0
     or refund_amount <> attempt_row.amount_cents
+    or payment_intent_id is null
+    or length(btrim(payment_intent_id)) = 0
     or session_row.stripe_payment_intent_id <> payment_intent_id
   then
     return pg_catalog.jsonb_build_object('status', 'ignored');

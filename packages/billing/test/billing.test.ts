@@ -271,8 +271,12 @@ describe("@pickforge/billing", () => {
   it("continues automatically when a signed succeeded Refund leaves a shortfall", async () => {
     const supabase = new MemorySupabase();
     supabase.lifecycleSessions.set("cs_signed_partial", "refund_pending");
-    supabase.refundAttempts.set("cs_signed_partial", 1);
-    supabase.refundIds.set("cs_signed_partial", "re_signed_partial");
+    supabase.seedRefundAttempt("cs_signed_partial", {
+      attempt: 1,
+      refundId: "re_signed_partial",
+      amountCents: 400,
+      status: "pending",
+    });
     const stripe = fakeStripe();
     const partial = { id: "re_signed_partial", amount: 400, status: "succeeded" };
     const remaining = { id: "re_signed_remaining", amount: 600, status: "succeeded" };
@@ -298,6 +302,61 @@ describe("@pickforge/billing", () => {
       { idempotencyKey: "checkout-deletion:cs_signed_partial:attempt:2" },
     );
     expect(supabase.lifecycleSessions.get("cs_signed_partial")).toBe("refunded");
+  });
+
+  it("replaces coverage when an earlier partial Refund reverses", async () => {
+    const supabase = new MemorySupabase();
+    supabase.lifecycleSessions.set("cs_superseded_reversal", "refunded");
+    supabase.lifecycleAmounts.set("cs_superseded_reversal", 1000);
+    supabase.seedRefundAttempt("cs_superseded_reversal", {
+      attempt: 1,
+      refundId: "re_partial_a",
+      amountCents: 400,
+      status: "succeeded",
+    });
+    supabase.seedRefundAttempt("cs_superseded_reversal", {
+      attempt: 2,
+      refundId: "re_partial_b",
+      amountCents: 600,
+      status: "succeeded",
+    });
+    const stripe = fakeStripe();
+    const partialA = { id: "re_partial_a", amount: 400, status: "failed" };
+    const partialB = { id: "re_partial_b", amount: 600, status: "succeeded" };
+    const replacement = { id: "re_replacement_c", amount: 400, status: "succeeded" };
+    stripe.refunds.list
+      .mockResolvedValueOnce({ data: [partialA, partialB], has_more: false })
+      .mockResolvedValueOnce({ data: [partialA, partialB], has_more: false })
+      .mockResolvedValue({ data: [partialA, partialB, replacement], has_more: false });
+    stripe.refunds.create.mockResolvedValue(replacement);
+    stripe.refunds.retrieve.mockResolvedValue(replacement);
+    const event = refundEvent({
+      refundId: "re_partial_a",
+      amount: 400,
+      status: "failed",
+      type: "refund.failed",
+    });
+
+    await expect(processStripeEvent({ supabase, stripe, event })).resolves.toMatchObject({
+      reconciliation: "deletion_race_refunded",
+    });
+
+    expect(stripe.refunds.create).toHaveBeenCalledWith(
+      { payment_intent: "pi_123", amount: 400 },
+      { idempotencyKey: "checkout-deletion:cs_superseded_reversal:attempt:3" },
+    );
+    expect(supabase.lifecycleSessions.get("cs_superseded_reversal")).toBe("refunded");
+    expect(supabase.refundHistory.get("cs_superseded_reversal")?.get(3)).toMatchObject({
+      refundId: "re_replacement_c",
+      amountCents: 400,
+      status: "succeeded",
+    });
+
+    await expect(processStripeEvent({ supabase, stripe, event })).resolves.toEqual({
+      handled: false,
+      duplicate: false,
+    });
+    expect(stripe.refunds.create).toHaveBeenCalledTimes(1);
   });
 
   it("retries a signed terminal Refund with a new durable attempt key", async () => {
@@ -340,8 +399,12 @@ describe("@pickforge/billing", () => {
     const supabase = new MemorySupabase();
     supabase.deletedUsers.add(USER_ID);
     supabase.lifecycleSessions.set("cs_late_failure", "refunded");
-    supabase.refundAttempts.set("cs_late_failure", 1);
-    supabase.refundIds.set("cs_late_failure", "re_late_failure");
+    supabase.seedRefundAttempt("cs_late_failure", {
+      attempt: 1,
+      refundId: "re_late_failure",
+      amountCents: 1000,
+      status: "succeeded",
+    });
     const stripe = fakeStripe();
     stripe.refunds.create.mockResolvedValue({
       id: "re_late_recovery",
@@ -837,6 +900,13 @@ interface Tables {
   stripe_events: Array<Record<string, unknown>>;
 }
 
+interface RefundAttemptState {
+  attempt: number;
+  refundId: string;
+  amountCents: number;
+  status: "pending" | "succeeded" | "failed" | "canceled";
+}
+
 class MemorySupabase implements SupabaseClientLike {
   readonly tables: Tables = {
     billing_customers: [],
@@ -855,6 +925,7 @@ class MemorySupabase implements SupabaseClientLike {
   readonly cleanupCustomerIds = new Map<string, string | null>();
   readonly refundFailures = new Map<string, { refundId: string; status: string }>();
   readonly refundAttempts = new Map<string, number>();
+  readonly refundHistory = new Map<string, Map<number, RefundAttemptState>>();
   readonly lifecycleAmounts = new Map<string, number>();
   readonly lifecyclePaymentIntents = new Map<string, string>();
   readonly refundIds = new Map<string, string>();
@@ -873,6 +944,25 @@ class MemorySupabase implements SupabaseClientLike {
     }
 
     return new MemoryQuery<T>(this, table);
+  }
+
+  seedRefundAttempt(sessionId: string, attempt: RefundAttemptState): void {
+    const history = this.refundHistory.get(sessionId) ?? new Map<number, RefundAttemptState>();
+    history.set(attempt.attempt, attempt);
+    this.refundHistory.set(sessionId, history);
+    this.refundAttempts.set(sessionId, Math.max(this.refundAttempts.get(sessionId) ?? 0, attempt.attempt));
+    this.refundIds.set(sessionId, attempt.refundId);
+  }
+
+  private findRefundAttempt(refundId: string): { sessionId: string; attempt: RefundAttemptState } | null {
+    for (const [sessionId, history] of this.refundHistory) {
+      for (const attempt of history.values()) {
+        if (attempt.refundId === refundId) {
+          return { sessionId, attempt };
+        }
+      }
+    }
+    return null;
   }
 
   async rpc<T = unknown>(fn: string, args?: Record<string, unknown>): Promise<SupabaseQueryResult<T>> {
@@ -991,24 +1081,76 @@ class MemorySupabase implements SupabaseClientLike {
       return { data: "terminalized" as T, error: null };
     }
     if (fn === "checkout_lifecycle_mark_refunded") {
-      this.lifecycleSessions.set(String(args?.checkout_session_id), "refunded");
+      const sessionId = String(args?.checkout_session_id);
+      const succeededCents = [...(this.refundHistory.get(sessionId)?.values() ?? [])]
+        .filter((attempt) => attempt.status === "succeeded")
+        .reduce((sum, attempt) => sum + attempt.amountCents, 0);
+      if (succeededCents < (this.lifecycleAmounts.get(sessionId) ?? 1000)) {
+        return {
+          data: null,
+          error: {
+            code: "23514",
+            message: "Refund attempt history does not cover the full Checkout Session amount",
+          },
+        };
+      }
+      this.lifecycleSessions.set(sessionId, "refunded");
+      return { data: null, error: null };
+    }
+    if (fn === "checkout_lifecycle_record_observed_refund") {
+      const sessionId = String(args?.checkout_session_id);
+      const refundId = String(args?.refund_id);
+      const amountCents = Number(args?.amount_cents);
+      const found = this.findRefundAttempt(refundId);
+      if (found !== null) {
+        if (
+          found.sessionId !== sessionId ||
+          found.attempt.amountCents !== amountCents ||
+          found.attempt.status === "failed" ||
+          found.attempt.status === "canceled"
+        ) {
+          return {
+            data: null,
+            error: { code: "23514", message: "Observed Refund conflicts with durable history" },
+          };
+        }
+        found.attempt.status = "succeeded";
+        return { data: null, error: null };
+      }
+      const history = this.refundHistory.get(sessionId) ?? new Map<number, RefundAttemptState>();
+      const historyMax = Math.max(0, ...history.keys());
+      const attempt = Math.max(historyMax, this.refundAttempts.get(sessionId) ?? 0) + 1;
+      history.set(attempt, { attempt, refundId, amountCents, status: "succeeded" });
+      this.refundHistory.set(sessionId, history);
       return { data: null, error: null };
     }
     if (fn === "checkout_lifecycle_reconcile_refund_event") {
       const refundId = String(args?.refund_id);
-      const sessionId = [...this.refundIds.entries()]
-        .find(([, storedRefundId]) => storedRefundId === refundId)?.[0];
-      if (sessionId === undefined) {
+      const found = this.findRefundAttempt(refundId);
+      if (found === null) {
+        return { data: { status: "ignored" } as T, error: null };
+      }
+      const { sessionId, attempt } = found;
+      const paymentIntentId = String(args?.payment_intent_id);
+      if (
+        Number(args?.refund_amount) !== attempt.amountCents ||
+        paymentIntentId !== (this.lifecyclePaymentIntents.get(sessionId) ?? "pi_123")
+      ) {
         return { data: { status: "ignored" } as T, error: null };
       }
       const status = String(args?.refund_status);
       const cleanupPending = this.customerCleanupPending.has(sessionId);
       if (status === "succeeded") {
+        if (attempt.status === "failed" || attempt.status === "canceled") {
+          return { data: { status: "ignored" } as T, error: null };
+        }
+        attempt.status = "succeeded";
+        this.refundFailures.delete(sessionId);
         return {
           data: {
             status: "succeeded",
             checkout_session_id: sessionId,
-            payment_intent_id: String(args?.payment_intent_id),
+            payment_intent_id: paymentIntentId,
             amount_cents: this.lifecycleAmounts.get(sessionId) ?? 1000,
             customer_cleanup_pending: cleanupPending,
           } as T,
@@ -1016,13 +1158,21 @@ class MemorySupabase implements SupabaseClientLike {
         };
       }
       if (status === "failed" || status === "canceled") {
-        this.lifecycleSessions.set(sessionId, "refund_pending");
-        this.refundFailures.set(sessionId, { refundId, status });
+        if (attempt.status === "failed" || attempt.status === "canceled") {
+          if (this.lifecycleSessions.get(sessionId) !== "refund_pending") {
+            return { data: { status: "ignored" } as T, error: null };
+          }
+        } else {
+          attempt.status = status;
+          this.lifecycleSessions.set(sessionId, "refund_pending");
+          this.refundIds.set(sessionId, refundId);
+          this.refundFailures.set(sessionId, { refundId, status });
+        }
         return {
           data: {
             status: "retry_required",
             checkout_session_id: sessionId,
-            payment_intent_id: String(args?.payment_intent_id),
+            payment_intent_id: paymentIntentId,
             amount_cents: this.lifecycleAmounts.get(sessionId) ?? 1000,
             customer_cleanup_pending: cleanupPending,
           } as T,
@@ -1031,9 +1181,9 @@ class MemorySupabase implements SupabaseClientLike {
       }
       return {
         data: {
-          status: "pending",
+          status: attempt.status === "succeeded" ? "succeeded" : "pending",
           checkout_session_id: sessionId,
-          payment_intent_id: String(args?.payment_intent_id),
+          payment_intent_id: paymentIntentId,
           amount_cents: this.lifecycleAmounts.get(sessionId) ?? 1000,
           customer_cleanup_pending: cleanupPending,
         } as T,
@@ -1059,9 +1209,11 @@ class MemorySupabase implements SupabaseClientLike {
           error: null,
         };
       }
+      const history = this.refundHistory.get(sessionId);
+      const historyMax = history === undefined ? 0 : Math.max(0, ...history.keys());
       const attempt = failure === undefined
         ? Math.max(this.refundAttempts.get(sessionId) ?? 0, 1)
-        : (this.refundAttempts.get(sessionId) ?? 1) + 1;
+        : Math.max(historyMax, this.refundAttempts.get(sessionId) ?? 1) + 1;
       this.refundAttempts.set(sessionId, attempt);
       this.refundFailures.delete(sessionId);
       return {
@@ -1077,8 +1229,30 @@ class MemorySupabase implements SupabaseClientLike {
     }
     if (fn === "checkout_lifecycle_record_refund_attempt") {
       const sessionId = String(args?.checkout_session_id);
-      this.refundAttempts.set(sessionId, Number(args?.attempt));
-      this.refundIds.set(sessionId, String(args?.refund_id));
+      const attempt = Number(args?.attempt);
+      const refundId = String(args?.refund_id);
+      const amountCents = Number(args?.amount_cents);
+      const existing = this.refundHistory.get(sessionId)?.get(attempt);
+      if (
+        existing !== undefined &&
+        (existing.refundId !== refundId || existing.amountCents !== amountCents)
+      ) {
+        return {
+          data: null,
+          error: { code: "23514", message: "Refund attempt conflicts with durable history" },
+        };
+      }
+      const duplicateOwner = this.findRefundAttempt(refundId);
+      if (duplicateOwner !== null && duplicateOwner.sessionId !== sessionId) {
+        return uniqueViolation<T>();
+      }
+      this.seedRefundAttempt(sessionId, {
+        attempt,
+        refundId,
+        amountCents,
+        status: existing?.status ?? "pending",
+      });
+      this.refundIds.set(sessionId, refundId);
       return { data: null, error: null };
     }
     if (fn === "checkout_lifecycle_get_customer_cleanup") {
@@ -1096,11 +1270,18 @@ class MemorySupabase implements SupabaseClientLike {
       return { data: null, error: null };
     }
     if (fn === "checkout_lifecycle_record_refund_failure") {
-      this.refundFailures.set(String(args?.checkout_session_id), {
-        refundId: String(args?.refund_id),
-        status: String(args?.failure_status),
-      });
-      this.refundIds.set(String(args?.checkout_session_id), String(args?.refund_id));
+      const sessionId = String(args?.checkout_session_id);
+      const refundId = String(args?.refund_id);
+      const status = String(args?.failure_status);
+      const found = this.findRefundAttempt(refundId);
+      if (found === null || found.sessionId !== sessionId) {
+        return { data: null, error: { code: "P0002", message: "Refund attempt is not registered" } };
+      }
+      found.attempt.status = status === "partial"
+        ? "succeeded"
+        : status as "failed" | "canceled";
+      this.refundFailures.set(sessionId, { refundId, status });
+      this.refundIds.set(sessionId, refundId);
       return { data: null, error: null };
     }
     if (fn === "credit_balance_cents") {

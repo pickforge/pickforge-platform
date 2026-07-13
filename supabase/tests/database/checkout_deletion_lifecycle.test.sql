@@ -1,6 +1,6 @@
 begin;
 
-select plan(99);
+select plan(110);
 
 select ok(
   not has_schema_privilege('anon', 'checkout_lifecycle_private', 'usage'),
@@ -39,6 +39,18 @@ select ok(
   not has_table_privilege('service_role', 'checkout_lifecycle_private.checkout_sessions', 'select'),
   'service role cannot directly read Checkout Session registrations'
 );
+select ok(
+  not has_table_privilege('anon', 'checkout_lifecycle_private.refund_attempts', 'select'),
+  'anon cannot read Refund attempt history'
+);
+select ok(
+  not has_table_privilege('authenticated', 'checkout_lifecycle_private.refund_attempts', 'select'),
+  'authenticated cannot read Refund attempt history'
+);
+select ok(
+  not has_table_privilege('service_role', 'checkout_lifecycle_private.refund_attempts', 'select'),
+  'service role cannot directly read Refund attempt history'
+);
 
 select is(
   (
@@ -61,6 +73,17 @@ select is(
   ),
   true,
   'Checkout Session registrations have RLS defense in depth'
+);
+select is(
+  (
+    select relrowsecurity
+    from pg_class
+    join pg_namespace on pg_namespace.oid = pg_class.relnamespace
+    where pg_namespace.nspname = 'checkout_lifecycle_private'
+      and pg_class.relname = 'refund_attempts'
+  ),
+  true,
+  'Refund attempt history has RLS defense in depth'
 );
 
 select ok(
@@ -369,7 +392,7 @@ select is(
 );
 select lives_ok(
   $$select public.checkout_lifecycle_record_refund_attempt(
-    'cs_raced', 'evt_raced', 're_failed', 1
+    'cs_raced', 'evt_raced', 're_failed', 1, 2500
   )$$,
   'the initial Stripe Refund id is durably attached to its attempt'
 );
@@ -407,7 +430,7 @@ select is(
 );
 select lives_ok(
   $$select public.checkout_lifecycle_record_refund_attempt(
-    'cs_raced', 'evt_raced_retry', 're_retry', 2
+    'cs_raced', 'evt_raced_retry', 're_retry', 2, 1000
   )$$,
   'the retry persists a distinct Stripe Refund id'
 );
@@ -436,6 +459,12 @@ select is(
   'refund_pending',
   'an individual partial Refund cannot terminalize compensation'
 );
+select throws_ok(
+  $$select public.checkout_lifecycle_mark_refunded('cs_raced', 'evt_partial_only')$$,
+  '23000',
+  'Refund attempt history does not cover the full Checkout Session amount',
+  'SQL refuses to mark a Checkout Session refunded before owned attempts cover it'
+);
 select lives_ok(
   $$select public.checkout_lifecycle_record_refund_failure(
     'cs_raced', 'evt_refund_partial', 're_retry', 'partial'
@@ -449,7 +478,7 @@ select is(
 );
 select lives_ok(
   $$select public.checkout_lifecycle_record_refund_attempt(
-    'cs_raced', 'evt_remaining_attempt', 're_remaining', 3
+    'cs_raced', 'evt_remaining_attempt', 're_remaining', 3, 1500
   )$$,
   'the remaining-amount attempt is durably attached'
 );
@@ -467,6 +496,46 @@ select is(
 select lives_ok(
   $$select public.checkout_lifecycle_mark_refunded('cs_raced', 'evt_aggregate_full')$$,
   'aggregate full-refund verification can terminalize compensation'
+);
+select is(
+  public.checkout_lifecycle_reconcile_refund_event(
+    're_retry',
+    'evt_superseded_refund_failure',
+    'failed',
+    1000,
+    'pi_raced'
+  ) ->> 'status',
+  'retry_required',
+  'a superseded partial Refund remains reconcilable after aggregate completion'
+);
+select is(
+  (
+    select state
+    from checkout_lifecycle_private.checkout_sessions
+    where stripe_checkout_session_id = 'cs_raced'
+  ),
+  'refund_pending',
+  'a superseded partial Refund reversal reopens compensation'
+);
+select is(
+  (
+    select status
+    from checkout_lifecycle_private.refund_attempts
+    where stripe_refund_id = 're_retry'
+  ),
+  'failed',
+  'the superseded attempt retains its own terminal status'
+);
+select is(
+  public.checkout_lifecycle_reconcile_refund_event(
+    're_retry',
+    'evt_out_of_order_succeeded',
+    'succeeded',
+    1000,
+    'pi_raced'
+  ) ->> 'status',
+  'ignored',
+  'an out-of-order succeeded event cannot resurrect a terminal Refund'
 );
 select is(
   public.checkout_lifecycle_reconcile_refund_event(
@@ -504,7 +573,7 @@ select is(
 );
 select lives_ok(
   $$select public.checkout_lifecycle_record_refund_attempt(
-    'cs_raced', 'evt_late_recovery', 're_late_recovery', 4
+    'cs_raced', 'evt_late_recovery', 're_late_recovery', 4, 2500
   )$$,
   'late Refund recovery attaches its replacement Refund'
 );
@@ -522,6 +591,17 @@ select is(
 select lives_ok(
   $$select public.checkout_lifecycle_mark_refunded('cs_raced', 'evt_late_recovery_full')$$,
   'late Refund recovery can terminalize compensation again'
+);
+select is(
+  public.checkout_lifecycle_reconcile_refund_event(
+    're_retry',
+    'evt_duplicate_late_failure',
+    'failed',
+    1000,
+    'pi_raced'
+  ) ->> 'status',
+  'ignored',
+  'a duplicate historical failure cannot reopen fully restored coverage'
 );
 select is(
   (
@@ -566,6 +646,36 @@ select is(
   ) ->> 'status',
   'ignored',
   'an unknown Refund cannot mutate lifecycle state'
+);
+
+do $$
+begin
+  perform public.checkout_lifecycle_fence_deletion(
+    '00000000-0000-0000-0000-000000000202'
+  );
+  perform public.checkout_lifecycle_reconcile_completion(
+    '00000000-0000-0000-0000-000000000202',
+    'cs_other_refund_owner',
+    'evt_other_refund_owner',
+    'checkout.session.completed',
+    500,
+    'cus_other_refund_owner',
+    'pi_other_refund_owner'
+  );
+  perform public.checkout_lifecycle_prepare_refund_attempt('cs_other_refund_owner');
+end;
+$$;
+select throws_ok(
+  $$select public.checkout_lifecycle_record_refund_attempt(
+    'cs_other_refund_owner',
+    'evt_cross_owner_refund',
+    're_late_recovery',
+    1,
+    500
+  )$$,
+  '23505',
+  null,
+  'a Stripe Refund id cannot be attached to another user or Checkout Session'
 );
 
 select is(
@@ -688,6 +798,17 @@ select is(
   true,
   'late completion invalidates the frozen deletion snapshot'
 );
+do $$
+begin
+  perform public.checkout_lifecycle_record_observed_refund(
+    'cs_after_finalize',
+    'evt_after_finalize',
+    're_after_finalize',
+    5000,
+    'pi_after_finalize'
+  );
+end;
+$$;
 select lives_ok(
   $$select public.checkout_lifecycle_mark_refunded('cs_after_finalize', 'evt_after_finalize')$$,
   'late finalized-fence refund can become terminal'
@@ -746,6 +867,17 @@ select ok(
   ),
   'the user survives the finalization-to-auth deletion race'
 );
+do $$
+begin
+  perform public.checkout_lifecycle_record_observed_refund(
+    'cs_atomic_race',
+    'evt_atomic_race',
+    're_atomic_race',
+    5000,
+    'pi_atomic_race'
+  );
+end;
+$$;
 select lives_ok(
   $$select public.checkout_lifecycle_mark_refunded('cs_atomic_race', 'evt_atomic_race')$$,
   'the racing completion refund can become terminal'
@@ -831,6 +963,17 @@ select is(
   0,
   'the missing-user compensation path cannot mint credits'
 );
+do $$
+begin
+  perform public.checkout_lifecycle_record_observed_refund(
+    'cs_after_delete',
+    'evt_after_delete',
+    're_after_delete',
+    5000,
+    'pi_after_delete'
+  );
+end;
+$$;
 select lives_ok(
   $$select public.checkout_lifecycle_mark_refunded('cs_after_delete', 'evt_after_delete')$$,
   'missing-user compensation can become terminal after Stripe succeeds'

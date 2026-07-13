@@ -268,6 +268,38 @@ describe("@pickforge/billing", () => {
     expect(supabase.lifecycleSessions.get("cs_partial_remaining")).toBe("refunded");
   });
 
+  it("continues automatically when a signed succeeded Refund leaves a shortfall", async () => {
+    const supabase = new MemorySupabase();
+    supabase.lifecycleSessions.set("cs_signed_partial", "refund_pending");
+    supabase.refundAttempts.set("cs_signed_partial", 1);
+    supabase.refundIds.set("cs_signed_partial", "re_signed_partial");
+    const stripe = fakeStripe();
+    const partial = { id: "re_signed_partial", amount: 400, status: "succeeded" };
+    const remaining = { id: "re_signed_remaining", amount: 600, status: "succeeded" };
+    stripe.refunds.list
+      .mockResolvedValueOnce({ data: [partial], has_more: false })
+      .mockResolvedValueOnce({ data: [partial], has_more: false })
+      .mockResolvedValueOnce({ data: [partial, remaining], has_more: false });
+    stripe.refunds.create.mockResolvedValue(remaining);
+    stripe.refunds.retrieve.mockResolvedValue(remaining);
+
+    await expect(processStripeEvent({
+      supabase,
+      stripe,
+      event: refundEvent({
+        refundId: "re_signed_partial",
+        amount: 400,
+        status: "succeeded",
+      }),
+    })).resolves.toMatchObject({ reconciliation: "deletion_race_refunded" });
+
+    expect(stripe.refunds.create).toHaveBeenCalledWith(
+      { payment_intent: "pi_123", amount: 600 },
+      { idempotencyKey: "checkout-deletion:cs_signed_partial:attempt:2" },
+    );
+    expect(supabase.lifecycleSessions.get("cs_signed_partial")).toBe("refunded");
+  });
+
   it("retries a signed terminal Refund with a new durable attempt key", async () => {
     const supabase = new MemorySupabase();
     supabase.fencedUsers.add(USER_ID);
@@ -938,7 +970,7 @@ class MemorySupabase implements SupabaseClientLike {
             status: "retry_required",
             checkout_session_id: sessionId,
             payment_intent_id: String(args?.payment_intent_id),
-            amount_cents: Number(args?.refund_amount),
+            amount_cents: 1000,
             customer_cleanup_pending: cleanupPending,
           } as T,
           error: null,
@@ -949,7 +981,7 @@ class MemorySupabase implements SupabaseClientLike {
           status: "pending",
           checkout_session_id: sessionId,
           payment_intent_id: String(args?.payment_intent_id),
-          amount_cents: Number(args?.refund_amount),
+          amount_cents: 1000,
           customer_cleanup_pending: cleanupPending,
         } as T,
         error: null,

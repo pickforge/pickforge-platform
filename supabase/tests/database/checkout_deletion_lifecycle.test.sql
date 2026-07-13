@@ -1,6 +1,6 @@
 begin;
 
-select plan(85);
+select plan(86);
 
 select ok(
   not has_schema_privilege('anon', 'checkout_lifecycle_private', 'usage'),
@@ -461,6 +461,17 @@ select is(
   ),
   'refunded',
   'a compensated completion is idempotently terminal'
+);
+select throws_ok(
+  $$select public.checkout_lifecycle_record_refund_failure(
+    'cs_unknown_refund_failure',
+    'evt_unknown_refund_failure',
+    're_unknown_refund_failure',
+    'failed'
+  )$$,
+  'P0002',
+  'Checkout Session refund failure is not pending',
+  'recording a Refund failure cannot silently update zero rows'
 );
 select is(
   public.checkout_lifecycle_reconcile_refund_event(

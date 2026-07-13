@@ -21,7 +21,7 @@ create table checkout_lifecycle_private.checkout_sessions (
   stripe_refund_id text,
   refund_attempt_count integer not null default 0 check (refund_attempt_count >= 0),
   refund_attempt_claimed boolean not null default false,
-  refund_error_code text check (refund_error_code is null or refund_error_code in ('failed', 'canceled')),
+  refund_error_code text check (refund_error_code is null or refund_error_code in ('failed', 'canceled', 'partial')),
   refund_error_at timestamptz,
   customer_cleanup_pending boolean not null default false,
   created_at timestamptz not null default now(),
@@ -450,10 +450,11 @@ create or replace function public.checkout_lifecycle_record_refund_failure(
   failure_status text
 )
 returns void
-language sql
+language plpgsql
 security definer
 set search_path = ''
 as $$
+begin
   update checkout_lifecycle_private.checkout_sessions
   set state = 'refund_pending',
       stripe_event_id = event_id,
@@ -463,6 +464,11 @@ as $$
       updated_at = now()
   where stripe_checkout_session_id = checkout_session_id
     and state = 'refund_pending';
+
+  if not found then
+    raise no_data_found using message = 'Checkout Session refund failure is not pending';
+  end if;
+end;
 $$;
 
 create or replace function public.checkout_lifecycle_mark_expired(
@@ -562,7 +568,7 @@ begin
 
   if session_row.stripe_refund_id is null and session_row.refund_error_code is null then
     next_attempt := greatest(session_row.refund_attempt_count, 1);
-  elsif session_row.refund_error_code in ('failed', 'canceled') then
+  elsif session_row.refund_error_code in ('failed', 'canceled', 'partial') then
     next_attempt := case
       when session_row.refund_attempt_claimed then session_row.refund_attempt_count
       else session_row.refund_attempt_count + 1

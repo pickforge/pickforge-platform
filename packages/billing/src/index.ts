@@ -483,8 +483,8 @@ async function processRefundLifecycleEvent({
   if (data.status === "ignored") {
     return { handled: false, duplicate: false };
   }
-  if (data.status === "pending" || data.status === "refunded") {
-    return { handled: true, duplicate: data.status === "refunded" };
+  if (data.status === "pending") {
+    return { handled: true, duplicate: false };
   }
   const sessionId = validateNonEmptyString(data.checkout_session_id, "checkout session id");
   const cleanupLateCustomer = data.customer_cleanup_pending === true;
@@ -497,7 +497,23 @@ async function processRefundLifecycleEvent({
       }
       return { handled: true, duplicate: false, reconciliation: "deletion_race_refunded" };
     }
-    return { handled: true, duplicate: false };
+    if (summary.hasNonterminal) {
+      throw new BillingError(
+        "refund_incomplete",
+        "The PaymentIntent still has another nonterminal Refund",
+      );
+    }
+    await recordCheckoutRefundFailure(supabase, sessionId, event.id, refundId, "partial");
+    await performDeletionRefund({
+      supabase,
+      stripe,
+      sessionId,
+      eventId: event.id,
+      paymentIntentId,
+      amountCents: Number(data.amount_cents),
+      cleanupLateCustomer,
+    });
+    return { handled: true, duplicate: false, reconciliation: "deletion_race_refunded" };
   }
   if (data.status !== "retry_required") {
     throw databaseError("Invalid Stripe Refund reconciliation status", {
@@ -732,7 +748,7 @@ async function recordCheckoutRefundFailure(
   sessionId: string,
   eventId: string,
   refundId: string,
-  failureStatus: "failed" | "canceled",
+  failureStatus: "failed" | "canceled" | "partial",
 ): Promise<void> {
   const { error } = await (supabase.rpc("checkout_lifecycle_record_refund_failure", {
     checkout_session_id: sessionId,

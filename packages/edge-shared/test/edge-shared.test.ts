@@ -631,6 +631,7 @@ describe("@pickforge/edge-shared", () => {
     });
     const stripe = deletionStripe();
     const handler = createDeleteAccountHandler({
+
       admin,
       stripe,
       resolveUserId: vi.fn(async () => USER_ID),
@@ -640,6 +641,31 @@ describe("@pickforge/edge-shared", () => {
 
     expect(response.status).toBe(200);
     expect(stripe.customers.del).toHaveBeenCalledWith("cus_locked_refunded");
+    expect(admin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
+  });
+
+  it("deletes safely with a pre-lifecycle credited Session backfilled as completed", async () => {
+    const admin = accountAdmin({}, {}, {
+      sessions: [{
+        stripe_checkout_session_id: "cs_pre_lifecycle_credited",
+        state: "completed",
+        stripe_customer_id: "cus_pre_lifecycle_credited",
+      }],
+    });
+    const stripe = deletionStripe({
+      sessions: [{ id: "cs_pre_lifecycle_credited", status: "complete" }],
+    });
+    const handler = createDeleteAccountHandler({
+      admin,
+      stripe,
+      resolveUserId: vi.fn(async () => USER_ID),
+    });
+
+    const response = await handler(new Request("https://edge.test", { method: "POST" }));
+
+    expect(response.status).toBe(200);
+    expect(stripe.checkout.sessions.expire).not.toHaveBeenCalled();
+    expect(stripe.customers.del).toHaveBeenCalledWith("cus_pre_lifecycle_credited");
     expect(admin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
   });
 

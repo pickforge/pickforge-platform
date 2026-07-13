@@ -94,6 +94,34 @@ describe("@pickforge/billing", () => {
     expect(supabase.lifecycleSessions.get("cs_fenced")).toBe("refunded");
   });
 
+  it("does not refund a pre-lifecycle credited purchase retried after fencing", async () => {
+    const supabase = new MemorySupabase();
+    const stripe = fakeStripe();
+    await processStripeEvent({
+      supabase,
+      stripe,
+      event: checkoutSessionEvent({ sessionId: "cs_pre_lifecycle" }),
+    });
+    supabase.lifecycleSessions.delete("cs_pre_lifecycle");
+    supabase.fencedUsers.add(USER_ID);
+
+    await expect(processStripeEvent({
+      supabase,
+      stripe,
+      event: checkoutSessionEvent({
+        id: "evt_pre_lifecycle_retry",
+        sessionId: "cs_pre_lifecycle",
+      }),
+    })).resolves.toMatchObject({
+      handled: false,
+      duplicate: true,
+    });
+
+    expect(stripe.refunds.create).not.toHaveBeenCalled();
+    expect(supabase.tables.credit_ledger).toHaveLength(1);
+    expect(supabase.lifecycleSessions.get("cs_pre_lifecycle")).toBe("completed");
+  });
+
   it("refunds and cleans a late customer after deletion finalization while auth still exists", async () => {
     const supabase = new MemorySupabase();
     supabase.fencedUsers.add(USER_ID);
@@ -630,6 +658,21 @@ class MemorySupabase implements SupabaseClientLike {
             : "refunded") as T,
           error: null,
         };
+      }
+      const creditedPurchase = this.tables.credit_ledger.find(
+        (row) =>
+          row.kind === "purchase" &&
+          row.stripe_checkout_session_id === sessionId,
+      );
+      if (creditedPurchase !== undefined) {
+        if (creditedPurchase.user_id !== userId) {
+          return {
+            data: null,
+            error: { code: "23514", message: "Checkout Session credit belongs to another user" },
+          };
+        }
+        this.lifecycleSessions.set(sessionId, "completed");
+        return { data: "duplicate" as T, error: null };
       }
       if (this.deletedUsers.has(userId)) {
         this.lifecycleSessions.set(sessionId, "refund_pending");

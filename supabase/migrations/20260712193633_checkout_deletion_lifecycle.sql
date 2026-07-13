@@ -29,6 +29,28 @@ create table checkout_lifecycle_private.checkout_sessions (
 create index checkout_lifecycle_sessions_user_id_idx
   on checkout_lifecycle_private.checkout_sessions(user_id, stripe_checkout_session_id);
 
+insert into checkout_lifecycle_private.checkout_sessions (
+  stripe_checkout_session_id,
+  user_id,
+  state,
+  stripe_event_id,
+  amount_total_cents,
+  stripe_customer_id,
+  stripe_payment_intent_id
+)
+select
+  ledger.stripe_checkout_session_id,
+  ledger.user_id,
+  'completed',
+  ledger.stripe_event_id,
+  ledger.amount_cents,
+  nullif(ledger.metadata ->> 'stripe_customer_id', ''),
+  nullif(ledger.metadata ->> 'stripe_payment_intent_id', '')
+from public.credit_ledger as ledger
+where ledger.kind = 'purchase'
+  and ledger.stripe_checkout_session_id is not null
+on conflict (stripe_checkout_session_id) do nothing;
+
 alter table checkout_lifecycle_private.deletion_fences enable row level security;
 alter table checkout_lifecycle_private.checkout_sessions enable row level security;
 
@@ -149,6 +171,7 @@ declare
   existing_state text;
   existing_cleanup_pending boolean;
   deletion_finalized boolean := false;
+  credited_user uuid;
   credited_id uuid;
 begin
   perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext(target_user::text));
@@ -161,6 +184,48 @@ begin
   if existing_user is not null and existing_user <> target_user then
     raise integrity_constraint_violation using
       message = 'Checkout Session is already registered to another user';
+  end if;
+
+  select ledger.user_id
+  into credited_user
+  from public.credit_ledger as ledger
+  where ledger.kind = 'purchase'
+    and ledger.stripe_checkout_session_id = checkout_session_id;
+
+  if found then
+    if credited_user <> target_user then
+      raise integrity_constraint_violation using
+        message = 'Checkout Session credit belongs to another user';
+    end if;
+
+    insert into checkout_lifecycle_private.checkout_sessions (
+      stripe_checkout_session_id,
+      user_id,
+      state,
+      stripe_event_id,
+      amount_total_cents,
+      stripe_customer_id,
+      stripe_payment_intent_id,
+      customer_cleanup_pending
+    )
+    select
+      ledger.stripe_checkout_session_id,
+      ledger.user_id,
+      'completed',
+      ledger.stripe_event_id,
+      ledger.amount_cents,
+      nullif(ledger.metadata ->> 'stripe_customer_id', ''),
+      nullif(ledger.metadata ->> 'stripe_payment_intent_id', ''),
+      false
+    from public.credit_ledger as ledger
+    where ledger.kind = 'purchase'
+      and ledger.stripe_checkout_session_id = checkout_session_id
+    on conflict (stripe_checkout_session_id) do update
+      set state = 'completed',
+          customer_cleanup_pending = false,
+          updated_at = now();
+
+    return 'duplicate';
   end if;
 
   if existing_state = 'completed' then

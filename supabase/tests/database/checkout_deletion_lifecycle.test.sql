@@ -1,6 +1,6 @@
 begin;
 
-select plan(71);
+select plan(75);
 
 select ok(
   not has_schema_privilege('anon', 'checkout_lifecycle_private', 'usage'),
@@ -276,6 +276,41 @@ select throws_ok(
   '23000',
   'Stripe completion conflicts with another ledger entry',
   'a conflicting ledger event cannot terminalize an unrelated Session'
+);
+select lives_ok(
+  $$select public.checkout_lifecycle_fence_deletion('00000000-0000-0000-0000-000000000202')$$,
+  'a user with a pre-lifecycle credited purchase can begin deletion'
+);
+select is(
+  public.checkout_lifecycle_reconcile_completion(
+    '00000000-0000-0000-0000-000000000202',
+    'cs_conflict_owner',
+    'evt_conflict_owner_retry',
+    'checkout.session.completed',
+    100,
+    'cus_conflict_owner',
+    'pi_conflict_owner'
+  ),
+  'duplicate',
+  'a fenced retry backfills the authoritative credited purchase instead of refunding'
+);
+select is(
+  (
+    select state
+    from checkout_lifecycle_private.checkout_sessions
+    where stripe_checkout_session_id = 'cs_conflict_owner'
+  ),
+  'completed',
+  'the pre-lifecycle credited purchase is durably terminalized as completed'
+);
+select is(
+  (
+    select count(*)::integer
+    from public.credit_ledger
+    where stripe_checkout_session_id = 'cs_conflict_owner'
+  ),
+  1,
+  'the credited retry remains exact-once'
 );
 select throws_ok(
   $$select public.checkout_lifecycle_mark_refunded('cs_normal', 'evt_wrong_state')$$,

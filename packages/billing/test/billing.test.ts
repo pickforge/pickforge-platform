@@ -88,7 +88,7 @@ describe("@pickforge/billing", () => {
     expect(stripe.refunds.create).toHaveBeenCalledOnce();
     expect(stripe.refunds.create).toHaveBeenCalledWith(
       { payment_intent: "pi_123" },
-      { idempotencyKey: "checkout-deletion:cs_fenced" },
+      { idempotencyKey: "checkout-deletion:cs_fenced:attempt:1" },
     );
     expect(supabase.tables.credit_ledger).toHaveLength(0);
     expect(supabase.lifecycleSessions.get("cs_fenced")).toBe("refunded");
@@ -159,7 +159,7 @@ describe("@pickforge/billing", () => {
     expect(stripe.refunds.create).toHaveBeenNthCalledWith(
       2,
       { payment_intent: "pi_123" },
-      { idempotencyKey: "checkout-deletion:cs_refund_retry" },
+      { idempotencyKey: "checkout-deletion:cs_refund_retry:attempt:1" },
     );
     expect(supabase.lifecycleSessions.get("cs_refund_retry")).toBe("refunded");
   });
@@ -169,9 +169,11 @@ describe("@pickforge/billing", () => {
     supabase.fencedUsers.add(USER_ID);
     const stripe = fakeStripe();
     stripe.refunds.create.mockResolvedValue({ id: "re_pending", amount: 1000, status: "pending" });
-    stripe.refunds.retrieve
-      .mockResolvedValueOnce({ id: "re_pending", amount: 1000, status: "pending" })
-      .mockResolvedValueOnce({ id: "re_pending", amount: 1000, status: "succeeded" });
+    stripe.refunds.retrieve.mockResolvedValueOnce({
+      id: "re_pending",
+      amount: 1000,
+      status: "pending",
+    });
     const event = checkoutSessionEvent({ sessionId: "cs_async_refund" });
 
     await expect(
@@ -181,10 +183,63 @@ describe("@pickforge/billing", () => {
     expect(supabase.tables.credit_ledger).toHaveLength(0);
 
     await expect(
-      processStripeEvent({ supabase, stripe, event }),
-    ).resolves.toMatchObject({ reconciliation: "deletion_race_refunded" });
-    expect(stripe.refunds.retrieve).toHaveBeenCalledTimes(2);
+      processStripeEvent({
+        supabase,
+        stripe,
+        event: refundEvent({ refundId: "re_pending", status: "succeeded" }),
+      }),
+    ).resolves.toEqual({ handled: true, duplicate: true });
+    expect(stripe.refunds.retrieve).toHaveBeenCalledOnce();
     expect(supabase.lifecycleSessions.get("cs_async_refund")).toBe("refunded");
+  });
+
+  it("retries a signed terminal Refund with a new durable attempt key", async () => {
+    const supabase = new MemorySupabase();
+    supabase.fencedUsers.add(USER_ID);
+    const stripe = fakeStripe();
+    stripe.refunds.create
+      .mockResolvedValueOnce({ id: "re_failed_attempt", amount: 1000, status: "pending" })
+      .mockResolvedValueOnce({ id: "re_retry_succeeded", amount: 1000, status: "succeeded" });
+    stripe.refunds.retrieve
+      .mockResolvedValueOnce({ id: "re_failed_attempt", amount: 1000, status: "pending" })
+      .mockResolvedValueOnce({ id: "re_retry_succeeded", amount: 1000, status: "succeeded" });
+
+    await expect(processStripeEvent({
+      supabase,
+      stripe,
+      event: checkoutSessionEvent({ sessionId: "cs_signed_retry" }),
+    })).rejects.toMatchObject({ code: "refund_incomplete" });
+
+    await expect(processStripeEvent({
+      supabase,
+      stripe,
+      event: refundEvent({
+        refundId: "re_failed_attempt",
+        status: "failed",
+        type: "refund.failed",
+      }),
+    })).resolves.toMatchObject({ reconciliation: "deletion_race_refunded" });
+
+    expect(stripe.refunds.create).toHaveBeenNthCalledWith(
+      2,
+      { payment_intent: "pi_123" },
+      { idempotencyKey: "checkout-deletion:cs_signed_retry:attempt:2" },
+    );
+    expect(supabase.lifecycleSessions.get("cs_signed_retry")).toBe("refunded");
+  });
+
+  it("ignores an unknown signed Refund without mutating lifecycle", async () => {
+    const supabase = new MemorySupabase();
+    const stripe = fakeStripe();
+
+    await expect(processStripeEvent({
+      supabase,
+      stripe,
+      event: refundEvent({ refundId: "re_unknown" }),
+    })).resolves.toEqual({ handled: false, duplicate: false });
+
+    expect(stripe.refunds.create).not.toHaveBeenCalled();
+    expect(stripe.customers.del).not.toHaveBeenCalled();
   });
 
   it("accepts charge_already_refunded only after verifying a full succeeded refund", async () => {
@@ -275,7 +330,7 @@ describe("@pickforge/billing", () => {
 
     expect(stripe.refunds.create).toHaveBeenCalledWith(
       { payment_intent: "pi_123" },
-      { idempotencyKey: "checkout-deletion:cs_deleted" },
+      { idempotencyKey: "checkout-deletion:cs_deleted:attempt:1" },
     );
     expect(supabase.tables.billing_customers).toHaveLength(0);
     expect(stripe.customers.del).toHaveBeenCalledWith("cus_123");
@@ -579,6 +634,27 @@ function checkoutSessionEvent(
   };
 }
 
+function refundEvent(overrides: {
+  refundId?: string;
+  status?: string;
+  amount?: number;
+  paymentIntent?: string;
+  type?: string;
+} = {}): StripeEventLike {
+  return {
+    id: `evt_${overrides.refundId ?? "refund"}`,
+    type: overrides.type ?? "refund.updated",
+    data: {
+      object: {
+        id: overrides.refundId ?? "re_123",
+        amount: overrides.amount ?? 1000,
+        status: overrides.status ?? "succeeded",
+        payment_intent: overrides.paymentIntent ?? "pi_123",
+      },
+    },
+  };
+}
+
 function fakeStripe(options: { event?: StripeEventLike } = {}) {
   return {
     checkout: {
@@ -626,6 +702,8 @@ class MemorySupabase implements SupabaseClientLike {
   readonly customerCleanupPending = new Set<string>();
   readonly cleanupCustomerIds = new Map<string, string | null>();
   readonly refundFailures = new Map<string, { refundId: string; status: string }>();
+  readonly refundAttempts = new Map<string, number>();
+  readonly refundIds = new Map<string, string>();
 
   private readonly insertFailures: Record<keyof Tables, SupabaseErrorLike[]> = {
     billing_customers: [],
@@ -757,6 +835,83 @@ class MemorySupabase implements SupabaseClientLike {
       this.lifecycleSessions.set(String(args?.checkout_session_id), "refunded");
       return { data: null, error: null };
     }
+    if (fn === "checkout_lifecycle_reconcile_refund_event") {
+      const refundId = String(args?.refund_id);
+      const sessionId = [...this.refundIds.entries()]
+        .find(([, storedRefundId]) => storedRefundId === refundId)?.[0];
+      if (sessionId === undefined) {
+        return { data: { status: "ignored" } as T, error: null };
+      }
+      const status = String(args?.refund_status);
+      const cleanupPending = this.customerCleanupPending.has(sessionId);
+      if (status === "succeeded") {
+        this.lifecycleSessions.set(sessionId, "refunded");
+        return {
+          data: {
+            status: cleanupPending ? "refunded_cleanup_pending" : "refunded",
+            checkout_session_id: sessionId,
+            payment_intent_id: String(args?.payment_intent_id),
+            amount_cents: Number(args?.refund_amount),
+            customer_cleanup_pending: cleanupPending,
+          } as T,
+          error: null,
+        };
+      }
+      if (status === "failed" || status === "canceled") {
+        this.refundFailures.set(sessionId, { refundId, status });
+        return {
+          data: {
+            status: "retry_required",
+            checkout_session_id: sessionId,
+            payment_intent_id: String(args?.payment_intent_id),
+            amount_cents: Number(args?.refund_amount),
+            customer_cleanup_pending: cleanupPending,
+          } as T,
+          error: null,
+        };
+      }
+      return {
+        data: {
+          status: "pending",
+          checkout_session_id: sessionId,
+          payment_intent_id: String(args?.payment_intent_id),
+          amount_cents: Number(args?.refund_amount),
+          customer_cleanup_pending: cleanupPending,
+        } as T,
+        error: null,
+      };
+    }
+    if (fn === "checkout_lifecycle_prepare_refund_attempt") {
+      const sessionId = String(args?.checkout_session_id);
+      if (this.lifecycleSessions.get(sessionId) !== "refund_pending") {
+        return { data: null, error: null };
+      }
+      const failure = this.refundFailures.get(sessionId);
+      if (this.refundIds.has(sessionId) && failure === undefined) {
+        return { data: null, error: null };
+      }
+      const attempt = failure === undefined
+        ? Math.max(this.refundAttempts.get(sessionId) ?? 0, 1)
+        : (this.refundAttempts.get(sessionId) ?? 1) + 1;
+      this.refundAttempts.set(sessionId, attempt);
+      this.refundIds.delete(sessionId);
+      this.refundFailures.delete(sessionId);
+      return {
+        data: {
+          attempt,
+          payment_intent_id: "pi_123",
+          amount_cents: 1000,
+          customer_cleanup_pending: this.customerCleanupPending.has(sessionId),
+        } as T,
+        error: null,
+      };
+    }
+    if (fn === "checkout_lifecycle_record_refund_attempt") {
+      const sessionId = String(args?.checkout_session_id);
+      this.refundAttempts.set(sessionId, Number(args?.attempt));
+      this.refundIds.set(sessionId, String(args?.refund_id));
+      return { data: null, error: null };
+    }
     if (fn === "checkout_lifecycle_get_customer_cleanup") {
       const sessionId = String(args?.checkout_session_id);
       return {
@@ -776,6 +931,7 @@ class MemorySupabase implements SupabaseClientLike {
         refundId: String(args?.refund_id),
         status: String(args?.failure_status),
       });
+      this.refundIds.set(String(args?.checkout_session_id), String(args?.refund_id));
       return { data: null, error: null };
     }
     if (fn === "credit_balance_cents") {

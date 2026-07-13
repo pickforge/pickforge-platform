@@ -70,6 +70,13 @@ export interface StripeRefundLike {
   status: string | null;
 }
 
+interface StripeRefundEventObject {
+  id: string;
+  amount: number;
+  status: string | null;
+  payment_intent: unknown;
+}
+
 export interface StripeClientLike {
   checkout: {
     sessions: {
@@ -246,6 +253,11 @@ export async function processStripeEvent({
 }: ProcessStripeEventOptions): Promise<ProcessStripeEventResult> {
   assertStripeEvent(event);
 
+  if (event.type === "refund.updated" || event.type === "refund.failed") {
+    const result = await processRefundLifecycleEvent({ supabase, stripe, event });
+    await recordStripeEventBestEffort(supabase, event);
+    return result;
+  }
   if (event.type === "checkout.session.async_payment_failed") {
     const result = await processCheckoutSessionAsyncPaymentFailed(supabase, event);
     await recordStripeEventBestEffort(supabase, event);
@@ -414,50 +426,15 @@ async function processCheckoutSessionMoneyEvent({
     };
   }
   if (reconciliation === "refund" || reconciliation === "refund_missing_user") {
-    const cleanupLateCustomer = reconciliation === "refund_missing_user";
-    let createdRefund: StripeRefundLike;
-    try {
-      createdRefund = await stripe.refunds.create(
-        { payment_intent: paymentIntentId },
-        { idempotencyKey: `checkout-deletion:${sessionId}` },
-      );
-    } catch (error) {
-      if (
-        !isStripeAlreadyRefundedError(error) ||
-        !(await isPaymentIntentFullyRefunded(stripe, paymentIntentId, amountCents))
-      ) {
-        throw error;
-      }
-      await markCheckoutRefunded(supabase, sessionId, event.id);
-      if (cleanupLateCustomer) {
-        await completeLateCustomerCleanup(supabase, stripe, sessionId);
-      }
-      return {
-        handled: true,
-        duplicate: false,
-        reconciliation: "deletion_race_refunded",
-      };
-    }
-
-    const refundId = validateNonEmptyString(createdRefund.id, "refund id");
-    const refund = await stripe.refunds.retrieve(refundId);
-    if (refund.status === "failed" || refund.status === "canceled") {
-      await recordCheckoutRefundFailure(supabase, sessionId, event.id, refundId, refund.status);
-      throw new BillingError(
-        "refund_terminal_failure",
-        `The deletion-race refund reached terminal status ${refund.status}`,
-      );
-    }
-    if (refund.status !== "succeeded") {
-      throw new BillingError(
-        "refund_incomplete",
-        "The deletion-race refund has not succeeded",
-      );
-    }
-    await markCheckoutRefunded(supabase, sessionId, event.id);
-    if (cleanupLateCustomer) {
-      await completeLateCustomerCleanup(supabase, stripe, sessionId);
-    }
+    await performDeletionRefund({
+      supabase,
+      stripe,
+      sessionId,
+      eventId: event.id,
+      paymentIntentId,
+      amountCents,
+      cleanupLateCustomer: reconciliation === "refund_missing_user",
+    });
     return {
       handled: true,
       duplicate: false,
@@ -466,6 +443,169 @@ async function processCheckoutSessionMoneyEvent({
   }
 
   return { handled: true, duplicate: false };
+}
+
+async function processRefundLifecycleEvent({
+  supabase,
+  stripe,
+  event,
+}: ProcessStripeEventOptions): Promise<ProcessStripeEventResult> {
+  const refund = getObject<StripeRefundEventObject>(event);
+  const refundId = validateNonEmptyString(refund.id, "refund id");
+  const paymentIntentId = validateNonEmptyString(
+    readStripeObjectId(refund.payment_intent),
+    "payment_intent",
+  );
+  const amountCents = validateCheckoutAmount(refund.amount);
+  const status = validateNonEmptyString(refund.status, "refund status");
+  const { data, error } = await (supabase.rpc(
+    "checkout_lifecycle_reconcile_refund_event",
+    {
+      refund_id: refundId,
+      event_id: event.id,
+      refund_status: status,
+      refund_amount: amountCents,
+      payment_intent_id: paymentIntentId,
+    },
+  ) as PromiseLike<SupabaseQueryResult<unknown>>);
+  if (error !== null) {
+    throw databaseError("Failed to reconcile Stripe Refund event", error);
+  }
+  if (!isRecord(data) || typeof data.status !== "string") {
+    throw databaseError("Invalid Stripe Refund reconciliation response", {
+      message: "checkout_lifecycle_reconcile_refund_event returned an invalid result",
+    });
+  }
+  if (data.status === "ignored") {
+    return { handled: false, duplicate: false };
+  }
+  if (data.status === "pending" || data.status === "refunded") {
+    return { handled: true, duplicate: data.status === "refunded" };
+  }
+  const sessionId = validateNonEmptyString(data.checkout_session_id, "checkout session id");
+  const cleanupLateCustomer = data.customer_cleanup_pending === true;
+  if (data.status === "refunded_cleanup_pending") {
+    await completeLateCustomerCleanup(supabase, stripe, sessionId);
+    return { handled: true, duplicate: false, reconciliation: "deletion_race_refunded" };
+  }
+  if (data.status !== "retry_required") {
+    throw databaseError("Invalid Stripe Refund reconciliation status", {
+      message: `Unknown refund lifecycle status: ${data.status}`,
+    });
+  }
+
+  const refundSummary = await inspectPaymentIntentRefunds(stripe, paymentIntentId);
+  const refundedCents = refundSummary.succeededCents;
+  if (refundedCents === amountCents) {
+    await markCheckoutRefunded(supabase, sessionId, event.id);
+    if (cleanupLateCustomer) {
+      await completeLateCustomerCleanup(supabase, stripe, sessionId);
+    }
+    return { handled: true, duplicate: false, reconciliation: "deletion_race_refunded" };
+  }
+  if (refundedCents !== 0) {
+    throw new BillingError(
+      "refund_terminal_failure",
+      "The PaymentIntent has a partial succeeded refund and cannot be retried as a full refund",
+    );
+  }
+  if (refundSummary.hasNonterminal) {
+    throw new BillingError(
+      "refund_incomplete",
+      "The PaymentIntent still has a nonterminal Refund and is not safe to retry",
+    );
+  }
+  await performDeletionRefund({
+    supabase,
+    stripe,
+    sessionId,
+    eventId: event.id,
+    paymentIntentId,
+    amountCents,
+    cleanupLateCustomer,
+  });
+  return { handled: true, duplicate: false, reconciliation: "deletion_race_refunded" };
+}
+
+async function performDeletionRefund({
+  supabase,
+  stripe,
+  sessionId,
+  eventId,
+  paymentIntentId,
+  amountCents,
+  cleanupLateCustomer,
+}: {
+  supabase: SupabaseClientLike;
+  stripe: Pick<StripeClientLike, "customers" | "refunds">;
+  sessionId: string;
+  eventId: string;
+  paymentIntentId: string;
+  amountCents: number;
+  cleanupLateCustomer: boolean;
+}): Promise<void> {
+  const prepared = await (supabase.rpc("checkout_lifecycle_prepare_refund_attempt", {
+    checkout_session_id: sessionId,
+  }) as PromiseLike<SupabaseQueryResult<unknown>>);
+  if (prepared.error !== null) {
+    throw databaseError("Failed to prepare Checkout Session refund attempt", prepared.error);
+  }
+  if (
+    !isRecord(prepared.data) ||
+    !Number.isSafeInteger(prepared.data.attempt) ||
+    Number(prepared.data.attempt) <= 0
+  ) {
+    throw new BillingError("refund_incomplete", "A Checkout Session refund attempt is already pending");
+  }
+  const attempt = Number(prepared.data.attempt);
+  let createdRefund: StripeRefundLike;
+  try {
+    createdRefund = await stripe.refunds.create(
+      { payment_intent: paymentIntentId },
+      { idempotencyKey: `checkout-deletion:${sessionId}:attempt:${attempt}` },
+    );
+  } catch (error) {
+    if (
+      !isStripeAlreadyRefundedError(error) ||
+      !(await isPaymentIntentFullyRefunded(stripe, paymentIntentId, amountCents))
+    ) {
+      throw error;
+    }
+    await markCheckoutRefunded(supabase, sessionId, eventId);
+    if (cleanupLateCustomer) {
+      await completeLateCustomerCleanup(supabase, stripe, sessionId);
+    }
+    return;
+  }
+
+  const refundId = validateNonEmptyString(createdRefund.id, "refund id");
+  const recorded = await (supabase.rpc("checkout_lifecycle_record_refund_attempt", {
+    checkout_session_id: sessionId,
+    event_id: eventId,
+    refund_id: refundId,
+    attempt,
+  }) as PromiseLike<SupabaseQueryResult<unknown>>);
+  if (recorded.error !== null) {
+    throw databaseError("Failed to record Checkout Session refund attempt", recorded.error);
+  }
+  const refund = await stripe.refunds.retrieve(refundId);
+  if (refund.status === "failed" || refund.status === "canceled") {
+    await recordCheckoutRefundFailure(supabase, sessionId, eventId, refundId, refund.status);
+    throw new BillingError(
+      "refund_terminal_failure",
+      `The deletion-race refund reached terminal status ${refund.status}`,
+    );
+  }
+  if (refund.status !== "succeeded") {
+    throw new BillingError("refund_incomplete", "The deletion-race refund has not succeeded");
+  }
+  if (refund.amount !== amountCents) {
+    throw new BillingError("refund_terminal_failure", "The deletion-race refund was not for the full amount");
+  }
+  await markCheckoutRefunded(supabase, sessionId, eventId);
+  if (cleanupLateCustomer) {
+    await completeLateCustomerCleanup(supabase, stripe, sessionId);
+  }
 }
 
 async function reconcileCheckoutCompletion(
@@ -520,6 +660,12 @@ async function completeLateCustomerCleanup(
   if (cleanupResult.error !== null) {
     throw databaseError("Failed to read late Stripe customer cleanup", cleanupResult.error);
   }
+  if (cleanupResult.data === null) {
+    return;
+  }
+  if (isRecord(cleanupResult.data) && cleanupResult.data.pending === false) {
+    return;
+  }
   if (
     !isRecord(cleanupResult.data) ||
     cleanupResult.data.pending !== true ||
@@ -573,9 +719,23 @@ async function isPaymentIntentFullyRefunded(
   paymentIntentId: string,
   amountCents: number,
 ): Promise<boolean> {
-  let refundedCents = 0;
-  let startingAfter: string | undefined;
+  return (await inspectPaymentIntentRefunds(stripe, paymentIntentId)).succeededCents >= amountCents;
+}
 
+async function getSucceededRefundedCents(
+  stripe: Pick<StripeClientLike, "refunds">,
+  paymentIntentId: string,
+): Promise<number> {
+  return (await inspectPaymentIntentRefunds(stripe, paymentIntentId)).succeededCents;
+}
+
+async function inspectPaymentIntentRefunds(
+  stripe: Pick<StripeClientLike, "refunds">,
+  paymentIntentId: string,
+): Promise<{ succeededCents: number; hasNonterminal: boolean }> {
+  let succeededCents = 0;
+  let hasNonterminal = false;
+  let startingAfter: string | undefined;
   for (;;) {
     const page = await stripe.refunds.list({
       payment_intent: paymentIntentId,
@@ -584,18 +744,17 @@ async function isPaymentIntentFullyRefunded(
     });
     for (const refund of page.data) {
       if (refund.status === "succeeded" && Number.isSafeInteger(refund.amount) && refund.amount > 0) {
-        refundedCents += refund.amount;
+        succeededCents += refund.amount;
+      } else if (refund.status !== "failed" && refund.status !== "canceled") {
+        hasNonterminal = true;
       }
     }
-    if (refundedCents >= amountCents) {
-      return true;
-    }
     if (!page.has_more) {
-      return false;
+      return { succeededCents, hasNonterminal };
     }
     const lastRefund = page.data.at(-1);
     if (lastRefund === undefined) {
-      return false;
+      return { succeededCents, hasNonterminal };
     }
     startingAfter = lastRefund.id;
   }

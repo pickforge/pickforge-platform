@@ -401,8 +401,10 @@ describe("@pickforge/edge-shared", () => {
       args: { target_user: USER_ID },
     });
     expect(stripe.checkout.sessions.expire).toHaveBeenCalledWith("cs_first");
-    expect(stripe.checkout.sessions.expire.mock.invocationCallOrder[0]!).toBeLessThan(
-      admin.auth.admin.deleteUser.mock.invocationCallOrder[0]!,
+    expect(
+      admin.rpcCalls.findIndex(({ fn }) => fn === "checkout_lifecycle_delete_auth_user"),
+    ).toBeGreaterThan(
+      admin.rpcCalls.findIndex(({ fn }) => fn === "checkout_lifecycle_mark_expired"),
     );
   });
 
@@ -512,7 +514,7 @@ describe("@pickforge/edge-shared", () => {
 
     expect(response.status).toBe(200);
     expect(stripe.customers.del).toHaveBeenCalledWith("cus_late_refunded");
-    expect(admin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
+    expect(admin.rpcCalls).toContainEqual({ fn: "checkout_lifecycle_delete_auth_user", args: { target_user: USER_ID } });
   });
 
   it("fails closed when lifecycle discovery never reaches a fixpoint", async () => {
@@ -641,7 +643,7 @@ describe("@pickforge/edge-shared", () => {
 
     expect(response.status).toBe(200);
     expect(stripe.customers.del).toHaveBeenCalledWith("cus_locked_refunded");
-    expect(admin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
+    expect(admin.rpcCalls).toContainEqual({ fn: "checkout_lifecycle_delete_auth_user", args: { target_user: USER_ID } });
   });
 
   it("deletes safely with a pre-lifecycle credited Session backfilled as completed", async () => {
@@ -666,7 +668,7 @@ describe("@pickforge/edge-shared", () => {
     expect(response.status).toBe(200);
     expect(stripe.checkout.sessions.expire).not.toHaveBeenCalled();
     expect(stripe.customers.del).toHaveBeenCalledWith("cus_pre_lifecycle_credited");
-    expect(admin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
+    expect(admin.rpcCalls).toContainEqual({ fn: "checkout_lifecycle_delete_auth_user", args: { target_user: USER_ID } });
   });
 
   it("rechecks and deletes a customer terminalized after the first frozen snapshot", async () => {
@@ -711,7 +713,7 @@ describe("@pickforge/edge-shared", () => {
     expect(response.status).toBe(200);
     expect(stripe.customers.del).toHaveBeenCalledWith("cus_initial");
     expect(stripe.customers.del).toHaveBeenCalledWith("cus_late");
-    expect(admin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
+    expect(admin.rpcCalls).toContainEqual({ fn: "checkout_lifecycle_delete_auth_user", args: { target_user: USER_ID } });
   });
 
   it("keeps deletion retryable when expiry fails after earlier Sessions were expired", async () => {
@@ -749,7 +751,7 @@ describe("@pickforge/edge-shared", () => {
     failSecond = false;
     const retried = await handler(new Request("https://edge.test", { method: "POST" }));
     expect(retried.status).toBe(200);
-    expect(admin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
+    expect(admin.rpcCalls).toContainEqual({ fn: "checkout_lifecycle_delete_auth_user", args: { target_user: USER_ID } });
   });
 
   it("classifies expired and reconciled-completed races but blocks unreconciled completion", async () => {
@@ -782,7 +784,7 @@ describe("@pickforge/edge-shared", () => {
     await expect(safeHandler(new Request("https://edge.test", { method: "POST" }))).resolves.toMatchObject({
       status: 200,
     });
-    expect(safeAdmin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
+    expect(safeAdmin.rpcCalls).toContainEqual({ fn: "checkout_lifecycle_delete_auth_user", args: { target_user: USER_ID } });
     expect(safeStripe.customers.del).toHaveBeenCalledWith("cus_refunded");
 
     const unsafeAdmin = accountAdmin({}, {}, {
@@ -857,26 +859,14 @@ describe("@pickforge/edge-shared", () => {
 
     const missing = await missingHandler(new Request("https://edge.test", { method: "POST" }));
     expect(missing.status).toBe(200);
-    expect(missingAdmin.auth.admin.deleteUser).toHaveBeenCalledWith(USER_ID);
+    expect(missingAdmin.rpcCalls).toContainEqual({ fn: "checkout_lifecycle_delete_auth_user", args: { target_user: USER_ID } });
   });
 
-  it("treats a missing auth user as deleted and returns 500 for other deletion failures", async () => {
-    const missingUserAdmin = accountAdmin();
-    missingUserAdmin.auth.admin.deleteUser.mockResolvedValue({
-      error: { code: "user_not_found", message: "User not found" },
-    });
-    const missingUserHandler = createDeleteAccountHandler({
-      admin: missingUserAdmin,
-      stripe: deletionStripe(),
-      resolveUserId: vi.fn(async () => USER_ID),
-    });
-
-    const missingUserResponse = await missingUserHandler(new Request("https://edge.test", { method: "POST" }));
-    expect(missingUserResponse.status).toBe(200);
-
-    const failedDeleteAdmin = accountAdmin();
-    failedDeleteAdmin.auth.admin.deleteUser.mockResolvedValue({
-      error: { message: "Database unavailable" },
+  it("returns 500 when the atomic auth-deletion RPC fails", async () => {
+    const failedDeleteAdmin = accountAdmin({}, {}, {
+      errors: {
+        checkout_lifecycle_delete_auth_user: { message: "Database unavailable" },
+      },
     });
     const failedDeleteHandler = createDeleteAccountHandler({
       admin: failedDeleteAdmin,
@@ -886,6 +876,7 @@ describe("@pickforge/edge-shared", () => {
 
     const failedDeleteResponse = await failedDeleteHandler(new Request("https://edge.test", { method: "POST" }));
     expect(failedDeleteResponse.status).toBe(500);
+    expect(failedDeleteAdmin.auth.admin.deleteUser).not.toHaveBeenCalled();
   });
 
   it("returns unauthorized for account deletion without an authenticated user", async () => {
@@ -1583,13 +1574,6 @@ function accountAdmin(
         );
         if (unsafe) {
           return { data: "unsafe" as T, error: null };
-        }
-        const result = await deleteUser(String(args?.target_user));
-        if (result.error?.code === "user_not_found") {
-          return { data: "deleted" as T, error: null };
-        }
-        if (result.error !== null) {
-          return { data: null, error: result.error };
         }
         return { data: "deleted" as T, error: null };
       }

@@ -1,6 +1,6 @@
 begin;
 
-select plan(75);
+select plan(82);
 
 select ok(
   not has_schema_privilege('anon', 'checkout_lifecycle_private', 'usage'),
@@ -362,6 +362,17 @@ select is(
   'refund_pending',
   'refund work remains durable until Stripe compensation succeeds'
 );
+select is(
+  (public.checkout_lifecycle_prepare_refund_attempt('cs_raced') ->> 'attempt')::integer,
+  1,
+  'the initial refund attempt receives a durable attempt number'
+);
+select lives_ok(
+  $$select public.checkout_lifecycle_record_refund_attempt(
+    'cs_raced', 'evt_raced', 're_failed', 1
+  )$$,
+  'the initial Stripe Refund id is durably attached to its attempt'
+);
 select lives_ok(
   $$select public.checkout_lifecycle_record_refund_failure(
     'cs_raced',
@@ -389,9 +400,27 @@ select is(
   're_failed',
   'terminal refund records the Stripe Refund id for manual resolution'
 );
+select is(
+  (public.checkout_lifecycle_prepare_refund_attempt('cs_raced') ->> 'attempt')::integer,
+  2,
+  'a terminal Refund permits exactly one new attempt number'
+);
 select lives_ok(
-  $$select public.checkout_lifecycle_mark_refunded('cs_raced', 'evt_raced')$$,
-  'successful compensation marks the Session refunded'
+  $$select public.checkout_lifecycle_record_refund_attempt(
+    'cs_raced', 'evt_raced_retry', 're_retry', 2
+  )$$,
+  'the retry persists a distinct Stripe Refund id'
+);
+select is(
+  public.checkout_lifecycle_reconcile_refund_event(
+    're_retry',
+    'evt_refund_succeeded',
+    'succeeded',
+    2500,
+    'pi_raced'
+  ) ->> 'status',
+  'refunded',
+  'a signed full succeeded Refund terminalizes compensation'
 );
 select is(
   (
@@ -414,6 +443,17 @@ select is(
   ),
   'refunded',
   'a compensated completion is idempotently terminal'
+);
+select is(
+  public.checkout_lifecycle_reconcile_refund_event(
+    're_unknown',
+    'evt_unknown_refund',
+    'succeeded',
+    2500,
+    'pi_unknown'
+  ) ->> 'status',
+  'ignored',
+  'an unknown Refund cannot mutate lifecycle state'
 );
 
 select is(
@@ -682,6 +722,14 @@ select is(
 select lives_ok(
   $$select public.checkout_lifecycle_complete_customer_cleanup('cs_after_delete')$$,
   'late missing-user Stripe customer cleanup can be durably acknowledged'
+);
+select lives_ok(
+  $$select public.checkout_lifecycle_complete_customer_cleanup('cs_after_delete')$$,
+  'replayed customer cleanup is idempotent after pending work is cleared'
+);
+select lives_ok(
+  $$select public.checkout_lifecycle_complete_customer_cleanup('cs_unknown_cleanup')$$,
+  'unknown customer cleanup is an idempotent no-op'
 );
 select is(
   public.checkout_lifecycle_reconcile_completion(

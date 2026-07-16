@@ -1,0 +1,23 @@
+{
+  "$schema": "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json",
+  "mcpServers": {
+    "supabase-pickforge-pro-dev": {
+      "type": "http",
+      "url": "https://mcp.supabase.com/mcp?project_ref=trmlnarhgiutgsoancrl"
+    },
+    "vercel": {
+      "type": "http",
+      "url": "https://mcp.vercel.com/"
+    },
+    "stripe": {
+      "type": "http",
+      "url": "https://mcp.stripe.com",
+      "oauth": {
+        "clientId": "oacli_UsBlZ6jiucaNw9",
+        "redirectUri": "http://127.0.0.1:3000/callback",
+        "callbackPort": 3000,
+        "callbackPath": "/callback"
+      }
+    }
+  }
+}

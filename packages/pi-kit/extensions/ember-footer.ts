@@ -25,6 +25,29 @@ function fmtTokens(count: number): string {
 export default function emberFooter(pi: ExtensionAPI) {
   let enabled = true;
 
+  // Cost accumulation is O(session length); cache it and refresh only when the
+  // branch entry count changes instead of walking the branch every render frame.
+  let cachedCost = 0;
+  let cachedEntryCount = -1;
+
+  function sessionCost(ctx: ExtensionContext): number {
+    try {
+      const branch = ctx.sessionManager.getBranch();
+      if (branch.length !== cachedEntryCount) {
+        cachedEntryCount = branch.length;
+        cachedCost = 0;
+        for (const entry of branch) {
+          if (entry.type === "message" && entry.message.role === "assistant") {
+            cachedCost += (entry.message as AssistantMessage).usage.cost.total;
+          }
+        }
+      }
+    } catch {
+      // Footer must never break the session.
+    }
+    return cachedCost;
+  }
+
   function install(ctx: ExtensionContext): void {
     if (!ctx.hasUI) return;
     ctx.ui.setFooter((tui, theme, footerData) => {
@@ -35,20 +58,11 @@ export default function emberFooter(pi: ExtensionAPI) {
         dispose: unsubscribe,
         invalidate() {},
         render(width: number): string[] {
-          // Context usage from the session branch.
-          let tokens = 0;
-          let cost = 0;
+          const cost = sessionCost(ctx);
           let contextTokens: number | null = null;
           let contextWindow = 0;
           try {
-            for (const entry of ctx.sessionManager.getBranch()) {
-              if (entry.type === "message" && entry.message.role === "assistant") {
-                const message = entry.message as AssistantMessage;
-                tokens += message.usage.input + message.usage.output;
-                cost += message.usage.cost.total;
-              }
-            }
-            const usage = ctx.getContextUsage?.();
+            const usage = ctx.getContextUsage();
             contextTokens = usage?.tokens ?? null;
             contextWindow = usage?.contextWindow ?? 0;
           } catch {

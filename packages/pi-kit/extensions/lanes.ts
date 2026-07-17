@@ -10,7 +10,6 @@ interface LastRun {
   runner: LaneRunner;
   projection: RunProjection;
   hidden: boolean;
-  clearTimer?: NodeJS.Timeout;
 }
 
 interface SpawnLaneInput {
@@ -33,26 +32,102 @@ function renderWidget(ctx: WidgetContext, run: LastRun): void {
   }
 }
 
+const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+let spinnerTick = 0;
+
+function shortModel(selector: string): string {
+  return selector.slice(selector.indexOf("/") + 1);
+}
+
+function fmtTokens(count: number): string {
+  if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+  if (count >= 1_000) return `${(count / 1_000).toFixed(1)}k`;
+  return `${count}`;
+}
+
+function fmtDuration(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
+}
+
 function renderWidgetUnsafe(ctx: WidgetContext, run: LastRun): void {
+  const theme = ctx.ui.theme;
   const lanes = [...run.projection.lanes.values()];
-  const glyphs: Record<LaneProjection["state"], string> = {
-    queued: "◷",
-    running: "●",
-    done: "✔",
-    failed: "✖",
-    abandoned: "⊘",
+  spinnerTick = (spinnerTick + 1) % SPINNER.length;
+
+  const stateGlyph = (state: LaneProjection["state"]): string => {
+    switch (state) {
+      case "queued":
+        return theme.fg("dim", "◌");
+      case "running":
+        return theme.fg("accent", SPINNER[spinnerTick]!);
+      case "done":
+        return theme.fg("success", "✔");
+      case "failed":
+        return theme.fg("error", "✖");
+      case "abandoned":
+        return theme.fg("warning", "⊘");
+    }
   };
+
+  const done = lanes.filter((l) => l.state === "done").length;
+  const running = lanes.filter((l) => l.state === "running").length;
+  const failed = lanes.filter((l) => l.state === "failed" || l.state === "abandoned").length;
+  const settled = done + failed;
+
+  const progress = lanes
+    .map((l) =>
+      l.state === "done"
+        ? theme.fg("success", "■")
+        : l.state === "running"
+          ? theme.fg("accent", "▣")
+          : l.state === "queued"
+            ? theme.fg("dim", "□")
+            : theme.fg("error", "■"),
+    )
+    .join("");
+
+  const dot = theme.fg("dim", " · ");
+  const header = [
+    theme.fg("accent", "▸ lanes"),
+    theme.fg("muted", run.id),
+    `${progress} ${theme.fg("text", `${settled}/${lanes.length}`)}`,
+    theme.fg("warning", `$${run.projection.totalCost.toFixed(4)}`),
+    theme.fg("muted", `↑${fmtTokens(run.projection.totalTokensIn)} ↓${fmtTokens(run.projection.totalTokensOut)}`),
+  ].join(dot);
+
+  const nameWidth = Math.min(24, Math.max(...lanes.map((l) => l.spec.lane.length), 4));
   const lines = [
-    `run ${run.id} · ${lanes.length} lanes · $${run.projection.totalCost.toFixed(4)} · ${run.projection.totalTokensIn}/${run.projection.totalTokensOut} tokens`,
+    header,
     ...lanes.map((lane) => {
-      const prefix = `${glyphs[lane.state]} ${lane.spec.lane} · ${lane.spec.model}:${lane.spec.effort} · tok ${lane.tokensIn}/${lane.tokensOut} · $${lane.cost.toFixed(4)}`;
-      const activity = lane.currentTool ?? lane.lastStatus ?? "";
-      return activity ? `${prefix} · ${activity}`.slice(0, 100) : prefix.slice(0, 100);
+      const name =
+        lane.state === "running"
+          ? theme.fg("text", lane.spec.lane.padEnd(nameWidth))
+          : theme.fg("muted", lane.spec.lane.padEnd(nameWidth));
+      const model = theme.fg("dim", `${shortModel(lane.spec.model)}:${lane.spec.effort}`);
+      const tokens = theme.fg("muted", `↑${fmtTokens(lane.tokensIn)} ↓${fmtTokens(lane.tokensOut)}`);
+      const cost = theme.fg("warning", `$${lane.cost.toFixed(4)}`);
+      const parts = [`${stateGlyph(lane.state)} ${name}`, model, tokens, cost];
+      if (lane.durationMs !== undefined) parts.push(theme.fg("dim", fmtDuration(lane.durationMs)));
+      if (lane.state === "failed" || lane.state === "abandoned") {
+        parts.push(theme.fg("error", (lane.abandonReason ?? "failed").slice(0, 40)));
+      } else {
+        const activity = lane.currentTool ?? lane.lastStatus ?? "";
+        if (activity) parts.push(theme.fg("dim", activity.slice(0, 44)));
+      }
+      return `  ${parts.join(dot)}`;
     }),
   ];
   ctx.ui.setWidget("pi-lanes", lines);
-  const running = lanes.filter((lane) => lane.state === "running").length;
-  ctx.ui.setStatus("pi-lanes", running > 0 ? `${running} running · $${run.projection.totalCost.toFixed(4)}` : undefined);
+  ctx.ui.setStatus(
+    "pi-lanes",
+    running > 0
+      ? theme.fg("accent", `▸ ${running} lane${running === 1 ? "" : "s"} running · $${run.projection.totalCost.toFixed(4)}`)
+      : failed > 0
+        ? theme.fg("error", `▸ lanes: ${done}✔ ${failed}✖`)
+        : theme.fg("success", `▸ lanes: ${done}/${lanes.length} ✔`),
+  );
 }
 
 export default function lanesExtension(pi: ExtensionAPI): void {
@@ -121,7 +196,6 @@ export default function lanesExtension(pi: ExtensionAPI): void {
         });
         runner = activeRunner;
         view = { id: runId, runner: activeRunner, projection: activeRunner.projection(), hidden: false };
-        clearTimeout(lastRun?.clearTimer);
         lastRun = view;
         renderWidget(ctx, view);
 
@@ -139,22 +213,8 @@ export default function lanesExtension(pi: ExtensionAPI): void {
           ok,
           durationMs: Date.now() - startedAt,
         });
+        // Widget stays visible after completion; only /lanes hide or a new run replaces it.
         renderWidget(ctx, view);
-        if (ctx.hasUI) {
-          const closingView = view;
-          closingView.clearTimer = setTimeout(() => {
-            if (lastRun === closingView) {
-              closingView.hidden = true;
-              try {
-                ctx.ui.setWidget("pi-lanes", undefined);
-                ctx.ui.setStatus("pi-lanes", undefined);
-              } catch {
-                // UI teardown races are non-fatal.
-              }
-            }
-          }, 30_000);
-          closingView.clearTimer.unref();
-        }
 
         const text = projections
           .map((lane) => {
@@ -195,10 +255,14 @@ export default function lanesExtension(pi: ExtensionAPI): void {
       }
       if (command === "abandon") {
         if (!lane) {
-          ctx.ui.notify("Usage: /lanes abandon <lane>", "warning");
+          ctx.ui.notify("Usage: /lanes abandon <lane|all>", "warning");
           return;
         }
-        lastRun.runner.abandon(lane, "user");
+        if (lane === "all") {
+          lastRun.runner.abandonAll("user");
+        } else {
+          lastRun.runner.abandon(lane, "user");
+        }
         renderWidget(ctx, lastRun);
         return;
       }
@@ -212,13 +276,11 @@ export default function lanesExtension(pi: ExtensionAPI): void {
         return;
       }
       if (command === "show") {
-        clearTimeout(lastRun.clearTimer);
-        lastRun.clearTimer = undefined;
         lastRun.hidden = false;
         renderWidget(ctx, lastRun);
         return;
       }
-      ctx.ui.notify("Usage: /lanes [show|hide|last|abandon <lane>]", "warning");
+      ctx.ui.notify("Usage: /lanes [show|hide|last|abandon <lane|all>]", "warning");
     },
   });
 }

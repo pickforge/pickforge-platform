@@ -128,6 +128,10 @@ export function decideGate(mode: DeliveryMode, command: string): GateDecision {
 export default function (pi: ExtensionAPI) {
   let mode: DeliveryMode = "local";
 
+  pi.on("session_start", async (_event, ctx) => {
+    if (ctx.hasUI) ctx.ui.setStatus("mode", `mode: ${mode}`);
+  });
+
   pi.registerCommand("mode", {
     description: "Show or set the delivery-mode gate (plan-only | local | ship)",
     handler: async (args, ctx) => {
@@ -142,7 +146,7 @@ export default function (pi: ExtensionAPI) {
       }
       mode = arg;
       ctx.ui.notify(`mode: ${mode}`, "info");
-      ctx.ui.setStatus("mode", mode === "local" ? undefined : `mode: ${mode}`);
+      ctx.ui.setStatus("mode", `mode: ${mode}`);
       try {
         pi.appendEntry("pikit-mode", { mode });
       } catch {

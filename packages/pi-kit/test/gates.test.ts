@@ -76,3 +76,47 @@ describe("decideGate — catastrophic rm -rf, all modes", () => {
     });
   }
 });
+
+describe("decideGate — review regressions", () => {
+  it("blocks git -C <dir> push in plan-only", () => {
+    expect(decideGate("plan-only", "git -C /some/repo push origin main").block).toBe(true);
+  });
+
+  it("blocks git --git-dir=.git push in local", () => {
+    expect(decideGate("local", "git --git-dir=.git push").block).toBe(true);
+  });
+
+  it("blocks git -c user.name=x commit in plan-only", () => {
+    expect(decideGate("plan-only", "git -c user.name=x commit -m hi").block).toBe(true);
+  });
+
+  it("allows git merge-base in plan-only", () => {
+    expect(decideGate("plan-only", "git merge-base main HEAD").block).toBe(false);
+  });
+
+  it("allows git push-to-checkout style subcommands only when not blocked verbs", () => {
+    expect(decideGate("local", "git push-to-checkout").block).toBe(false);
+  });
+
+  it("blocks absolute-path git binary push in local", () => {
+    expect(decideGate("local", "/usr/bin/git push").block).toBe(true);
+  });
+
+  for (const mode of ["plan-only", "local", "ship"] as const) {
+    it(`blocks rm -r / (no force) in ${mode}`, () => {
+      expect(decideGate(mode, "rm -r /").block).toBe(true);
+    });
+
+    it(`blocks rm -rf /* in ${mode}`, () => {
+      expect(decideGate(mode, "rm -rf /*").block).toBe(true);
+    });
+
+    it(`blocks rm --recursive $HOME/* in ${mode}`, () => {
+      expect(decideGate(mode, "rm --recursive $HOME/*").block).toBe(true);
+    });
+  }
+
+  it("still allows plain recursive rm on a project path chained after build", () => {
+    expect(decideGate("plan-only", "bun run build && rm -rf dist && mkdir dist").block).toBe(false);
+  });
+});

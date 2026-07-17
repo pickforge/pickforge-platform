@@ -26,6 +26,14 @@ type WidgetContext = Pick<ExtensionContext, "hasUI" | "ui">;
 
 function renderWidget(ctx: WidgetContext, run: LastRun): void {
   if (!ctx.hasUI || run.hidden) return;
+  try {
+    renderWidgetUnsafe(ctx, run);
+  } catch {
+    // Widget rendering must never break the runner or the session.
+  }
+}
+
+function renderWidgetUnsafe(ctx: WidgetContext, run: LastRun): void {
   const lanes = [...run.projection.lanes.values()];
   const glyphs: Record<LaneProjection["state"], string> = {
     queued: "◷",
@@ -53,7 +61,7 @@ export default function lanesExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "lanes_spawn",
     label: "Spawn lanes",
-    description: `Run independent Pi lanes concurrently. You MUST state an explicit model and effort for every lane from the current table: ${MODEL_TABLE.map((row) => `${row.selector} (${row.prior})`).join(", ")}.`,
+    description: `Run independent Pi lanes concurrently. You MUST state an explicit model and effort for every lane. Any effort off|minimal|low|medium|high|xhigh is allowed per lane (the value in parentheses is only that model's starting prior). Models: ${MODEL_TABLE.map((row) => `${row.selector} (prior ${row.prior})`).join(", ")}.`,
     parameters: Type.Object({
       lanes: Type.Array(
         Type.Object({
@@ -67,7 +75,7 @@ export default function lanesExtension(pi: ExtensionAPI): void {
         { minItems: 1 },
       ),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const specs: LaneSpec[] = params.lanes.map((lane: SpawnLaneInput, index: number) => ({
         lane: lane.lane?.trim() || `lane-${index + 1}`,
         task: lane.task,
@@ -90,61 +98,84 @@ export default function lanesExtension(pi: ExtensionAPI): void {
 
       const runId = newRunId();
       const startedAt = Date.now();
-      appendEvent({
-        v: 1,
-        t: new Date().toISOString(),
-        run: runId,
-        type: "run_created",
-        lanes: specs.length,
-        origin: "lanes_spawn",
-      });
+      let view: LastRun | undefined;
+      let timer: NodeJS.Timeout | undefined;
+      let runner: LaneRunner | undefined;
+      const onAbort = () => runner?.abandonAll("aborted by parent");
+      try {
+        appendEvent({
+          v: 1,
+          t: new Date().toISOString(),
+          run: runId,
+          type: "run_created",
+          lanes: specs.length,
+          origin: "lanes_spawn",
+        });
 
-      let view: LastRun;
-      const runner = new LaneRunner({
-        runId,
-        append: appendEvent,
-        onUpdate() {
-          if (lastRun === view) renderWidget(ctx, view);
-        },
-      });
-      view = { id: runId, runner, projection: runner.projection(), hidden: false };
-      clearTimeout(lastRun?.clearTimer);
-      lastRun = view;
-      renderWidget(ctx, view);
+        const activeRunner = new LaneRunner({
+          runId,
+          append: appendEvent,
+          onUpdate() {
+            if (view && lastRun === view) renderWidget(ctx, view);
+          },
+        });
+        runner = activeRunner;
+        view = { id: runId, runner: activeRunner, projection: activeRunner.projection(), hidden: false };
+        clearTimeout(lastRun?.clearTimer);
+        lastRun = view;
+        renderWidget(ctx, view);
 
-      const timer = ctx.hasUI ? setInterval(() => renderWidget(ctx, view), 1_000) : undefined;
-      timer?.unref();
-      const projections = await runner.dispatch(specs);
-      clearInterval(timer);
+        signal?.addEventListener("abort", onAbort, { once: true });
+        timer = ctx.hasUI ? setInterval(() => renderWidget(ctx, view!), 1_000) : undefined;
+        timer?.unref();
+        const projections = await activeRunner.dispatch(specs);
 
-      const ok = projections.every((lane) => lane.state === "done");
-      appendEvent({
-        v: 1,
-        t: new Date().toISOString(),
-        run: runId,
-        type: "run_end",
-        ok,
-        durationMs: Date.now() - startedAt,
-      });
-      renderWidget(ctx, view);
-      if (ctx.hasUI) {
-        view.clearTimer = setTimeout(() => {
-          if (lastRun === view) {
-            view.hidden = true;
-            ctx.ui.setWidget("pi-lanes", undefined);
-            ctx.ui.setStatus("pi-lanes", undefined);
-          }
-        }, 30_000);
-        view.clearTimer.unref();
+        const ok = projections.every((lane) => lane.state === "done");
+        appendEvent({
+          v: 1,
+          t: new Date().toISOString(),
+          run: runId,
+          type: "run_end",
+          ok,
+          durationMs: Date.now() - startedAt,
+        });
+        renderWidget(ctx, view);
+        if (ctx.hasUI) {
+          const closingView = view;
+          closingView.clearTimer = setTimeout(() => {
+            if (lastRun === closingView) {
+              closingView.hidden = true;
+              try {
+                ctx.ui.setWidget("pi-lanes", undefined);
+                ctx.ui.setStatus("pi-lanes", undefined);
+              } catch {
+                // UI teardown races are non-fatal.
+              }
+            }
+          }, 30_000);
+          closingView.clearTimer.unref();
+        }
+
+        const text = projections
+          .map((lane) => {
+            const answer = lane.answer?.replace(/\s+/g, " ").trim().slice(0, 400) ?? "";
+            const failure = lane.state !== "done" ? ` · ${lane.abandonReason ?? "failed"}` : "";
+            return `${lane.spec.lane}: ${lane.state} · ${lane.spec.model}:${lane.spec.effort} · tok ${lane.tokensIn}/${lane.tokensOut} · $${lane.cost.toFixed(4)}${failure}${answer ? ` · ${answer}` : ""}`;
+          })
+          .join("\n");
+        return { content: [{ type: "text" as const, text }], details: projections, isError: !ok };
+      } catch (error) {
+        runner?.abandonAll("lanes_spawn error");
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{ type: "text" as const, text: `lanes_spawn failed: ${message}` }],
+          details: { error: message },
+          isError: true,
+        };
+      } finally {
+        clearInterval(timer);
+        signal?.removeEventListener("abort", onAbort);
       }
-
-      const text = projections
-        .map((lane) => {
-          const answer = lane.answer?.replace(/\s+/g, " ").trim().slice(0, 400) ?? "";
-          return `${lane.spec.lane}: ${lane.state} · ${lane.spec.model}:${lane.spec.effort} · tok ${lane.tokensIn}/${lane.tokensOut} · $${lane.cost.toFixed(4)}${answer ? ` · ${answer}` : ""}`;
-        })
-        .join("\n");
-      return { content: [{ type: "text" as const, text }], details: projections };
     },
   });
 

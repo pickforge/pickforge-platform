@@ -30,6 +30,35 @@ interface LaneRuntime {
 
 type JsonRecord = Record<string, unknown>;
 
+const MAX_STDOUT_BUFFER = 4 * 1024 * 1024;
+
+/** Live runners with children, reaped synchronously if the parent dies. */
+const ACTIVE_RUNNERS = new Set<LaneRunner>();
+let exitHookInstalled = false;
+
+function installExitHook(): void {
+  if (exitHookInstalled) return;
+  exitHookInstalled = true;
+  process.once("exit", () => {
+    for (const runner of ACTIVE_RUNNERS) runner.reapAll();
+  });
+}
+
+/** SIGTERM/SIGKILL the child's whole process group, falling back to the direct child. */
+function killTree(child: ChildProcessByStdio<null, Readable, Readable>, signal: NodeJS.Signals): void {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  try {
+    if (child.pid) process.kill(-child.pid, signal);
+    else child.kill(signal);
+  } catch {
+    try {
+      child.kill(signal);
+    } catch {
+      // Process already gone.
+    }
+  }
+}
+
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null;
 }
@@ -103,13 +132,20 @@ export class LaneRunner {
     if (this.dispatching) throw new Error("LaneRunner.dispatch may only be called once");
 
     const violations: string[] = [];
+    const seen = new Set<string>();
     specs.forEach((spec, index) => {
       const reason = validateLaneSpec(spec);
       if (reason) violations.push(`${spec.lane || `lane-${index + 1}`}: ${reason}`);
+      if (spec.lane) {
+        if (seen.has(spec.lane)) violations.push(`${spec.lane}: duplicate lane id`);
+        seen.add(spec.lane);
+      }
     });
     if (violations.length > 0) throw new Error(`Invalid lane specs:\n${violations.join("\n")}`);
 
     this.dispatching = true;
+    installExitHook();
+    ACTIVE_RUNNERS.add(this);
     for (const spec of specs) {
       this.record({ v: 1, t: new Date().toISOString(), run: this.runId, lane: spec.lane, type: "lane_created", spec });
     }
@@ -122,6 +158,7 @@ export class LaneRunner {
       }
     });
     await Promise.all(workers);
+    ACTIVE_RUNNERS.delete(this);
 
     this.live.ended = true;
     this.live.ok = [...this.live.lanes.values()].every((lane) => lane.state === "done");
@@ -137,12 +174,7 @@ export class LaneRunner {
     if (runtime) {
       runtime.settled = true;
       clearTimeout(runtime.statusTimer);
-      runtime.child.kill("SIGTERM");
-      const killTimer = setTimeout(() => {
-        if (runtime.child.exitCode === null && runtime.child.signalCode === null) runtime.child.kill("SIGKILL");
-      }, 5_000);
-      killTimer.unref();
-      runtime.child.once("close", () => clearTimeout(killTimer));
+      this.terminate(runtime);
     }
 
     this.record({ v: 1, t: new Date().toISOString(), run: this.runId, lane, type: "lane_abandoned", reason });
@@ -150,6 +182,26 @@ export class LaneRunner {
       this.runtimes.delete(lane);
       runtime.finish();
     }
+  }
+
+  /** Abandon every non-terminal lane (abort signal, shutdown). */
+  abandonAll(reason: string): void {
+    for (const [lane, projection] of this.live.lanes) {
+      if (!["done", "failed", "abandoned"].includes(projection.state)) this.abandon(lane, reason);
+    }
+  }
+
+  /** Synchronous last-resort kill of every live child. Called from the process exit hook. */
+  reapAll(): void {
+    for (const runtime of this.runtimes.values()) killTree(runtime.child, "SIGKILL");
+  }
+
+  /** SIGTERM the child's process group now, escalate to SIGKILL after 5s. */
+  private terminate(runtime: LaneRuntime): void {
+    killTree(runtime.child, "SIGTERM");
+    const killTimer = setTimeout(() => killTree(runtime.child, "SIGKILL"), 5_000);
+    killTimer.unref();
+    runtime.child.once("close", () => clearTimeout(killTimer));
   }
 
   private record(event: KitEvent): void {
@@ -226,6 +278,7 @@ export class LaneRunner {
           cwd: spec.cwd ?? process.cwd(),
           env: { ...process.env, PIKIT_CHILD: "1" },
           stdio: ["ignore", "pipe", "pipe"],
+          detached: true,
         },
       );
 
@@ -251,6 +304,7 @@ export class LaneRunner {
         runtime.settled = true;
         clearTimeout(runtime.statusTimer);
         this.runtimes.delete(spec.lane);
+        this.terminate(runtime);
         this.record({
           v: 1,
           t: new Date().toISOString(),
@@ -374,6 +428,10 @@ export class LaneRunner {
       });
       child.stdout.setEncoding("utf8");
       child.stdout.on("data", (chunk: string) => {
+        if (runtime.stdoutBuffer.length + chunk.length > MAX_STDOUT_BUFFER) {
+          finish(false, runtime.answer, "stdout-overflow");
+          return;
+        }
         runtime.stdoutBuffer += chunk;
         const lines = runtime.stdoutBuffer.split("\n");
         runtime.stdoutBuffer = lines.pop() ?? "";

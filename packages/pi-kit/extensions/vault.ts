@@ -36,12 +36,16 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const dir = process.env[VAULT_DIR_ENV] ?? DEFAULT_VAULT_DIR;
-      const sessionId = ctx.sessionManager.getSessionFile();
-      const source = sessionId ? `pi session ${sessionId}` : `pi session (cwd: ${ctx.cwd})`;
+      try {
+        const dir = process.env[VAULT_DIR_ENV] ?? DEFAULT_VAULT_DIR;
+        const sessionId = ctx.sessionManager.getSessionFile();
+        const source = sessionId ? `pi session ${sessionId}` : `pi session (cwd: ${ctx.cwd})`;
 
-      const path = appendPromotion(dir, text, source);
-      ctx.ui.notify(`promoted to ${path}`, "info");
+        const path = appendPromotion(dir, text, source);
+        ctx.ui.notify(`promoted to ${path}`, "info");
+      } catch (error) {
+        ctx.ui.notify(`promote failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+      }
     },
   });
 }

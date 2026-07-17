@@ -4,6 +4,7 @@ import { BANNED, EFFORT_PINS } from "../src/table.ts";
 
 export default function tablePolicy(pi: ExtensionAPI) {
   pi.on("model_select", async (event, ctx) => {
+    try {
     const selected = `${event.model.provider}/${event.model.id}`;
     if (BANNED.some((pattern) => pattern.test(selected))) {
       const previous = event.previousModel;
@@ -26,6 +27,9 @@ export default function tablePolicy(pi: ExtensionAPI) {
     if (pin && pi.getThinkingLevel() !== pin.level) {
       pi.setThinkingLevel(pin.level);
       ctx.ui.notify(`pi-kit: ${selected} pinned to ${pin.level} effort`, "info");
+    }
+    } catch {
+      // Policy enforcement must never break the session; the shared AGENTS rules still apply.
     }
   });
 

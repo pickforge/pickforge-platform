@@ -44,15 +44,26 @@ export default function delegation(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", () => {
     if (counts.direct + counts.lanes === 0 || !sessionId) return;
+    // Dedicated "delegation" lane: never clobbers journal.ts's "main" lane status,
+    // and lane_created makes the status resolvable by reduceRun on its own.
+    const run = `sess-${sessionId}`;
+    const t = new Date().toISOString();
     try {
       appendEvent({
         v: 1,
-        t: new Date().toISOString(),
-        run: `sess-${sessionId}`,
-        type: "lane_status",
-        lane: "main",
-        text: summarize(counts),
+        t,
+        run,
+        type: "lane_created",
+        lane: "delegation",
+        spec: {
+          lane: "delegation",
+          task: "delegation-ratio observability",
+          model: "none/none",
+          effort: "off",
+          rationale: "session accounting",
+        },
       });
+      appendEvent({ v: 1, t, run, type: "lane_status", lane: "delegation", text: summarize(counts) });
     } catch {
       // Journal is best effort.
     }

@@ -11,7 +11,12 @@
       "extensions/lanes.ts",
       "extensions/gates.ts",
       "extensions/delegation.ts",
-      "extensions/vault.ts"
+      "extensions/vault.ts",
+      "extensions/compact-tools.ts",
+      "extensions/ember-footer.ts"
+    ],
+    "themes": [
+      "themes"
     ]
   },
   "scripts": {
@@ -22,6 +27,8 @@
     "@earendil-works/pi-coding-agent": "0.79.10",
     "typescript": "^5.6.0",
     "vitest": "^2.0.0",
-    "typebox": "1.1.38"
+    "typebox": "1.1.38",
+    "@earendil-works/pi-ai": "0.79.10",
+    "@earendil-works/pi-tui": "0.79.10"
   }
 }

@@ -60,7 +60,7 @@ export default function journal(pi: ExtensionAPI) {
     runId = undefined;
     try {
       const sessionId = ctx.sessionManager.getSessionId();
-      runId = sessionId ? `sess-${sessionId.slice(0, 8)}` : newRunId();
+      runId = sessionId ? `sess-${sessionId}` : newRunId();
       startedAt = Date.now();
       mainCreated = false;
       ended = false;
@@ -83,7 +83,7 @@ export default function journal(pi: ExtensionAPI) {
             .trim()
             .slice(0, 120)
         : "";
-      record(ctx, { type: "lane_status", lane: "main", text });
+      if (text) record(ctx, { type: "lane_status", lane: "main", text });
     } catch {
       warn(ctx);
     }

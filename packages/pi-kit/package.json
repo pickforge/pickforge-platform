@@ -10,6 +10,7 @@
       "extensions/journal.ts",
       "extensions/lanes.ts",
       "extensions/gates.ts",
+      "extensions/delegation.ts",
       "extensions/vault.ts"
     ]
   },

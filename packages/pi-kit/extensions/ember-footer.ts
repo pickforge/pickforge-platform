@@ -29,12 +29,15 @@ export default function emberFooter(pi: ExtensionAPI) {
   // branch entry count changes instead of walking the branch every render frame.
   let cachedCost = 0;
   let cachedEntryCount = -1;
+  let cachedLeafId: string | null = null;
 
   function sessionCost(ctx: ExtensionContext): number {
     try {
       const branch = ctx.sessionManager.getBranch();
-      if (branch.length !== cachedEntryCount) {
+      const leafId = ctx.sessionManager.getLeafId();
+      if (branch.length !== cachedEntryCount || leafId !== cachedLeafId) {
         cachedEntryCount = branch.length;
+        cachedLeafId = leafId;
         cachedCost = 0;
         for (const entry of branch) {
           if (entry.type === "message" && entry.message.role === "assistant") {

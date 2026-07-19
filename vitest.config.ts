@@ -1,3 +1,4 @@
+import { defaultExclude } from "vitest/config";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
@@ -15,5 +16,9 @@ export default defineConfig({
       },
     },
     include: ["packages/**/*.test.ts"],
+    // Runs under `bun test` (needs `bun:sql`/`bun:test`) against a local
+    // Supabase Postgres via `bun run test:supabase`; excluded here so plain
+    // `vitest run` stays green without Postgres.
+    exclude: [...defaultExclude, "packages/**/*.contract.test.ts"],
   },
 });

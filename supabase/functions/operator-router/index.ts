@@ -6,7 +6,6 @@ import {
   createRequiredEnv,
   corsHeaders,
   corsPreflightResponse,
-  debitCredits,
   EdgeSharedError,
   jsonResponse,
   withCors,
@@ -35,46 +34,19 @@ Deno.serve(async (req) => {
 
   const handler = createOperatorRouterHandler({
     supabase: createCallerSupabase(req),
-    findCompletedRoute,
+    serviceSupabase,
     getCreditBalance: (userId) => getCreditBalanceCents({ supabase: serviceSupabase, userId }),
     consumeRateLimit,
-    debit: (options) => debitCredits({ supabase: serviceSupabase, ...options }),
     chatComplete,
     model: Deno.env.get("OPENAI_ROUTER_MODEL") ?? "gpt-5.4-mini",
     apiKey,
     baseUrl: Deno.env.get("OPENAI_BASE_URL") ?? "https://api.openai.com/v1",
     creditCostCents: readPositiveIntegerEnv("ROUTER_CREDIT_COST_CENTS", 2),
+    attemptLeaseSeconds: readPositiveIntegerEnv("ROUTER_ATTEMPT_LEASE_SECONDS", 30),
   });
 
   return withCors(handler(req));
 });
-
-async function findCompletedRoute(userId: string, idempotencyKey: string) {
-  const { data, error } = await serviceSupabase
-    .from<{ metadata: unknown }>("credit_ledger")
-    .select("metadata")
-    .eq("user_id", userId)
-    .eq("idempotency_key", idempotencyKey)
-    .maybeSingle();
-  if (error !== null) {
-    throw new EdgeSharedError("database_error", "Failed to read stored router result", { cause: error });
-  }
-  if (data === null) {
-    return null;
-  }
-
-  const proposalJson = (data.metadata as { proposalJson?: unknown }).proposalJson;
-  const usage = (data.metadata as { usage?: { input?: unknown; output?: unknown } }).usage;
-  if (
-    typeof proposalJson !== "string" ||
-    !Number.isSafeInteger(usage?.input) ||
-    !Number.isSafeInteger(usage?.output)
-  ) {
-    return null;
-  }
-
-  return { proposalJson, usage: { input: usage.input, output: usage.output } };
-}
 
 async function consumeRateLimit(userId: string): Promise<boolean> {
   const { data, error } = await serviceSupabase.rpc<boolean>("consume_router_rate_limit", {

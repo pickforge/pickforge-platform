@@ -1216,19 +1216,18 @@ describe("@pickforge/edge-shared", () => {
     });
   });
 
-  it("routes a valid command then debits with a namespaced key", async () => {
+  it("routes a valid command then claims, completes, and debits with a namespaced key", async () => {
     const supabase = new MemorySupabase();
-    const debit = vi.fn(async () => ({ duplicate: false as const, balance: 98 }));
+    const serviceSupabase = new FakeRouterServiceSupabase({ [USER_ID]: 100 });
     const chatComplete = vi.fn(async () => ({
       text: "{\"action\":{\"action\":\"openProject\"},\"confidence\":0.9}",
       usage: { input: 42, output: 13 },
     }));
     const handler = createOperatorRouterHandler({
       supabase,
-      findCompletedRoute: vi.fn(async () => null),
+      serviceSupabase,
       consumeRateLimit: vi.fn(async () => true),
       getCreditBalance: vi.fn(async () => 100),
-      debit,
       chatComplete,
       model: "gpt-5.4-mini",
       apiKey: "key",
@@ -1250,28 +1249,34 @@ describe("@pickforge/edge-shared", () => {
       usage: { input: 42, output: 13 },
       costCents: 2,
     });
-    expect(debit).toHaveBeenCalledWith({
-      userId: USER_ID,
-      amountCents: 2,
-      reason: "Operator routing",
-      idempotencyKey: `router:${USER_ID}:router:attempt-1`,
-      metadata: {
-        proposalJson: "{\"action\":{\"action\":\"openProject\"},\"confidence\":0.9}",
-        usage: { input: 42, output: 13 },
+    expect(chatComplete).toHaveBeenCalledOnce();
+    const scopedKey = `router:${USER_ID}:router:attempt-1`;
+    expect(serviceSupabase.rpcCalls.map((call) => call.fn)).toEqual([
+      "router_attempt_claim",
+      "router_attempt_complete",
+      "debit_credits",
+    ]);
+    expect(serviceSupabase.rpcCalls[2]).toMatchObject({
+      args: {
+        target_user: USER_ID,
+        idem_key: scopedKey,
+        reason: "Operator routing",
+        usage_metadata: {
+          proposalJson: "{\"action\":{\"action\":\"openProject\"},\"confidence\":0.9}",
+          usage: { input: 42, output: 13 },
+        },
       },
     });
-    expect(chatComplete).toHaveBeenCalledOnce();
   });
 
-  it("returns insufficient credits without calling the model", async () => {
-    const supabase = new MemorySupabase();
+  it("returns insufficient credits without claiming or calling the model", async () => {
+    const serviceSupabase = new FakeRouterServiceSupabase();
     const chatComplete = vi.fn();
     const handler = createOperatorRouterHandler({
-      supabase,
-      findCompletedRoute: vi.fn(async () => null),
+      supabase: new MemorySupabase(),
+      serviceSupabase,
       consumeRateLimit: vi.fn(async () => true),
       getCreditBalance: vi.fn(async () => 1),
-      debit: vi.fn(),
       chatComplete,
       model: "gpt-5.4-mini",
       apiKey: "key",
@@ -1283,18 +1288,21 @@ describe("@pickforge/edge-shared", () => {
     expect(response.status).toBe(402);
     await expect(response.json()).resolves.toEqual({ error: "insufficient_credits", balance: 1 });
     expect(chatComplete).not.toHaveBeenCalled();
+    expect(serviceSupabase.rpcCalls).toHaveLength(0);
   });
 
-  it("returns a stored proposal without calling the model for a replay", async () => {
-    const supabase = new MemorySupabase();
-    const debit = vi.fn(async () => ({ duplicate: false as const, balance: 98 }));
+  it("returns a stored proposal without calling the model for a replay of an already-debited (legacy) route", async () => {
+    const serviceSupabase = new FakeRouterServiceSupabase({ [USER_ID]: 100 });
+    serviceSupabase.seedLegacyLedgerRoute(USER_ID, `router:${USER_ID}:router:attempt-1`, {
+      proposalJson: "{\"stored\":true}",
+      usage: { input: 3, output: 2 },
+    });
     const chatComplete = vi.fn(async () => ({ text: "{}", usage: { input: 1, output: 1 } }));
     const handler = createOperatorRouterHandler({
-      supabase,
-      findCompletedRoute: vi.fn(async () => ({ proposalJson: "{\"stored\":true}", usage: { input: 3, output: 2 } })),
+      supabase: new MemorySupabase(),
+      serviceSupabase,
       consumeRateLimit: vi.fn(async () => true),
       getCreditBalance: vi.fn(async () => 100),
-      debit,
       chatComplete,
       model: "gpt-5.4-mini",
       apiKey: "key",
@@ -1310,19 +1318,17 @@ describe("@pickforge/edge-shared", () => {
       costCents: 2,
     });
     expect(chatComplete).not.toHaveBeenCalled();
-    expect(debit).not.toHaveBeenCalled();
+    expect(serviceSupabase.rpcCalls).toHaveLength(0);
   });
 
-  it("rejects forbidden attached context before debiting or calling the model", async () => {
-    const supabase = new MemorySupabase();
-    const debit = vi.fn();
+  it("rejects forbidden attached context before claiming, debiting, or calling the model", async () => {
+    const serviceSupabase = new FakeRouterServiceSupabase({ [USER_ID]: 100 });
     const chatComplete = vi.fn();
     const handler = createOperatorRouterHandler({
-      supabase,
-      findCompletedRoute: vi.fn(async () => null),
+      supabase: new MemorySupabase(),
+      serviceSupabase,
       consumeRateLimit: vi.fn(async () => true),
       getCreditBalance: vi.fn(async () => 100),
-      debit,
       chatComplete,
       model: "gpt-5.4-mini",
       apiKey: "key",
@@ -1335,23 +1341,21 @@ describe("@pickforge/edge-shared", () => {
     );
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toEqual({ error: "boundary_violation" });
-    expect(debit).not.toHaveBeenCalled();
     expect(chatComplete).not.toHaveBeenCalled();
+    expect(serviceSupabase.rpcCalls).toHaveLength(0);
   });
 
-  it("does not debit a failed route and allows a retry", async () => {
-    const supabase = new MemorySupabase();
-    const debit = vi.fn(async () => ({ duplicate: false as const, balance: 98 }));
+  it("does not debit a failed provider attempt and lets an immediate retry reclaim it", async () => {
+    const serviceSupabase = new FakeRouterServiceSupabase({ [USER_ID]: 100 });
     const chatComplete = vi
       .fn()
       .mockRejectedValueOnce(new Error("provider unavailable"))
       .mockResolvedValueOnce({ text: "{}", usage: { input: 1, output: 1 } });
     const handler = createOperatorRouterHandler({
-      supabase,
-      findCompletedRoute: vi.fn(async () => null),
+      supabase: new MemorySupabase(),
+      serviceSupabase,
       consumeRateLimit: vi.fn(async () => true),
       getCreditBalance: vi.fn(async () => 100),
-      debit,
       chatComplete,
       model: "gpt-5.4-mini",
       apiKey: "key",
@@ -1360,20 +1364,123 @@ describe("@pickforge/edge-shared", () => {
     });
 
     await expect(handler(routeRequest("open project Billing"))).resolves.toMatchObject({ status: 500 });
-    expect(debit).not.toHaveBeenCalled();
+    expect(serviceSupabase.rpcCalls.map((call) => call.fn)).toEqual([
+      "router_attempt_claim",
+      "router_attempt_fail",
+    ]);
     await expect(handler(routeRequest("open project Billing"))).resolves.toMatchObject({ status: 200 });
-    expect(debit).toHaveBeenCalledOnce();
+    expect(serviceSupabase.rpcCalls.map((call) => call.fn)).toEqual([
+      "router_attempt_claim",
+      "router_attempt_fail",
+      "router_attempt_claim",
+      "router_attempt_complete",
+      "debit_credits",
+    ]);
+    expect(chatComplete).toHaveBeenCalledTimes(2);
+  });
+
+  it("returns attempt_in_progress without invoking the provider or debiting while a claim is live", async () => {
+    const serviceSupabase = new FakeRouterServiceSupabase({ [USER_ID]: 100 });
+    serviceSupabase.seedClaim(USER_ID, `router:${USER_ID}:router:attempt-1`);
+    const chatComplete = vi.fn();
+    const handler = createOperatorRouterHandler({
+      supabase: new MemorySupabase(),
+      serviceSupabase,
+      consumeRateLimit: vi.fn(async () => true),
+      getCreditBalance: vi.fn(async () => 100),
+      chatComplete,
+      model: "gpt-5.4-mini",
+      apiKey: "key",
+      baseUrl: "https://api.openai.com/v1",
+      creditCostCents: 2,
+    });
+
+    const response = await handler(routeRequest("open project Billing"));
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({ error: "attempt_in_progress" });
+    expect(chatComplete).not.toHaveBeenCalled();
+    expect(serviceSupabase.rpcCalls.map((call) => call.fn)).toEqual(["router_attempt_claim"]);
+  });
+
+  it("recovers a stale (lease-expired) claim and invokes the provider exactly once", async () => {
+    const serviceSupabase = new FakeRouterServiceSupabase({ [USER_ID]: 100 });
+    serviceSupabase.seedClaim(USER_ID, `router:${USER_ID}:router:attempt-1`, 31_000);
+    const chatComplete = vi.fn(async () => ({ text: "{\"recovered\":true}", usage: { input: 1, output: 1 } }));
+    const handler = createOperatorRouterHandler({
+      supabase: new MemorySupabase(),
+      serviceSupabase,
+      consumeRateLimit: vi.fn(async () => true),
+      getCreditBalance: vi.fn(async () => 100),
+      chatComplete,
+      model: "gpt-5.4-mini",
+      apiKey: "key",
+      baseUrl: "https://api.openai.com/v1",
+      creditCostCents: 2,
+      attemptLeaseSeconds: 30,
+    });
+
+    const response = await handler(routeRequest("open project Billing"));
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      proposalJson: "{\"recovered\":true}",
+      usage: { input: 1, output: 1 },
+      costCents: 2,
+    });
+    expect(chatComplete).toHaveBeenCalledOnce();
+  });
+
+  it("retries only the debit, without re-invoking the provider, after a debit fails post-completion", async () => {
+    const serviceSupabase = new FakeRouterServiceSupabase({ [USER_ID]: 100 });
+    serviceSupabase.failNextDebitWithoutCommitting();
+    const chatComplete = vi.fn(async () => ({ text: "{\"once\":true}", usage: { input: 4, output: 6 } }));
+    const handler = createOperatorRouterHandler({
+      supabase: new MemorySupabase(),
+      serviceSupabase,
+      consumeRateLimit: vi.fn(async () => true),
+      getCreditBalance: vi.fn(async () => 100),
+      chatComplete,
+      model: "gpt-5.4-mini",
+      apiKey: "key",
+      baseUrl: "https://api.openai.com/v1",
+      creditCostCents: 2,
+    });
+
+    await expect(handler(routeRequest("open project Billing"))).resolves.toMatchObject({ status: 500 });
+    expect(chatComplete).toHaveBeenCalledOnce();
+    expect(serviceSupabase.rpcCalls.map((call) => call.fn)).toEqual([
+      "router_attempt_claim",
+      "router_attempt_complete",
+      "debit_credits",
+    ]);
+
+    const response = await handler(routeRequest("open project Billing"));
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      proposalJson: "{\"once\":true}",
+      usage: { input: 4, output: 6 },
+      costCents: 2,
+    });
+    // The provider was invoked only once across both calls: the retry's claim
+    // finds the attempt already completed and skips straight to the debit.
+    expect(chatComplete).toHaveBeenCalledOnce();
+    expect(serviceSupabase.rpcCalls.map((call) => call.fn)).toEqual([
+      "router_attempt_claim",
+      "router_attempt_complete",
+      "debit_credits",
+      "router_attempt_claim",
+      "debit_credits",
+    ]);
   });
 
   it("returns the stored result after a concurrent duplicate debit", async () => {
-    const stored = { proposalJson: "{\"stored\":true}", usage: { input: 5, output: 3 } };
-    const findCompletedRoute = vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(stored);
+    const serviceSupabase = new FakeRouterServiceSupabase({ [USER_ID]: 100 });
+    const winner = { proposalJson: "{\"stored\":true}", usage: { input: 5, output: 3 } };
+    serviceSupabase.forceDuplicateDebitOnce(winner);
     const handler = createOperatorRouterHandler({
       supabase: new MemorySupabase(),
-      findCompletedRoute,
+      serviceSupabase,
       consumeRateLimit: vi.fn(async () => true),
       getCreditBalance: vi.fn(async () => 100),
-      debit: vi.fn(async () => ({ duplicate: true as const })),
       chatComplete: vi.fn(async () => ({ text: "{\"fresh\":true}", usage: { input: 1, output: 1 } })),
       model: "gpt-5.4-mini",
       apiKey: "key",
@@ -1382,21 +1489,20 @@ describe("@pickforge/edge-shared", () => {
     });
 
     const response = await handler(routeRequest("open project Billing"));
-    await expect(response.json()).resolves.toEqual({ ...stored, costCents: 2 });
-    expect(findCompletedRoute).toHaveBeenCalledTimes(2);
+    await expect(response.json()).resolves.toEqual({ ...winner, costCents: 2 });
   });
 
   it("returns the stored proposal when a committed debit loses its response", async () => {
-    const stored = { proposalJson: "{\"stored\":true}", usage: { input: 5, output: 3 } };
+    const serviceSupabase = new FakeRouterServiceSupabase({ [USER_ID]: 100 });
+    const scopedKey = `router:${USER_ID}:router:attempt-1`;
+    serviceSupabase.loseNextDebitResponseAfterCommitting();
+
     const handler = createOperatorRouterHandler({
       supabase: new MemorySupabase(),
-      findCompletedRoute: vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(stored),
+      serviceSupabase,
       consumeRateLimit: vi.fn(async () => true),
       getCreditBalance: vi.fn(async () => 100),
-      debit: vi.fn(async () => {
-        throw new Error("response lost");
-      }),
-      chatComplete: vi.fn(async () => ({ text: "{\"fresh\":true}", usage: { input: 1, output: 1 } })),
+      chatComplete: vi.fn(async () => ({ text: "{\"stored\":true}", usage: { input: 5, output: 3 } })),
       model: "gpt-5.4-mini",
       apiKey: "key",
       baseUrl: "https://api.openai.com/v1",
@@ -1405,7 +1511,12 @@ describe("@pickforge/edge-shared", () => {
 
     const response = await handler(routeRequest("open project Billing"));
     expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toEqual({ ...stored, costCents: 2 });
+    await expect(response.json()).resolves.toEqual({
+      proposalJson: "{\"stored\":true}",
+      usage: { input: 5, output: 3 },
+      costCents: 2,
+    });
+    expect(serviceSupabase.readLedgerRoute(USER_ID, scopedKey)).not.toBeNull();
   });
 
   it.each([
@@ -1441,15 +1552,14 @@ describe("@pickforge/edge-shared", () => {
   });
 
   it("returns rate_limited after ten routed attempts", async () => {
-    const debit = vi.fn(async () => ({ duplicate: false as const, balance: 98 }));
+    const serviceSupabase = new FakeRouterServiceSupabase({ [USER_ID]: 100 });
     const chatComplete = vi.fn(async () => ({ text: "{}", usage: { input: 1, output: 1 } }));
     let attempts = 0;
     const handler = createOperatorRouterHandler({
       supabase: new MemorySupabase(),
-      findCompletedRoute: vi.fn(async () => null),
+      serviceSupabase,
       consumeRateLimit: vi.fn(async () => ++attempts <= 10),
       getCreditBalance: vi.fn(async () => 100),
-      debit,
       chatComplete,
       model: "gpt-5.4-mini",
       apiKey: "key",
@@ -1466,17 +1576,17 @@ describe("@pickforge/edge-shared", () => {
     const response = await handler(routeRequest("open project Billing", undefined, "attempt-10"));
     expect(response.status).toBe(429);
     await expect(response.json()).resolves.toEqual({ error: "rate_limited" });
-    expect(debit).toHaveBeenCalledTimes(10);
     expect(chatComplete).toHaveBeenCalledTimes(10);
+    expect(serviceSupabase.rpcCalls.filter((call) => call.fn === "debit_credits")).toHaveLength(10);
   });
 
   it("maps invalid JSON to a boundary violation", async () => {
+    const serviceSupabase = new FakeRouterServiceSupabase({ [USER_ID]: 100 });
     const handler = createOperatorRouterHandler({
       supabase: new MemorySupabase(),
-      findCompletedRoute: vi.fn(async () => null),
+      serviceSupabase,
       consumeRateLimit: vi.fn(async () => true),
       getCreditBalance: vi.fn(async () => 100),
-      debit: vi.fn(),
       chatComplete: vi.fn(),
       model: "gpt-5.4-mini",
       apiKey: "key",
@@ -1493,6 +1603,7 @@ describe("@pickforge/edge-shared", () => {
     );
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toEqual({ error: "boundary_violation" });
+    expect(serviceSupabase.rpcCalls).toHaveLength(0);
   });
 });
 
@@ -1885,6 +1996,231 @@ class MemoryQuery<T> implements SupabaseQueryBuilderLike<T> {
   private rows(): EntitlementRow[] {
     return this.supabase.entitlements.filter((row) =>
       this.filters.every((filter) => row[filter.column as keyof EntitlementRow] === filter.value),
+    );
+  }
+}
+
+interface FakeRouterAttemptRow {
+  status: "claimed" | "completed" | "failed";
+  proposalJson?: string;
+  usageInput?: number;
+  usageOutput?: number;
+  claimedAtMs: number;
+}
+
+/**
+ * Reimplements the router_attempt_claim / router_attempt_complete /
+ * router_attempt_fail / debit_credits RPC contracts (and a minimal
+ * credit_ledger table) in memory, exactly like `scopedDebitSupabase` already
+ * does for `debit_credits` alone. The real durable decisions are proven
+ * separately against Postgres by
+ * packages/edge-shared/test/router-attempt.contract.test.ts; this fake only
+ * needs to honor the same contract so createOperatorRouterHandler's own
+ * choreography (claim -> provider -> complete -> debit, and every recovery
+ * path) can be exercised fast and deterministically.
+ */
+class FakeRouterServiceSupabase implements Pick<SupabaseClientLike, "from" | "rpc"> {
+  readonly rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
+  nowMs = 0;
+  private forcedDuplicateOnce: StoredRouteProposalLike | null = null;
+  private failNextDebitWithoutWriting = false;
+  private loseNextDebitResponseAfterCommit = false;
+  private readonly attempts = new Map<string, FakeRouterAttemptRow>();
+  private readonly ledger = new Map<string, unknown>();
+  private readonly balances: Map<string, number>;
+
+  constructor(initialBalances: Record<string, number> = {}) {
+    this.balances = new Map(Object.entries(initialBalances));
+  }
+
+  seedLegacyLedgerRoute(userId: string, idempotencyKey: string, route: StoredRouteProposalLike): void {
+    this.ledger.set(`${userId}:${idempotencyKey}`, route);
+  }
+
+  seedClaim(userId: string, idempotencyKey: string, ageMs = 0): void {
+    this.attempts.set(`${userId}:${idempotencyKey}`, { status: "claimed", claimedAtMs: this.nowMs - ageMs });
+  }
+
+  forceDuplicateDebitOnce(route: StoredRouteProposalLike): void {
+    this.forcedDuplicateOnce = route;
+  }
+
+  failNextDebitWithoutCommitting(): void {
+    this.failNextDebitWithoutWriting = true;
+  }
+
+  loseNextDebitResponseAfterCommitting(): void {
+    this.loseNextDebitResponseAfterCommit = true;
+  }
+
+  from<T = unknown>(table: string): SupabaseQueryBuilderLike<T> {
+    if (table !== "credit_ledger") {
+      throw new Error(`Unknown table: ${table}`);
+    }
+
+    return new FakeLedgerQuery<T>(this);
+  }
+
+  async rpc<T = unknown>(fn: string, args: Record<string, unknown> = {}): Promise<SupabaseQueryResult<T>> {
+    this.rpcCalls.push({ fn, args });
+    if (fn === "router_attempt_claim") return this.claim(args) as SupabaseQueryResult<T>;
+    if (fn === "router_attempt_complete") return this.complete(args) as SupabaseQueryResult<T>;
+    if (fn === "router_attempt_fail") return this.fail(args) as SupabaseQueryResult<T>;
+    if (fn === "debit_credits") return this.debit(args) as SupabaseQueryResult<T>;
+
+    return { data: null, error: { message: `Unknown rpc: ${fn}` } };
+  }
+
+  readLedgerRoute(userId: string, idempotencyKey: string): unknown {
+    return this.ledger.get(`${userId}:${idempotencyKey}`) ?? null;
+  }
+
+  private claim(args: Record<string, unknown>): SupabaseQueryResult<unknown> {
+    const key = attemptKey(args);
+    const leaseMs = Number(args.lease_seconds ?? 30) * 1000;
+    const existing = this.attempts.get(key);
+    if (existing === undefined) {
+      this.attempts.set(key, { status: "claimed", claimedAtMs: this.nowMs });
+      return { data: { outcome: "claimed" }, error: null };
+    }
+    if (existing.status === "completed") {
+      return { data: completedPayload(existing), error: null };
+    }
+    if (existing.status === "failed" || this.nowMs - existing.claimedAtMs >= leaseMs) {
+      existing.status = "claimed";
+      existing.claimedAtMs = this.nowMs;
+      existing.proposalJson = undefined;
+      existing.usageInput = undefined;
+      existing.usageOutput = undefined;
+      return { data: { outcome: "claimed" }, error: null };
+    }
+
+    return { data: { outcome: "in_progress" }, error: null };
+  }
+
+  private complete(args: Record<string, unknown>): SupabaseQueryResult<unknown> {
+    const key = attemptKey(args);
+    const existing = this.attempts.get(key);
+    if (existing === undefined) {
+      return { data: null, error: { message: "router attempt is not claimed" } };
+    }
+    if (existing.status !== "completed") {
+      existing.status = "completed";
+      existing.proposalJson = String(args.new_proposal_json);
+      existing.usageInput = Number(args.new_usage_input);
+      existing.usageOutput = Number(args.new_usage_output);
+    }
+
+    return { data: completedPayload(existing), error: null };
+  }
+
+  private fail(args: Record<string, unknown>): SupabaseQueryResult<unknown> {
+    const key = attemptKey(args);
+    const existing = this.attempts.get(key);
+    if (existing !== undefined && existing.status === "claimed") {
+      existing.status = "failed";
+    }
+
+    return { data: null, error: null };
+  }
+
+  private debit(args: Record<string, unknown>): SupabaseQueryResult<unknown> {
+    const key = attemptKey({ target_user: args.target_user, idem_key: args.idem_key });
+    if (this.forcedDuplicateOnce !== null) {
+      const route = this.forcedDuplicateOnce;
+      this.forcedDuplicateOnce = null;
+      if (!this.ledger.has(key)) {
+        this.ledger.set(key, route);
+      }
+      return { data: { status: "duplicate" }, error: null };
+    }
+    if (this.failNextDebitWithoutWriting) {
+      this.failNextDebitWithoutWriting = false;
+      return { data: null, error: { message: "database unavailable" } };
+    }
+    if (this.ledger.has(key)) {
+      return { data: { status: "duplicate" }, error: null };
+    }
+
+    const userId = String(args.target_user);
+    const debitCents = Number(args.debit_cents);
+    const balance = this.balances.get(userId) ?? 0;
+    if (balance < debitCents) {
+      return { data: { status: "insufficient", balance }, error: null };
+    }
+
+    const nextBalance = balance - debitCents;
+    this.balances.set(userId, nextBalance);
+    this.ledger.set(key, args.usage_metadata);
+
+    if (this.loseNextDebitResponseAfterCommit) {
+      this.loseNextDebitResponseAfterCommit = false;
+      return { data: null, error: { message: "response lost" } };
+    }
+
+    return { data: { status: "ok", balance: nextBalance }, error: null };
+  }
+}
+
+interface StoredRouteProposalLike {
+  proposalJson: string;
+  usage: { input: number; output: number };
+}
+
+function attemptKey(args: Record<string, unknown>): string {
+  return `${String(args.target_user)}:${String(args.idem_key)}`;
+}
+
+function completedPayload(row: FakeRouterAttemptRow): Record<string, unknown> {
+  return {
+    outcome: "completed",
+    proposal_json: row.proposalJson,
+    usage_input: row.usageInput,
+    usage_output: row.usageOutput,
+  };
+}
+
+class FakeLedgerQuery<T> implements SupabaseQueryBuilderLike<T> {
+  private readonly filters: Record<string, unknown> = {};
+
+  constructor(private readonly supabase: FakeRouterServiceSupabase) {}
+
+  select(): SupabaseQueryBuilderLike<T> {
+    return this;
+  }
+
+  eq(column: string, value: unknown): SupabaseQueryBuilderLike<T> {
+    this.filters[column] = value;
+    return this;
+  }
+
+  is(column: string, value: unknown): SupabaseQueryBuilderLike<T> {
+    return this.eq(column, value);
+  }
+
+  order(): SupabaseQueryBuilderLike<T> {
+    return this;
+  }
+
+  range(): SupabaseQueryBuilderLike<T> {
+    return this;
+  }
+
+  async maybeSingle(): Promise<SupabaseQueryResult<T | null>> {
+    const userId = String(this.filters.user_id);
+    const idempotencyKey = String(this.filters.idempotency_key);
+    const metadata = this.supabase.readLedgerRoute(userId, idempotencyKey);
+
+    return { data: metadata === null ? null : ({ metadata } as T), error: null };
+  }
+
+  then<TResult1 = SupabaseQueryResult<T>, TResult2 = never>(
+    onfulfilled?: ((value: SupabaseQueryResult<T>) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): PromiseLike<TResult1 | TResult2> {
+    return this.maybeSingle().then(
+      onfulfilled as (value: SupabaseQueryResult<T | null>) => TResult1 | PromiseLike<TResult1>,
+      onrejected,
     );
   }
 }

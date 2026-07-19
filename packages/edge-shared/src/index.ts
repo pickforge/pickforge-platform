@@ -164,10 +164,9 @@ export interface ChatCompletionResult {
 
 export interface CreateOperatorRouterHandlerOptions {
   supabase: Pick<SupabaseClientLike, "auth">;
-  findCompletedRoute(userId: string, idempotencyKey: string): Promise<StoredRouteProposal | null>;
+  serviceSupabase: Pick<SupabaseClientLike, "from" | "rpc">;
   getCreditBalance(userId: string): Promise<number>;
   consumeRateLimit(userId: string): Promise<boolean>;
-  debit(options: Omit<DebitCreditsOptions, "supabase">): Promise<DebitCreditsResult>;
   chatComplete(options: {
     model: string;
     apiKey: string;
@@ -180,6 +179,8 @@ export interface CreateOperatorRouterHandlerOptions {
   baseUrl: string;
   creditCostCents: number;
   systemPrompt?: string;
+  /** How long a claim may go unconfirmed before another caller may recover it. Defaults to 30 seconds. */
+  attemptLeaseSeconds?: number;
 }
 
 export interface AccountAdminClientLike {
@@ -307,6 +308,21 @@ export interface StoredRouteProposal {
   usage: ChatCompletionUsage;
 }
 
+/**
+ * Outcome of durably claiming a router attempt (`router_attempt_claim`)
+ * BEFORE any provider invocation happens:
+ * - `claimed`: this caller now owns provider invocation for the key.
+ * - `in_progress`: another live claim owns it right now; the caller must not
+ *   invoke the provider or debit, and should tell the client to retry.
+ * - `completed`: the provider already ran for this key (most likely a prior
+ *   claim owner whose debit failed); the caller should retry only the debit
+ *   step with `result` instead of re-invoking the provider.
+ */
+export type RouteAttemptClaim =
+  | { outcome: "claimed" }
+  | { outcome: "in_progress" }
+  | { outcome: "completed"; result: StoredRouteProposal };
+
 interface EntitlementRow {
   value?: EdgeSharedJson;
   expires_at: string | null;
@@ -429,6 +445,168 @@ export async function debitCredits({
   throw invalidRpcResult();
 }
 
+/**
+ * Reads the confirmed-paid result for a router idempotency key from the
+ * credit ledger. A ledger row existing here means the provider ran and the
+ * debit committed — this is the money-path source of truth for "has this
+ * key already been charged", independent of whether a `router_attempts`
+ * claim row still exists (rows written before that table existed only ever
+ * have a ledger row, and this keeps honoring them).
+ */
+export async function findDebitedRouteResult({
+  supabase,
+  userId,
+  idempotencyKey,
+}: {
+  supabase: Pick<SupabaseClientLike, "from">;
+  userId: string;
+  idempotencyKey: string;
+}): Promise<StoredRouteProposal | null> {
+  const validUserId = validateNonEmptyString(userId, "userId", "invalid_string");
+  const validIdempotencyKey = validateNonEmptyString(
+    idempotencyKey,
+    "idempotencyKey",
+    "invalid_idempotency_key",
+  );
+  const { data, error } = await supabase
+    .from<{ metadata: unknown }>("credit_ledger")
+    .select("metadata")
+    .eq("user_id", validUserId)
+    .eq("idempotency_key", validIdempotencyKey)
+    .maybeSingle();
+  if (error !== null) {
+    throw databaseError("Failed to read stored router result", error);
+  }
+  if (data === null) {
+    return null;
+  }
+
+  return decodeLegacyLedgerRoute(data.metadata);
+}
+
+/**
+ * Durably claims a router attempt BEFORE any provider invocation, so at most
+ * one caller ever owns "go call the provider" for a given (userId,
+ * idempotencyKey) at a time. See
+ * supabase/migrations/20260722000000_router_attempt_claim.sql for the
+ * durable decision this wraps, including in-progress recovery via
+ * `leaseSeconds`.
+ */
+export async function claimRouteAttempt({
+  supabase,
+  userId,
+  idempotencyKey,
+  leaseSeconds = 30,
+}: {
+  supabase: Pick<SupabaseClientLike, "rpc">;
+  userId: string;
+  idempotencyKey: string;
+  leaseSeconds?: number;
+}): Promise<RouteAttemptClaim> {
+  const validUserId = validateNonEmptyString(userId, "userId", "invalid_string");
+  const validIdempotencyKey = validateNonEmptyString(
+    idempotencyKey,
+    "idempotencyKey",
+    "invalid_idempotency_key",
+  );
+  const validLeaseSeconds = validatePositiveInteger(leaseSeconds, "leaseSeconds");
+
+  const { data, error } = await supabase.rpc<Record<string, unknown>>("router_attempt_claim", {
+    target_user: validUserId,
+    idem_key: validIdempotencyKey,
+    lease_seconds: validLeaseSeconds,
+  });
+  if (error !== null) {
+    throw databaseError("Failed to claim router attempt", error);
+  }
+  if (!isRecord(data)) {
+    throw invalidRpcResult();
+  }
+  if (data.outcome === "claimed") {
+    return { outcome: "claimed" };
+  }
+  if (data.outcome === "in_progress") {
+    return { outcome: "in_progress" };
+  }
+  if (data.outcome === "completed") {
+    return { outcome: "completed", result: decodeRouteAttemptResult(data) };
+  }
+
+  throw invalidRpcResult();
+}
+
+/**
+ * Records a claimed attempt's provider outcome, independent of whether the
+ * following debit succeeds — so a retry that lost the debit can skip
+ * straight to a debit retry with the same result instead of re-invoking the
+ * provider. Idempotent: completing an already-completed attempt returns the
+ * stored outcome instead of erroring.
+ */
+export async function completeRouteAttempt({
+  supabase,
+  userId,
+  idempotencyKey,
+  result,
+}: {
+  supabase: Pick<SupabaseClientLike, "rpc">;
+  userId: string;
+  idempotencyKey: string;
+  result: StoredRouteProposal;
+}): Promise<StoredRouteProposal> {
+  const validUserId = validateNonEmptyString(userId, "userId", "invalid_string");
+  const validIdempotencyKey = validateNonEmptyString(
+    idempotencyKey,
+    "idempotencyKey",
+    "invalid_idempotency_key",
+  );
+  const validProposalJson = validateNonEmptyString(result.proposalJson, "proposalJson", "invalid_string");
+
+  const { data, error } = await supabase.rpc<Record<string, unknown>>("router_attempt_complete", {
+    target_user: validUserId,
+    idem_key: validIdempotencyKey,
+    new_proposal_json: validProposalJson,
+    new_usage_input: result.usage.input,
+    new_usage_output: result.usage.output,
+  });
+  if (error !== null) {
+    throw databaseError("Failed to record router attempt outcome", error);
+  }
+  if (!isRecord(data) || data.outcome !== "completed") {
+    throw invalidRpcResult();
+  }
+
+  return decodeRouteAttemptResult(data);
+}
+
+/**
+ * Releases a claim immediately after a definitive provider failure, so a
+ * retry does not have to wait out the claim's lease to try again.
+ */
+export async function failRouteAttempt({
+  supabase,
+  userId,
+  idempotencyKey,
+}: {
+  supabase: Pick<SupabaseClientLike, "rpc">;
+  userId: string;
+  idempotencyKey: string;
+}): Promise<void> {
+  const validUserId = validateNonEmptyString(userId, "userId", "invalid_string");
+  const validIdempotencyKey = validateNonEmptyString(
+    idempotencyKey,
+    "idempotencyKey",
+    "invalid_idempotency_key",
+  );
+
+  const { error } = await supabase.rpc("router_attempt_fail", {
+    target_user: validUserId,
+    idem_key: validIdempotencyKey,
+  });
+  if (error !== null) {
+    throw databaseError("Failed to mark router attempt failed", error);
+  }
+}
+
 export function newIdempotencyKey(scope: string, uniquePart: string): string {
   return `${validateNonEmptyString(scope, "scope", "invalid_idempotency_key")}:${validateNonEmptyString(
     uniquePart,
@@ -475,16 +653,16 @@ export function assertRouteRequest(body: unknown): RouteRequest {
 
 export function createOperatorRouterHandler({
   supabase,
-  findCompletedRoute,
+  serviceSupabase,
   getCreditBalance,
   consumeRateLimit,
-  debit,
   chatComplete,
   model,
   apiKey,
   baseUrl,
   creditCostCents,
   systemPrompt = operatorRouterSystemPrompt,
+  attemptLeaseSeconds = 30,
 }: CreateOperatorRouterHandlerOptions): (req: Request) => Promise<Response> {
   const validModel = validateNonEmptyString(model, "model", "invalid_string");
   const validApiKey = validateNonEmptyString(apiKey, "apiKey", "invalid_string");
@@ -501,9 +679,14 @@ export function createOperatorRouterHandler({
         "invalid_idempotency_key",
       );
       const scopedIdempotencyKey = newIdempotencyKey("router", `${userId}:${idempotencyKey}`);
-      const completedRoute = await findCompletedRoute(userId, scopedIdempotencyKey);
-      if (completedRoute !== null) {
-        return routeResponse(completedRoute, validCreditCostCents);
+
+      const debitedRoute = await findDebitedRouteResult({
+        supabase: serviceSupabase,
+        userId,
+        idempotencyKey: scopedIdempotencyKey,
+      });
+      if (debitedRoute !== null) {
+        return routeResponse(debitedRoute, validCreditCostCents);
       }
       if (!(await consumeRateLimit(userId))) {
         return jsonResponse(429, { error: "rate_limited" });
@@ -516,36 +699,87 @@ export function createOperatorRouterHandler({
         throw new EdgeSharedError("insufficient_credits", "Not enough credits", { balance });
       }
 
-      const completion = await chatComplete({
-        model: validModel,
-        apiKey: validApiKey,
-        baseUrl: validBaseUrl,
-        systemPrompt,
-        userPrompt: JSON.stringify(routeRequest),
+      // Durably claim BEFORE any provider invocation: at most one caller ever
+      // owns "go call the provider" for this key at a time.
+      const claim = await claimRouteAttempt({
+        supabase: serviceSupabase,
+        userId,
+        idempotencyKey: scopedIdempotencyKey,
+        leaseSeconds: attemptLeaseSeconds,
       });
-      const route = {
-        proposalJson: completion.text,
-        usage: { input: completion.usage.input, output: completion.usage.output },
-      };
+      if (claim.outcome === "in_progress") {
+        return jsonResponse(409, { error: "attempt_in_progress" });
+      }
+
+      let route: StoredRouteProposal;
+      if (claim.outcome === "completed") {
+        // A prior claim owner already ran the provider for this key (most
+        // likely this caller's own retry after a debit failure): skip
+        // straight to a debit retry with the stored result.
+        route = claim.result;
+      } else {
+        let completion: ChatCompletionResult;
+        try {
+          completion = await chatComplete({
+            model: validModel,
+            apiKey: validApiKey,
+            baseUrl: validBaseUrl,
+            systemPrompt,
+            userPrompt: JSON.stringify(routeRequest),
+          });
+        } catch (error) {
+          // A definitive provider failure releases the claim immediately so a
+          // retry does not have to wait out the lease.
+          await failRouteAttempt({
+            supabase: serviceSupabase,
+            userId,
+            idempotencyKey: scopedIdempotencyKey,
+          }).catch(() => {
+            // The original provider error remains the actionable failure; the
+            // lease will still make the claim recoverable if this also fails.
+          });
+          throw error;
+        }
+
+        route = await completeRouteAttempt({
+          supabase: serviceSupabase,
+          userId,
+          idempotencyKey: scopedIdempotencyKey,
+          result: {
+            proposalJson: completion.text,
+            usage: { input: completion.usage.input, output: completion.usage.output },
+          },
+        });
+      }
+
       let debitResult: DebitCreditsResult;
       try {
-        debitResult = await debit({
+        debitResult = await debitCredits({
+          supabase: serviceSupabase,
           userId,
           amountCents: validCreditCostCents,
           reason: "Operator routing",
           idempotencyKey: scopedIdempotencyKey,
-          metadata: route,
+          metadata: { proposalJson: route.proposalJson, usage: { input: route.usage.input, output: route.usage.output } },
         });
       } catch (error) {
-        const storedRoute = await findCompletedRoute(userId, scopedIdempotencyKey);
-        if (storedRoute !== null) {
-          return routeResponse(storedRoute, validCreditCostCents);
+        const recovered = await findDebitedRouteResult({
+          supabase: serviceSupabase,
+          userId,
+          idempotencyKey: scopedIdempotencyKey,
+        });
+        if (recovered !== null) {
+          return routeResponse(recovered, validCreditCostCents);
         }
 
         throw error;
       }
       if (debitResult.duplicate) {
-        const storedRoute = await findCompletedRoute(userId, scopedIdempotencyKey);
+        const storedRoute = await findDebitedRouteResult({
+          supabase: serviceSupabase,
+          userId,
+          idempotencyKey: scopedIdempotencyKey,
+        });
         if (storedRoute === null) {
           throw new EdgeSharedError("invalid_rpc_result", "Stored router result is missing");
         }
@@ -1024,6 +1258,40 @@ function routeResponse(route: StoredRouteProposal | ChatCompletionResult, costCe
   return jsonResponse(200, { proposalJson, usage: route.usage, costCents });
 }
 
+function decodeRouteAttemptResult(value: Record<string, unknown>): StoredRouteProposal {
+  const proposalJson = value.proposal_json;
+  const usageInput = value.usage_input;
+  const usageOutput = value.usage_output;
+  if (
+    typeof proposalJson !== "string" ||
+    !Number.isSafeInteger(usageInput) ||
+    !Number.isSafeInteger(usageOutput)
+  ) {
+    throw invalidRpcResult();
+  }
+
+  return { proposalJson, usage: { input: usageInput as number, output: usageOutput as number } };
+}
+
+function decodeLegacyLedgerRoute(metadata: unknown): StoredRouteProposal | null {
+  if (!isRecord(metadata)) {
+    return null;
+  }
+
+  const proposalJson = metadata.proposalJson;
+  const usage = isRecord(metadata.usage) ? metadata.usage : undefined;
+  if (
+    usage === undefined ||
+    typeof proposalJson !== "string" ||
+    !Number.isSafeInteger(usage.input) ||
+    !Number.isSafeInteger(usage.output)
+  ) {
+    return null;
+  }
+
+  return { proposalJson, usage: { input: usage.input as number, output: usage.output as number } };
+}
+
 async function readRouteRequest(req: Request): Promise<RouteRequest> {
   try {
     return assertRouteRequest(await req.json());
@@ -1052,9 +1320,13 @@ function routerErrorStatus(code: EdgeSharedErrorCode): number {
   return code === "database_error" ? 500 : 400;
 }
 
-function validatePositiveInteger(value: unknown, field: string): number {
+function validatePositiveInteger(
+  value: unknown,
+  field: string,
+  code: EdgeSharedErrorCode = "invalid_debit_amount",
+): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
-    throw new EdgeSharedError("invalid_debit_amount", `${field} must be a positive integer`);
+    throw new EdgeSharedError(code, `${field} must be a positive integer`);
   }
 
   return value;

@@ -1,6 +1,6 @@
 {
   "imports": {
     "@supabase/supabase-js": "npm:@supabase/supabase-js@2.110.0",
-    "@pickforge/edge-shared": "npm:@pickforge/edge-shared@0.11.0"
+    "@pickforge/edge-shared": "npm:@pickforge/edge-shared@0.12.0"
   }
 }

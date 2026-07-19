@@ -3,7 +3,7 @@
  * inspect each lane's session (thinking, text, tool calls, results).
  * Shown via ctx.ui.custom() on top of the active Pi session.
  */
-import { readFileSync, statSync } from "node:fs";
+import { closeSync, openSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TUI } from "@earendil-works/pi-tui";
 import { listRuns, rawRunDir, readRun, reduceRun } from "./journal-core.ts";
@@ -22,7 +22,7 @@ interface LaneFeed {
   bytesRead: number;
 }
 
-class RunView {
+export class RunView {
   readonly runId: string;
   projection: RunProjection;
   private readonly feeds = new Map<string, LaneFeed>();
@@ -52,10 +52,20 @@ class RunView {
     try {
       const size = statSync(path).size;
       if (size <= feed.bytesRead) return;
-      // Reread whole file and refeed only the new tail (lines are append-only).
-      const contents = readFileSync(path, "utf8");
-      feed.transcript.feedChunk(contents.slice(feed.bytesRead));
-      feed.bytesRead = size;
+      // Track offsets in bytes (never UTF-16 code units) and feed only
+      // complete lines, so multibyte characters and half-flushed tail lines
+      // are never split or silently dropped.
+      const fd = openSync(path, "r");
+      try {
+        const buf = Buffer.alloc(size - feed.bytesRead);
+        const read = readSync(fd, buf, 0, buf.length, feed.bytesRead);
+        const end = buf.subarray(0, read).lastIndexOf(0x0a) + 1;
+        if (end === 0) return;
+        feed.transcript.feedChunk(buf.subarray(0, end).toString("utf8"));
+        feed.bytesRead += end;
+      } finally {
+        closeSync(fd);
+      }
     } catch {
       // No transcript captured for this lane (pre-tap run or lane not started).
     }

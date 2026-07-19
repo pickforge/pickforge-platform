@@ -181,7 +181,6 @@ export class LaneRunner {
     if (runtime) {
       runtime.settled = true;
       clearTimeout(runtime.statusTimer);
-      runtime.raw?.end();
       this.terminate(runtime);
     }
 
@@ -323,7 +322,6 @@ export class LaneRunner {
         runtime.settled = true;
         clearTimeout(runtime.statusTimer);
         this.runtimes.delete(spec.lane);
-        runtime.raw?.end();
         this.terminate(runtime);
         this.record({
           v: 1,
@@ -465,6 +463,9 @@ export class LaneRunner {
       child.once("error", (error) => finish(false, runtime.stderrTail || error.message, `spawn:${error.message}`));
       child.once("close", (code) => {
         if (runtime.stdoutBuffer) consumeLine(runtime.stdoutBuffer);
+        // End the transcript only after the last stdout flush so abandoned or
+        // failed lanes keep their tail lines.
+        runtime.raw?.end();
         if (!runtime.settled) finish(false, runtime.stderrTail, `exit:${code ?? "signal"}`);
       });
     return promise;

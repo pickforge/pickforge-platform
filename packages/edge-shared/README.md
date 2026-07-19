@@ -4,9 +4,9 @@ Deno-compatible helpers for Pickforge Edge Functions. Clients are injected struc
 
 `assertRouteRequest` accepts only the hosted-router wire shape: `commandText` plus optional `context.projectName`, `context.chatNames`, and `context.widgetLabels`. Command text is user-authored and passed through unchanged; attached context is guarded against paths, host identifiers, tailnet IPs, and long serial-like tokens with `boundary_violation`.
 
-`createOperatorRouterHandler` composes bearer-token authentication, request boundary validation, idempotent credit debiting, and an injected chat completion. A replayed idempotency key returns its stored proposal without another model call.
+`createOperatorRouterHandler` composes bearer-token authentication, request boundary validation, a durable pre-provider claim, idempotent credit debiting, and an injected chat completion. Router work is durably claimed (`claimRouteAttempt`) BEFORE the provider is invoked, so at most one caller ever calls the provider and debits for a given idempotency key; `completeRouteAttempt`/`failRouteAttempt` record the outcome, and a stale (lease-expired) claim is recoverable by a later caller. A replayed, already-debited idempotency key returns its stored proposal (`findDebitedRouteResult`, honoring rows written before the durable claim table existed) without another model call.
 
-Hosted routing is limited to 10 uncached attempts per user in each 10-second window. Its responses are `200` with a proposal, `402` for insufficient credits, `429` for `rate_limited`, boundary/auth `4xx`, and `5xx` for server or provider failures.
+Hosted routing is limited to 10 uncached attempts per user in each 10-second window. Its responses are `200` with a proposal, `402` for insufficient credits, `409` for `attempt_in_progress` (another live claim owns this key right now; retry), `429` for `rate_limited`, boundary/auth `4xx`, and `5xx` for server or provider failures.
 
 ## Usage
 

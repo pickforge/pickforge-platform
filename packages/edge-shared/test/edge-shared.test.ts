@@ -6,7 +6,9 @@ import {
   createDeleteAccountHandler,
   createExportAccountHandler,
   createOperatorRouterHandler,
+  createCallerSupabaseFactory,
   createRegisteredCheckoutSession,
+  createRequiredEnv,
   createStripeWebhookHandler,
   debitCredits,
   getBearerToken,
@@ -14,6 +16,7 @@ import {
   getUserFromRequest,
   jsonResponse,
   newIdempotencyKey,
+  withCors,
   operatorRouterSystemPrompt,
   requireEntitlement,
   type EdgeSharedJson,
@@ -478,7 +481,21 @@ describe("@pickforge/edge-shared", () => {
         resolveUserId: vi.fn(async () => USER_ID),
       });
 
-      const response = await handler(new Request("https://edge.test", { method: "POST" }));
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      let response: Response;
+      try {
+        response = await handler(new Request("https://edge.test", { method: "POST" }));
+
+        expect(consoleError).toHaveBeenCalledWith(
+          JSON.stringify({
+            scope: "edge-shared",
+            operation: "account_deletion_incomplete",
+            error_code: "deletion_incomplete",
+          }),
+        );
+      } finally {
+        consoleError.mockRestore();
+      }
 
       expect(response.status).toBe(503);
       expect(admin.auth.admin.deleteUser).not.toHaveBeenCalled();
@@ -1060,13 +1077,28 @@ describe("@pickforge/edge-shared", () => {
       }),
     });
 
-    const response = await handler(
-      new Request("https://edge.test", {
-        method: "POST",
-        headers: { "stripe-signature": "sig_123" },
-        body: "{}",
-      }),
-    );
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    let response: Response;
+    try {
+      response = await handler(
+        new Request("https://edge.test", {
+          method: "POST",
+          headers: { "stripe-signature": "sig_123" },
+          body: "{}",
+        }),
+      );
+
+      expect(consoleError).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(consoleError.mock.calls[0]![0] as string)).toEqual({
+        scope: "edge-shared",
+        operation: "stripe_webhook_processing_failed",
+        event_id: "evt_123",
+        event_type: "checkout.session.completed",
+        error_code: "Error",
+      });
+    } finally {
+      consoleError.mockRestore();
+    }
 
     expect(response.status).toBe(500);
     await expect(response.json()).resolves.toEqual({ error: "webhook_processing_failed" });
@@ -1395,6 +1427,64 @@ describe("@pickforge/edge-shared", () => {
     );
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toEqual({ error: "boundary_violation" });
+  });
+});
+
+describe("Deno Edge Function adapter helpers", () => {
+  it("reads required env vars and throws on missing or empty values", () => {
+    const env = new Map<string, string>([
+      ["SUPABASE_URL", "https://project.supabase.co"],
+      ["EMPTY", ""],
+    ]);
+    const requiredEnv = createRequiredEnv({ get: (name) => env.get(name) });
+
+    expect(requiredEnv("SUPABASE_URL")).toBe("https://project.supabase.co");
+    expect(() => requiredEnv("EMPTY")).toThrow("EMPTY is required");
+    expect(() => requiredEnv("MISSING")).toThrow("MISSING is required");
+  });
+
+  it("builds a caller-scoped Supabase client that forwards the Authorization header", () => {
+    const createClient = vi.fn((url: string, key: string, options: unknown) => ({ url, key, options }));
+    const createCallerSupabase = createCallerSupabaseFactory({
+      createClient,
+      supabaseUrl: "https://project.supabase.co",
+      supabaseAnonKey: "anon-key",
+    });
+
+    const client = createCallerSupabase(
+      new Request("https://edge.test", { headers: { Authorization: "Bearer caller-token" } }),
+    );
+
+    expect(client).toEqual({
+      url: "https://project.supabase.co",
+      key: "anon-key",
+      options: {
+        auth: { autoRefreshToken: false, persistSession: false },
+        global: { headers: { Authorization: "Bearer caller-token" } },
+      },
+    });
+  });
+
+  it("defaults the forwarded Authorization header to an empty string when absent", () => {
+    const createClient = vi.fn((_url: string, _key: string, options: { global: { headers: { Authorization: string } } }) => options);
+    const createCallerSupabase = createCallerSupabaseFactory({
+      createClient,
+      supabaseUrl: "https://project.supabase.co",
+      supabaseAnonKey: "anon-key",
+    });
+
+    const options = createCallerSupabase(new Request("https://edge.test"));
+
+    expect(options.global.headers.Authorization).toBe("");
+  });
+
+  it("merges CORS headers onto a handler response without altering its body", async () => {
+    const merged = await withCors(jsonResponse(201, { ok: true }));
+
+    expect(merged.status).toBe(201);
+    expect(merged.headers.get("access-control-allow-origin")).toBe("*");
+    expect(merged.headers.get("content-type")).toBe("application/json");
+    await expect(merged.json()).resolves.toEqual({ ok: true });
   });
 });
 

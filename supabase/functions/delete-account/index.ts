@@ -3,17 +3,22 @@ import { createClient } from "@supabase/supabase-js";
 import {
   corsHeaders,
   corsPreflightResponse,
+  createCallerSupabaseFactory,
   createDeleteAccountHandler,
+  createRequiredEnv,
   getUserFromRequest,
   jsonResponse,
+  withCors,
 } from "@pickforge/edge-shared";
 
+const requiredEnv = createRequiredEnv(Deno.env);
 const supabaseUrl = requiredEnv("SUPABASE_URL");
 const supabaseAnonKey = requiredEnv("SUPABASE_ANON_KEY");
 const serviceSupabase = createClient(supabaseUrl, requiredEnv("SUPABASE_SERVICE_ROLE_KEY"), {
   auth: { autoRefreshToken: false, persistSession: false },
 });
 const stripe = new Stripe(requiredEnv("STRIPE_SECRET_KEY"));
+const createCallerSupabase = createCallerSupabaseFactory({ createClient, supabaseUrl, supabaseAnonKey });
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
@@ -33,28 +38,3 @@ Deno.serve(async (req) => {
   });
   return withCors(handler(req));
 });
-
-function createCallerSupabase(req: Request) {
-  return createClient(supabaseUrl, supabaseAnonKey, {
-    auth: { autoRefreshToken: false, persistSession: false },
-    global: { headers: { Authorization: req.headers.get("authorization") ?? "" } },
-  });
-}
-
-async function withCors(response: Promise<Response>): Promise<Response> {
-  const resolved = await response;
-  const headers = new Headers(resolved.headers);
-  for (const [name, value] of Object.entries(corsHeaders())) {
-    headers.set(name, value);
-  }
-  return new Response(resolved.body, { status: resolved.status, headers });
-}
-
-function requiredEnv(name: string): string {
-  const value = Deno.env.get(name);
-  if (value === undefined || value.length === 0) {
-    throw new Error(`${name} is required`);
-  }
-
-  return value;
-}

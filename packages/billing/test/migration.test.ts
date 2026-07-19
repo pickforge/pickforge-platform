@@ -7,6 +7,11 @@ const migration = readFileSync(
   "utf8",
 );
 
+const balanceIndexMigration = readFileSync(
+  join(import.meta.dirname, "../../../supabase/migrations/20260719000000_credit_ledger_balance_covering_index.sql"),
+  "utf8",
+);
+
 describe("billing customers and credit ledger migration", () => {
   it("enables RLS on all billing tables", () => {
     expect(migration).toContain("alter table public.billing_customers enable row level security");
@@ -49,5 +54,20 @@ describe("billing customers and credit ledger migration", () => {
     expect(migration).toContain("security invoker");
     expect(migration).toContain("stable");
     expect(migration).toContain("coalesce(sum(amount_cents), 0)::integer");
+  });
+});
+
+describe("credit ledger balance covering index migration", () => {
+  it("adds a covering index that carries amount_cents for balance sums", () => {
+    expect(balanceIndexMigration).toContain(
+      "create index if not exists credit_ledger_user_id_amount_cents_idx",
+    );
+    expect(balanceIndexMigration).toContain("on public.credit_ledger (user_id) include (amount_cents)");
+  });
+
+  it("stays additive: no drop/renumber of the existing balance path", () => {
+    expect(balanceIndexMigration).not.toMatch(/drop\s+index/i);
+    expect(balanceIndexMigration).not.toMatch(/drop\s+table/i);
+    expect(balanceIndexMigration).not.toMatch(/alter\s+table[\s\S]*drop/i);
   });
 });

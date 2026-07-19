@@ -2,6 +2,6 @@
   "imports": {
     "stripe": "npm:stripe@19.1.0",
     "@supabase/supabase-js": "npm:@supabase/supabase-js@2.110.0",
-    "@pickforge/edge-shared": "npm:@pickforge/edge-shared@0.9.0"
+    "@pickforge/edge-shared": "npm:@pickforge/edge-shared@0.10.0"
   }
 }

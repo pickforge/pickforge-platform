@@ -1,19 +1,24 @@
 import { createClient } from "@supabase/supabase-js";
 import { getCreditBalanceCents } from "@pickforge/billing";
 import {
+  createCallerSupabaseFactory,
   createOperatorRouterHandler,
+  createRequiredEnv,
   corsHeaders,
   corsPreflightResponse,
   debitCredits,
   EdgeSharedError,
   jsonResponse,
+  withCors,
 } from "@pickforge/edge-shared";
 
+const requiredEnv = createRequiredEnv(Deno.env);
 const supabaseUrl = requiredEnv("SUPABASE_URL");
 const supabaseAnonKey = requiredEnv("SUPABASE_ANON_KEY");
 const serviceSupabase = createClient(supabaseUrl, requiredEnv("SUPABASE_SERVICE_ROLE_KEY"), {
   auth: { autoRefreshToken: false, persistSession: false },
 });
+const createCallerSupabase = createCallerSupabaseFactory({ createClient, supabaseUrl, supabaseAnonKey });
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
@@ -41,12 +46,7 @@ Deno.serve(async (req) => {
     creditCostCents: readPositiveIntegerEnv("ROUTER_CREDIT_COST_CENTS", 2),
   });
 
-  const response = await handler(req);
-  const headers = new Headers(response.headers);
-  for (const [name, value] of Object.entries(corsHeaders())) {
-    headers.set(name, value);
-  }
-  return new Response(response.body, { status: response.status, headers });
+  return withCors(handler(req));
 });
 
 async function findCompletedRoute(userId: string, idempotencyKey: string) {
@@ -92,13 +92,6 @@ async function consumeRateLimit(userId: string): Promise<boolean> {
 
 function respond(status: number, body: unknown): Response {
   return jsonResponse(status, body, corsHeaders());
-}
-
-function createCallerSupabase(req: Request) {
-  return createClient(supabaseUrl, supabaseAnonKey, {
-    auth: { autoRefreshToken: false, persistSession: false },
-    global: { headers: { Authorization: req.headers.get("authorization") ?? "" } },
-  });
 }
 
 async function chatComplete({
@@ -154,13 +147,4 @@ function readPositiveIntegerEnv(name: string, fallback: number): number {
   }
 
   return parsed;
-}
-
-function requiredEnv(name: string): string {
-  const value = Deno.env.get(name);
-  if (value === undefined || value.length === 0) {
-    throw new Error(`${name} is required`);
-  }
-
-  return value;
 }

@@ -1,8 +1,9 @@
 import Stripe from "npm:stripe@19.1.0";
 import { createClient } from "npm:@supabase/supabase-js@2.110.0";
-import { processStripeEvent, verifyStripeEvent } from "npm:@pickforge/billing@0.9.0";
-import { createStripeWebhookHandler } from "npm:@pickforge/edge-shared@0.9.0";
+import { processStripeEvent, verifyStripeEvent } from "npm:@pickforge/billing@0.10.0";
+import { createRequiredEnv, createStripeWebhookHandler } from "npm:@pickforge/edge-shared@0.10.0";
 
+const requiredEnv = createRequiredEnv(Deno.env);
 const stripe = new Stripe(requiredEnv("STRIPE_SECRET_KEY"));
 const supabase = createClient(requiredEnv("SUPABASE_URL"), requiredEnv("SUPABASE_SERVICE_ROLE_KEY"), {
   auth: {
@@ -19,12 +20,3 @@ const handleWebhookRequest = createStripeWebhookHandler({
 });
 
 Deno.serve(handleWebhookRequest);
-
-function requiredEnv(name: string): string {
-  const value = Deno.env.get(name);
-  if (value === undefined || value.length === 0) {
-    throw new Error(`${name} is required`);
-  }
-
-  return value;
-}

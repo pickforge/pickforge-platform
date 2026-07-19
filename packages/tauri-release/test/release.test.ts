@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { runCli } from "../src/cli.js";
 import {
   collectAssets,
@@ -29,12 +29,34 @@ import {
   type TauriReleaseConfig,
 } from "../src/index.js";
 
+const injectedWriteFailure = vi.hoisted(() => ({ path: null as string | null, remaining: 0 }));
+
+vi.mock("node:fs", async () => {
+  const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+  return {
+    ...actual,
+    writeFileSync(path: Parameters<typeof actual.writeFileSync>[0], ...args: unknown[]) {
+      if (
+        typeof path === "string" &&
+        path === injectedWriteFailure.path &&
+        injectedWriteFailure.remaining > 0
+      ) {
+        injectedWriteFailure.remaining -= 1;
+        throw new Error(`injected write failure for ${path}`);
+      }
+      return Reflect.apply(actual.writeFileSync, actual, [path, ...args]);
+    },
+  };
+});
+
 const tempRoots: string[] = [];
 const squashfsToolsAvailable = hasCommand("mksquashfs") && hasCommand("unsquashfs");
 const zstdSquashfsAvailable = squashfsToolsAvailable && hasSquashfsCompressor("zstd");
 const toolOutputMaxBuffer = 64 * 1024 * 1024;
 
 afterEach(() => {
+  injectedWriteFailure.path = null;
+  injectedWriteFailure.remaining = 0;
   for (const root of tempRoots.splice(0)) {
     rmSync(root, { force: true, recursive: true });
   }
@@ -843,23 +865,109 @@ describe("@pickforge/tauri-release", () => {
   );
 
   it.skipIf(!squashfsToolsAvailable)(
-    "removes stale signatures before invoking the signer",
+    "currently replaces the AppImage and removes its stale signature when signing fails",
     () => {
       const root = tempRoot();
       const { appimage } = createSyntheticAppImage(root);
       const signStub = join(root, "failing-sign-stub.sh");
+      const latestJson = join(root, "latest.json");
       writeFileSync(signStub, "#!/bin/sh\nexit 7\n");
       writeFileSync(`${appimage}.sig`, "stale-signature");
+      writeLatestJsonFixture(latestJson, "PickGauge_1.0.0_amd64.AppImage");
       chmodSync(signStub, 0o755);
+      const artifactBefore = readFileSync(appimage);
+      const feedBefore = readFileSync(latestJson);
 
       expect(() =>
         fixAppImage({
           appimage,
           env: { ...envWithoutSigning(), TAURI_SIGNING_PRIVATE_KEY: "test-key" },
+          latestJson,
           signCommand: signStub,
         }),
       ).toThrow(/sign command failed with exit code 7/u);
+      expect(readFileSync(appimage)).not.toEqual(artifactBefore);
       expect(existsSync(`${appimage}.sig`)).toBe(false);
+      expect(readFileSync(latestJson)).toEqual(feedBefore);
+    },
+  );
+
+  it.skipIf(!squashfsToolsAvailable)(
+    "currently leaves the release set unchanged when rebuilding fails",
+    () => {
+      const root = tempRoot();
+      const { appimage } = createSyntheticAppImage(root);
+      const latestJson = join(root, "latest.json");
+      writeFileSync(`${appimage}.sig`, "stale-signature");
+      writeLatestJsonFixture(latestJson, "PickGauge_1.0.0_amd64.AppImage");
+      const artifactBefore = readFileSync(appimage);
+      const signatureBefore = readFileSync(`${appimage}.sig`);
+      const feedBefore = readFileSync(latestJson);
+
+      expect(() =>
+        fixAppImage({
+          appimage,
+          env: failingMksquashfsEnv(root),
+          latestJson,
+        }),
+      ).toThrow(/mksquashfs failed with exit code 19/u);
+      expect(readFileSync(appimage)).toEqual(artifactBefore);
+      expect(readFileSync(`${appimage}.sig`)).toEqual(signatureBefore);
+      expect(readFileSync(latestJson)).toEqual(feedBefore);
+    },
+  );
+
+  it.skipIf(!squashfsToolsAvailable)(
+    "currently leaves earlier release entries changed when the feed write fails",
+    () => {
+      const root = tempRoot();
+      const { appimage } = createSyntheticAppImage(root);
+      const signStub = join(root, "sign-stub.sh");
+      const latestJson = join(root, "latest.json");
+      writeFileSync(signStub, "#!/bin/sh\nprintf 'new-signature\\n' > \"$1.sig\"\n");
+      writeFileSync(`${appimage}.sig`, "stale-signature");
+      writeLatestJsonFixture(latestJson, "PickGauge_1.0.0_amd64.AppImage");
+      chmodSync(signStub, 0o755);
+      const artifactBefore = readFileSync(appimage);
+      const feedBefore = readFileSync(latestJson);
+      failNextWrite(latestJson);
+
+      expect(() =>
+        fixAppImage({
+          appimage,
+          env: { ...envWithoutSigning(), TAURI_SIGNING_PRIVATE_KEY: "test-key" },
+          latestJson,
+          signCommand: signStub,
+        }),
+      ).toThrow(/injected write failure/u);
+      expect(readFileSync(appimage)).not.toEqual(artifactBefore);
+      expect(readFileSync(`${appimage}.sig`, "utf8")).toBe("new-signature\n");
+      expect(readFileSync(latestJson)).toEqual(feedBefore);
+    },
+  );
+
+  it.skipIf(!squashfsToolsAvailable)(
+    "currently stops before changing the signature or feed when the artifact write fails",
+    () => {
+      const root = tempRoot();
+      const { appimage } = createSyntheticAppImage(root);
+      const latestJson = join(root, "latest.json");
+      writeFileSync(`${appimage}.sig`, "stale-signature");
+      writeLatestJsonFixture(latestJson, "PickGauge_1.0.0_amd64.AppImage");
+      const artifactBefore = readFileSync(appimage);
+      const signatureBefore = readFileSync(`${appimage}.sig`);
+      const feedBefore = readFileSync(latestJson);
+      failNextWrite(appimage);
+
+      expect(() =>
+        fixAppImage({
+          appimage,
+          env: envWithoutSigning(),
+        }),
+      ).toThrow(/injected write failure/u);
+      expect(readFileSync(appimage)).toEqual(artifactBefore);
+      expect(readFileSync(`${appimage}.sig`)).toEqual(signatureBefore);
+      expect(readFileSync(latestJson)).toEqual(feedBefore);
     },
   );
 
@@ -1133,6 +1241,37 @@ async function captureCli(argv: string[]): Promise<{ code: number; stdout: strin
     process.stdout.write = stdoutWrite;
     process.stderr.write = stderrWrite;
   }
+}
+
+function failNextWrite(path: string): void {
+  injectedWriteFailure.path = path;
+  injectedWriteFailure.remaining = 1;
+}
+
+function failingMksquashfsEnv(root: string): NodeJS.ProcessEnv {
+  const bin = join(root, "failing-tools");
+  const mksquashfs = commandPath("mksquashfs");
+  const unsquashfs = commandPath("unsquashfs");
+  if (mksquashfs === null || unsquashfs === null) {
+    throw new Error("SquashFS tools are required for this fixture");
+  }
+  mkdirSync(bin);
+  writeFileSync(
+    join(bin, "mksquashfs"),
+    `#!/bin/sh\nif [ "\${1:-}" = "-version" ]; then exec ${JSON.stringify(mksquashfs)} "$@"; fi\nexit 19\n`,
+  );
+  chmodSync(join(bin, "mksquashfs"), 0o755);
+  symlinkSync(unsquashfs, join(bin, "unsquashfs"));
+  return {
+    ...envWithoutSigning(),
+    PATH: bin,
+    TAURI_SIGNING_PRIVATE_KEY: "test-key",
+  };
+}
+
+function commandPath(command: string): string | null {
+  const result = spawnSync("sh", ["-c", `command -v ${command}`], { encoding: "utf8" });
+  return result.status === 0 ? result.stdout.trim() : null;
 }
 
 function envWithoutSigning(): NodeJS.ProcessEnv {

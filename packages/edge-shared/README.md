@@ -73,7 +73,7 @@ Deno.serve(async (req) => {
 Requesting deletion is terminal: once the fence exists, checkout stays disabled and the deletion endpoint is retry-only until every cleanup or refund finishes and auth deletion succeeds.
 Registry state `open` means “registered and not yet reconciled or durably marked expired”; it does not assert that Stripe still reports the Session as open.
 
-The lifecycle-aware helpers require a `0.9.0` package publish before deploying functions that import them.
+The lifecycle-aware helpers require a `0.9.0` package publish before deploying functions that import them. `isCheckoutDeletionFenced`, `registerCheckoutSession`, and `markCheckoutSessionExpired` wrap the `checkout_lifecycle_is_deletion_fenced`, `checkout_lifecycle_register_session`, and `checkout_lifecycle_mark_expired` RPCs used by `createRegisteredCheckoutSession`'s callbacks, so a Checkout Session creation adapter never re-implements that RPC contract.
 
 ## Cross-repo imports
 

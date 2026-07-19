@@ -1162,7 +1162,46 @@ async function fenceAccountDeletion(admin: AccountAdminClientLike, userId: strin
   }
 }
 
-async function markCheckoutSessionExpired(
+/**
+ * Reads whether an account deletion fence is already in effect for a user.
+ * The sole production caller registers a new Checkout Session (see
+ * `createRegisteredCheckoutSession`'s `isDeletionFenced` callback); colocated
+ * here so the RPC name and its result contract have one owner.
+ */
+export async function isCheckoutDeletionFenced(
+  admin: Pick<AccountAdminClientLike, "rpc">,
+  userId: string,
+): Promise<boolean> {
+  const { data, error } = await accountRpc<boolean>(admin, "checkout_lifecycle_is_deletion_fenced", {
+    target_user: userId,
+  });
+  if (error !== null || typeof data !== "boolean") {
+    throw databaseError("Failed to read account deletion fence", error ?? invalidRpcResultCause());
+  }
+  return data;
+}
+
+/**
+ * Registers a newly created Checkout Session against the durable lifecycle,
+ * returning whether an account-deletion fence raced the registration. See
+ * `isCheckoutDeletionFenced` for why this lives next to that check.
+ */
+export async function registerCheckoutSession(
+  admin: Pick<AccountAdminClientLike, "rpc">,
+  userId: string,
+  sessionId: string,
+): Promise<boolean> {
+  const { data, error } = await accountRpc<boolean>(admin, "checkout_lifecycle_register_session", {
+    target_user: userId,
+    checkout_session_id: sessionId,
+  });
+  if (error !== null || typeof data !== "boolean") {
+    throw databaseError("Failed to register Checkout Session", error ?? invalidRpcResultCause());
+  }
+  return data;
+}
+
+export async function markCheckoutSessionExpired(
   admin: Pick<AccountAdminClientLike, "rpc">,
   sessionId: string,
 ): Promise<void> {
@@ -1172,6 +1211,10 @@ async function markCheckoutSessionExpired(
   if (error !== null) {
     throw databaseError("Failed to mark Checkout Session expired", error);
   }
+}
+
+function invalidRpcResultCause(): SupabaseErrorLike {
+  return { message: "rpc returned an invalid result" };
 }
 
 async function runDeletionSettlementPass(

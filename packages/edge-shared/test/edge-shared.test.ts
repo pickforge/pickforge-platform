@@ -14,8 +14,11 @@ import {
   getBearerToken,
   expireCheckoutSession,
   getUserFromRequest,
+  isCheckoutDeletionFenced,
   jsonResponse,
+  markCheckoutSessionExpired,
   newIdempotencyKey,
+  registerCheckoutSession,
   withCors,
   operatorRouterSystemPrompt,
   requireEntitlement,
@@ -368,6 +371,69 @@ describe("@pickforge/edge-shared", () => {
     expect(registerSession).toHaveBeenCalledWith(USER_ID, "cs_raced");
     expect(stripe.checkout.sessions.expire).toHaveBeenCalledWith("cs_raced");
     expect(markSessionExpired).toHaveBeenCalledWith("cs_raced");
+  });
+
+  it("reads the account deletion fence used to gate new Checkout Session registration", async () => {
+    const rpc = vi.fn(async (fn: string, args?: Record<string, unknown>) => {
+      expect(fn).toBe("checkout_lifecycle_is_deletion_fenced");
+      expect(args).toEqual({ target_user: USER_ID });
+      return { data: true, error: null };
+    });
+
+    await expect(isCheckoutDeletionFenced({ rpc }, USER_ID)).resolves.toBe(true);
+  });
+
+  it("raises a database_error when the deletion fence RPC fails or returns a non-boolean", async () => {
+    await expect(
+      isCheckoutDeletionFenced({ rpc: async () => ({ data: null, error: { message: "down" } }) }, USER_ID),
+    ).rejects.toMatchObject({ code: "database_error" } satisfies Partial<EdgeSharedError>);
+
+    await expect(
+      isCheckoutDeletionFenced({ rpc: async () => ({ data: "nope", error: null }) }, USER_ID),
+    ).rejects.toMatchObject({ code: "database_error" } satisfies Partial<EdgeSharedError>);
+  });
+
+  it("registers a Checkout Session against the durable lifecycle", async () => {
+    const rpc = vi.fn(async (fn: string, args?: Record<string, unknown>) => {
+      expect(fn).toBe("checkout_lifecycle_register_session");
+      expect(args).toEqual({ target_user: USER_ID, checkout_session_id: "cs_registered" });
+      return { data: false, error: null };
+    });
+
+    await expect(registerCheckoutSession({ rpc }, USER_ID, "cs_registered")).resolves.toBe(false);
+  });
+
+  it("raises a database_error when Checkout Session registration fails or returns a non-boolean", async () => {
+    await expect(
+      registerCheckoutSession(
+        { rpc: async () => ({ data: null, error: { message: "down" } }) },
+        USER_ID,
+        "cs_x",
+      ),
+    ).rejects.toMatchObject({ code: "database_error" } satisfies Partial<EdgeSharedError>);
+
+    await expect(
+      registerCheckoutSession({ rpc: async () => ({ data: 1, error: null }) }, USER_ID, "cs_x"),
+    ).rejects.toMatchObject({ code: "database_error" } satisfies Partial<EdgeSharedError>);
+  });
+
+  it("marks a Checkout Session expired against the durable lifecycle", async () => {
+    const rpc = vi.fn(async (fn: string, args?: Record<string, unknown>) => {
+      expect(fn).toBe("checkout_lifecycle_mark_expired");
+      expect(args).toEqual({ checkout_session_id: "cs_expired" });
+      return { data: null, error: null };
+    });
+
+    await expect(markCheckoutSessionExpired({ rpc }, "cs_expired")).resolves.toBeUndefined();
+  });
+
+  it("raises a database_error when marking a Checkout Session expired fails", async () => {
+    await expect(
+      markCheckoutSessionExpired(
+        { rpc: async () => ({ data: null, error: { message: "down" } }) },
+        "cs_expired",
+      ),
+    ).rejects.toMatchObject({ code: "database_error" } satisfies Partial<EdgeSharedError>);
   });
 
   it("recognizes a completed Session without trying to expire it", async () => {

@@ -10,6 +10,14 @@ interface LastRun {
   runner: LaneRunner;
   projection: RunProjection;
   hidden: boolean;
+  /** Resolves when every lane settles. */
+  settled: Promise<LaneProjection[]>;
+  /** True once run_end was journaled and the summary is available. */
+  ended: boolean;
+  /** True once the model has consumed the final results (wait or nudge). */
+  reported: boolean;
+  /** Number of lanes_wait calls currently attached; suppresses the settle nudge. */
+  waiters: number;
 }
 
 interface SpawnLaneInput {
@@ -136,7 +144,7 @@ export default function lanesExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "lanes_spawn",
     label: "Spawn lanes",
-    description: `Run independent Pi lanes concurrently. You MUST state an explicit model and effort for every lane. Any effort off|minimal|low|medium|high|xhigh is allowed per lane (the value in parentheses is only that model's starting prior). Models: ${MODEL_TABLE.map((row) => `${row.selector} (prior ${row.prior})`).join(", ")}.`,
+    description: `Spawn independent Pi lanes that run concurrently in the background (non-blocking: this tool returns immediately; lanes survive turn cancellation). Collect results with lanes_wait, inspect progress or a specific lane with lanes_status, stop lanes only with lanes_abandon. While lanes run you can keep working with the user. You MUST state an explicit model and effort for every lane. Any effort off|minimal|low|medium|high|xhigh is allowed per lane (the value in parentheses is only that model's starting prior). Models: ${MODEL_TABLE.map((row) => `${row.selector} (prior ${row.prior})`).join(", ")}.`,
     parameters: Type.Object({
       lanes: Type.Array(
         Type.Object({
@@ -171,71 +179,240 @@ export default function lanesExtension(pi: ExtensionAPI): void {
         };
       }
 
-      const runId = newRunId();
-      const startedAt = Date.now();
-      let view: LastRun | undefined;
-      let timer: NodeJS.Timeout | undefined;
-      let runner: LaneRunner | undefined;
-      const onAbort = () => runner?.abandonAll("aborted by parent");
-      try {
-        appendEvent({
-          v: 1,
-          t: new Date().toISOString(),
-          run: runId,
-          type: "run_created",
-          lanes: specs.length,
-          origin: "lanes_spawn",
-        });
-
-        const activeRunner = new LaneRunner({
-          runId,
-          append: appendEvent,
-          onUpdate() {
-            if (view && lastRun === view) renderWidget(ctx, view);
-          },
-        });
-        runner = activeRunner;
-        view = { id: runId, runner: activeRunner, projection: activeRunner.projection(), hidden: false };
-        lastRun = view;
-        renderWidget(ctx, view);
-
-        signal?.addEventListener("abort", onAbort, { once: true });
-        timer = ctx.hasUI ? setInterval(() => renderWidget(ctx, view!), 1_000) : undefined;
-        timer?.unref();
-        const projections = await activeRunner.dispatch(specs);
-
-        const ok = projections.every((lane) => lane.state === "done");
-        appendEvent({
-          v: 1,
-          t: new Date().toISOString(),
-          run: runId,
-          type: "run_end",
-          ok,
-          durationMs: Date.now() - startedAt,
-        });
-        // Widget stays visible after completion; only /lanes hide or a new run replaces it.
-        renderWidget(ctx, view);
-
-        const text = projections
-          .map((lane) => {
-            const answer = lane.answer?.replace(/\s+/g, " ").trim().slice(0, 400) ?? "";
-            const failure = lane.state !== "done" ? ` · ${lane.abandonReason ?? "failed"}` : "";
-            return `${lane.spec.lane}: ${lane.state} · ${lane.spec.model}:${lane.spec.effort} · tok ${lane.tokensIn}/${lane.tokensOut} · $${lane.cost.toFixed(4)}${failure}${answer ? ` · ${answer}` : ""}`;
-          })
-          .join("\n");
-        return { content: [{ type: "text" as const, text }], details: projections, isError: !ok };
-      } catch (error) {
-        runner?.abandonAll("lanes_spawn error");
-        const message = error instanceof Error ? error.message : String(error);
+      if (lastRun && !lastRun.ended) {
         return {
-          content: [{ type: "text" as const, text: `lanes_spawn failed: ${message}` }],
-          details: { error: message },
+          content: [
+            {
+              type: "text" as const,
+              text: `Run ${lastRun.id} is still active. Use lanes_status to inspect it, lanes_wait to collect it, or lanes_abandon to stop it before spawning a new run.`,
+            },
+          ],
+          details: { activeRun: lastRun.id },
           isError: true,
         };
-      } finally {
-        clearInterval(timer);
-        signal?.removeEventListener("abort", onAbort);
       }
+
+      const runId = newRunId();
+      const startedAt = Date.now();
+      appendEvent({
+        v: 1,
+        t: new Date().toISOString(),
+        run: runId,
+        type: "run_created",
+        lanes: specs.length,
+        origin: "lanes_spawn",
+      });
+
+      let view: LastRun;
+      const activeRunner = new LaneRunner({
+        runId,
+        append: appendEvent,
+        onUpdate() {
+          if (view && lastRun === view) renderWidget(ctx, view);
+        },
+      });
+
+      // Deliberately NOT wired to the tool-call abort signal: lanes survive
+      // ESC / turn cancellation. Stopping a run is explicit via lanes_abandon
+      // or /lanes abandon.
+      const timer = ctx.hasUI ? setInterval(() => renderWidget(ctx, view), 1_000) : undefined;
+      timer?.unref();
+
+      const settled = activeRunner
+        .dispatch(specs)
+        .then((projections) => {
+          const ok = projections.every((lane) => lane.state === "done");
+          appendEvent({
+            v: 1,
+            t: new Date().toISOString(),
+            run: runId,
+            type: "run_end",
+            ok,
+            durationMs: Date.now() - startedAt,
+          });
+          return projections;
+        })
+        .catch((error: unknown) => {
+          activeRunner.abandonAll("lanes run error");
+          appendEvent({
+            v: 1,
+            t: new Date().toISOString(),
+            run: runId,
+            type: "run_end",
+            ok: false,
+            durationMs: Date.now() - startedAt,
+          });
+          return [...activeRunner.projection().lanes.values()];
+        })
+        .finally(() => {
+          clearInterval(timer);
+          view.ended = true;
+          // Widget stays visible after completion; only /lanes hide or a new run replaces it.
+          if (lastRun === view) renderWidget(ctx, view);
+          // Nudge the model when it is idle and never collected the results.
+          if (lastRun === view && !view.reported && view.waiters === 0) {
+            try {
+              if (ctx.isIdle()) {
+                view.reported = true;
+                pi.sendUserMessage(
+                  `[lanes] run ${runId} settled. Call lanes_status for the results, then continue where we left off.`,
+                );
+              } else {
+                pi.sendUserMessage(
+                  `[lanes] run ${runId} settled — results available via lanes_status/lanes_wait when convenient.`,
+                  { deliverAs: "followUp" },
+                );
+              }
+            } catch {
+              // Nudge is best-effort; lanes_status still works.
+            }
+          }
+        });
+
+      view = {
+        id: runId,
+        runner: activeRunner,
+        projection: activeRunner.projection(),
+        hidden: false,
+        settled,
+        ended: false,
+        reported: false,
+        waiters: 0,
+      };
+      lastRun = view;
+      renderWidget(ctx, view);
+
+      const text = [
+        `Run ${runId} spawned with ${specs.length} lane${specs.length === 1 ? "" : "s"} (non-blocking):`,
+        ...specs.map((spec) => `  ${spec.lane}: ${spec.model}:${spec.effort}`),
+        "Lanes run in the background and survive turn cancellation.",
+        "Use lanes_status to check progress or answer questions about a lane, lanes_wait to block for final results, lanes_abandon to stop lanes.",
+        "You can keep working with the user meanwhile — do not poll lanes_status in a loop.",
+      ].join("\n");
+      return { content: [{ type: "text" as const, text }], details: { run: runId, lanes: specs.length } };
+    },
+  });
+
+  function summarizeLane(lane: LaneProjection, verbose: boolean): string {
+    const answerLimit = verbose ? 4_000 : 400;
+    const answer = lane.answer?.replace(/\s+/g, " ").trim().slice(0, answerLimit) ?? "";
+    const failure = lane.state === "failed" || lane.state === "abandoned" ? ` · ${lane.abandonReason ?? "failed"}` : "";
+    const activity =
+      lane.state === "running" ? ` · ${(lane.currentTool ?? lane.lastStatus ?? "working").slice(0, verbose ? 200 : 60)}` : "";
+    const duration = lane.durationMs !== undefined ? ` · ${fmtDuration(lane.durationMs)}` : "";
+    return `${lane.spec.lane}: ${lane.state} · ${lane.spec.model}:${lane.spec.effort} · tok ${lane.tokensIn}/${lane.tokensOut} · $${lane.cost.toFixed(4)}${duration}${failure}${activity}${answer ? ` · ${answer}` : ""}`;
+  }
+
+  function summarizeRun(run: LastRun, laneFilter?: string): { text: string; lanes: LaneProjection[]; missing?: string } {
+    const all = [...run.projection.lanes.values()];
+    if (laneFilter) {
+      const lane = run.projection.lanes.get(laneFilter);
+      if (!lane) return { text: "", lanes: [], missing: laneFilter };
+      return { text: `run ${run.id} (${run.ended ? "ended" : "active"})\n${summarizeLane(lane, true)}`, lanes: [lane] };
+    }
+    const header = `run ${run.id} (${run.ended ? "ended" : "active"}) · $${run.projection.totalCost.toFixed(4)} · tok ${run.projection.totalTokensIn}/${run.projection.totalTokensOut}`;
+    return { text: [header, ...all.map((lane) => summarizeLane(lane, run.ended))].join("\n"), lanes: all };
+  }
+
+  pi.registerTool({
+    name: "lanes_status",
+    label: "Lane status",
+    description:
+      "Report live status of the current lane run without blocking: per-lane state, current activity, tokens, cost, and (for settled lanes) answers. Pass `lane` for a detailed view of one lane — use this when the user asks about a specific lane. Do not call in a polling loop; prefer lanes_wait when you only need the final results.",
+    parameters: Type.Object({
+      lane: Type.Optional(Type.String()),
+    }),
+    async execute(_toolCallId, params) {
+      if (!lastRun) {
+        return { content: [{ type: "text" as const, text: "No lane run has been spawned this session." }], details: undefined };
+      }
+      const { text, missing } = summarizeRun(lastRun, params.lane);
+      if (missing) {
+        const known = [...lastRun.projection.lanes.keys()].join(", ");
+        return {
+          content: [{ type: "text" as const, text: `Unknown lane "${missing}". Lanes in run ${lastRun.id}: ${known}` }],
+          details: undefined,
+          isError: true,
+        };
+      }
+      if (lastRun.ended) lastRun.reported = true;
+      return { content: [{ type: "text" as const, text }], details: undefined };
+    },
+  });
+
+  pi.registerTool({
+    name: "lanes_wait",
+    label: "Wait for lanes",
+    description:
+      "Block until the current lane run settles and return the final per-lane results. Call this when you have nothing else to do for the user, or when the user asks for the results. Cancelling this wait does NOT stop the lanes — they keep running and lanes_status/lanes_wait remain available.",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, signal) {
+      if (!lastRun) {
+        return { content: [{ type: "text" as const, text: "No lane run has been spawned this session." }], details: undefined };
+      }
+      const run = lastRun;
+      if (!run.ended) {
+        // Wait for settlement or the tool call being aborted — abort only
+        // detaches the wait, it never touches the lanes themselves.
+        run.waiters++;
+        try {
+          await Promise.race([
+            run.settled,
+            new Promise<void>((resolve) => {
+              if (!signal) return;
+              if (signal.aborted) resolve();
+              else signal.addEventListener("abort", () => resolve(), { once: true });
+            }),
+          ]);
+        } finally {
+          run.waiters--;
+        }
+        if (!run.ended) {
+          return {
+            content: [
+              { type: "text" as const, text: `Wait detached; run ${run.id} keeps running. Use lanes_status or lanes_wait again.` },
+            ],
+            details: undefined,
+          };
+        }
+      }
+      run.reported = true;
+      const { text, lanes } = summarizeRun(run);
+      const ok = lanes.every((lane) => lane.state === "done");
+      return { content: [{ type: "text" as const, text }], details: lanes, isError: !ok };
+    },
+  });
+
+  pi.registerTool({
+    name: "lanes_abandon",
+    label: "Abandon lanes",
+    description:
+      "Explicitly stop lanes of the current run. Pass `lane` to stop one lane, omit it to stop all. This is the only way to stop lanes — they are not cancelled by ESC or turn cancellation.",
+    parameters: Type.Object({
+      lane: Type.Optional(Type.String()),
+      reason: Type.Optional(Type.String()),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (!lastRun) {
+        return { content: [{ type: "text" as const, text: "No lane run has been spawned this session." }], details: undefined };
+      }
+      const reason = params.reason?.trim() || "abandoned by model";
+      if (params.lane) {
+        if (!lastRun.projection.lanes.has(params.lane)) {
+          const known = [...lastRun.projection.lanes.keys()].join(", ");
+          return {
+            content: [{ type: "text" as const, text: `Unknown lane "${params.lane}". Lanes: ${known}` }],
+            details: undefined,
+            isError: true,
+          };
+        }
+        lastRun.runner.abandon(params.lane, reason);
+      } else {
+        lastRun.runner.abandonAll(reason);
+      }
+      renderWidget(ctx, lastRun);
+      const { text } = summarizeRun(lastRun);
+      return { content: [{ type: "text" as const, text }], details: undefined };
     },
   });
 

@@ -318,16 +318,14 @@ describe("@pickforge/sync", () => {
     });
   });
 
-  it("retries the conditional update after an ignored duplicate insert race", async () => {
+  it("treats an equal updated_at as stale, so the first writer wins a tie", async () => {
     const supabase = new MemorySupabase();
-    supabase.beforeNextUpsert(() => {
-      supabase.tables.settings_sync.push({
-        user_id: USER_ID,
-        field_group: "appSettings",
-        payload: { theme: "older" },
-        updated_at: OLDER,
-        deleted_at: null,
-      });
+    await pushGroup({
+      supabase,
+      userId: USER_ID,
+      group: "appSettings",
+      payload: { theme: "first" },
+      updatedAt: NEWER,
     });
 
     await expect(
@@ -335,14 +333,14 @@ describe("@pickforge/sync", () => {
         supabase,
         userId: USER_ID,
         group: "appSettings",
-        payload: { theme: "newer" },
+        payload: { theme: "second" },
         updatedAt: NEWER,
       }),
     ).resolves.toEqual({
-      status: "written",
+      status: "stale",
       record: {
         fieldGroup: "appSettings",
-        payload: { theme: "newer" },
+        payload: { theme: "first" },
         updatedAt: NEWER,
       },
     });
@@ -350,11 +348,34 @@ describe("@pickforge/sync", () => {
       {
         user_id: USER_ID,
         field_group: "appSettings",
-        payload: { theme: "newer" },
+        payload: { theme: "first" },
         updated_at: NEWER,
         deleted_at: null,
       },
     ]);
+  });
+
+  it("treats an equal updated_at delete race the same way: first writer wins", async () => {
+    const supabase = new MemorySupabase();
+    await pushGroup({
+      supabase,
+      userId: USER_ID,
+      group: "appSettings",
+      payload: { theme: "dark" },
+      updatedAt: OLDER,
+    });
+    await deleteGroup({ supabase, userId: USER_ID, group: "appSettings", updatedAt: DELETED });
+
+    await expect(
+      pushGroup({
+        supabase,
+        userId: USER_ID,
+        group: "appSettings",
+        payload: { theme: "racing-push" },
+        updatedAt: DELETED,
+      }),
+    ).resolves.toEqual({ status: "stale", record: null });
+    await expect(pullGroup({ supabase, userId: USER_ID, group: "appSettings" })).resolves.toBeNull();
   });
 });
 
@@ -375,8 +396,6 @@ class MemorySupabase implements SupabaseClientLike {
     settings_sync: [],
   };
 
-  private readonly upsertHooks: Array<() => void> = [];
-
   from<T = unknown>(table: string): SupabaseQueryBuilderLike<T> {
     if (table !== "settings_sync") {
       throw new Error(`Unknown table: ${table}`);
@@ -385,22 +404,58 @@ class MemorySupabase implements SupabaseClientLike {
     return new MemoryQuery<T>(this, table);
   }
 
-  beforeNextUpsert(hook: () => void): void {
-    this.upsertHooks.push(hook);
+  // Mirrors the durable `settings_sync_lww_write` Postgres function (see
+  // supabase/migrations/20260720000000_settings_sync_lww.sql): compares the
+  // incoming `updated_at` against any existing row for (user_id, field_group)
+  // and performs whichever of insert/update/no-op wins, returning whichever
+  // row is now authoritative. This fake is single-threaded, so it is
+  // inherently atomic; real concurrent-race coverage lives in the local-
+  // Postgres contract lane (packages/sync/test/lww.contract.test.ts).
+  rpc(fn: string, args: Record<string, unknown> = {}): PromiseLike<SupabaseQueryResult<unknown>> {
+    if (fn !== "settings_sync_lww_write") {
+      throw new Error(`Unknown rpc: ${fn}`);
+    }
+
+    return Promise.resolve(this.applyLwwWrite(args));
   }
 
-  runBeforeUpsert(): void {
-    this.upsertHooks.shift()?.();
+  private applyLwwWrite(args: Record<string, unknown>): SupabaseQueryResult<unknown> {
+    const targetUser = args.target_user as string;
+    const targetGroup = args.target_group as string;
+    const newPayload = args.new_payload as Json;
+    const newUpdatedAt = args.new_updated_at as string;
+    const newDeletedAt = (args.new_deleted_at as string | null) ?? null;
+
+    const existing = this.tables.settings_sync.find(
+      (row) => row.user_id === targetUser && row.field_group === targetGroup,
+    );
+
+    if (existing === undefined) {
+      const row: SettingsSyncRow = {
+        user_id: targetUser,
+        field_group: targetGroup,
+        payload: newPayload,
+        updated_at: newUpdatedAt,
+        deleted_at: newDeletedAt,
+      };
+      this.tables.settings_sync.push(row);
+      return { data: { written: true, ...row }, error: null };
+    }
+
+    if (newUpdatedAt > existing.updated_at) {
+      existing.payload = newPayload;
+      existing.updated_at = newUpdatedAt;
+      existing.deleted_at = newDeletedAt;
+      return { data: { written: true, ...existing }, error: null };
+    }
+
+    return { data: { written: false, ...existing }, error: null };
   }
 }
 
 class MemoryQuery<T> implements SupabaseQueryBuilderLike<T> {
-  private action: "select" | "update" | "upsert" = "select";
-  private values: Record<string, unknown> | null = null;
-  private filters: Array<{ column: string; op: "eq" | "is" | "lt"; value: unknown }> = [];
+  private filters: Array<{ column: string; op: "eq" | "is"; value: unknown }> = [];
   private orderBy: { column: string; ascending: boolean } | null = null;
-  private onConflict: string | undefined;
-  private ignoreDuplicates = false;
 
   constructor(
     private readonly supabase: MemorySupabase,
@@ -411,23 +466,6 @@ class MemoryQuery<T> implements SupabaseQueryBuilderLike<T> {
     return this;
   }
 
-  update(values: unknown): SupabaseQueryBuilderLike<T> {
-    this.action = "update";
-    this.values = values as Record<string, unknown>;
-    return this;
-  }
-
-  upsert(
-    values: unknown,
-    options?: { onConflict?: string; ignoreDuplicates?: boolean },
-  ): SupabaseQueryBuilderLike<T> {
-    this.action = "upsert";
-    this.values = values as Record<string, unknown>;
-    this.onConflict = options?.onConflict;
-    this.ignoreDuplicates = options?.ignoreDuplicates === true;
-    return this;
-  }
-
   eq(column: string, value: unknown): SupabaseQueryBuilderLike<T> {
     this.filters.push({ column, op: "eq", value });
     return this;
@@ -435,11 +473,6 @@ class MemoryQuery<T> implements SupabaseQueryBuilderLike<T> {
 
   is(column: string, value: unknown): SupabaseQueryBuilderLike<T> {
     this.filters.push({ column, op: "is", value });
-    return this;
-  }
-
-  lt(column: string, value: unknown): SupabaseQueryBuilderLike<T> {
-    this.filters.push({ column, op: "lt", value });
     return this;
   }
 
@@ -466,19 +499,6 @@ class MemoryQuery<T> implements SupabaseQueryBuilderLike<T> {
   }
 
   private async execute(): Promise<SupabaseQueryResult<T>> {
-    if (this.action === "update") {
-      const rows = this.matchingRows();
-      for (const row of rows) {
-        Object.assign(row, this.values);
-      }
-
-      return { data: rows as T, error: null };
-    }
-
-    if (this.action === "upsert") {
-      return this.upsertRow() as SupabaseQueryResult<T>;
-    }
-
     let rows = this.matchingRows();
     if (this.orderBy !== null) {
       rows = [...rows].sort((left, right) => {
@@ -493,40 +513,10 @@ class MemoryQuery<T> implements SupabaseQueryBuilderLike<T> {
     return { data: rows as T, error: null };
   }
 
-  private upsertRow(): SupabaseQueryResult<SettingsSyncRow[] | null> {
-    const value = this.values as unknown as SettingsSyncRow;
-    const conflictColumns = (this.onConflict ?? "").split(",").map((column) => column.trim());
-    this.supabase.runBeforeUpsert();
-    const existing = this.supabase.tables[this.table].find((row) =>
-      conflictColumns.every(
-        (column) => row[column as keyof SettingsSyncRow] === value[column as keyof SettingsSyncRow],
-      ),
-    );
-
-    if (existing !== undefined) {
-      if (this.ignoreDuplicates) {
-        return { data: null, error: null };
-      }
-
-      Object.assign(existing, value);
-      return { data: [existing], error: null };
-    }
-
-    this.supabase.tables[this.table].push(value);
-    return { data: [value], error: null };
-  }
-
   private matchingRows(): SettingsSyncRow[] {
     return this.supabase.tables[this.table].filter((row) =>
       this.filters.every((filter) => {
         const value = row[filter.column as keyof SettingsSyncRow];
-        if (filter.op === "lt") {
-          return String(value) < String(filter.value);
-        }
-        if (filter.op === "is") {
-          return value === filter.value;
-        }
-
         return value === filter.value;
       }),
     );

@@ -1,4 +1,6 @@
 import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { createWriteStream, mkdirSync, type WriteStream } from "node:fs";
+import { join } from "node:path";
 import type { Readable } from "node:stream";
 import type { KitEvent, LaneProjection, LaneSpec, RunProjection } from "./schema.ts";
 import { estimateCost, validateLaneSpec } from "./table.ts";
@@ -9,10 +11,13 @@ export interface RunnerOptions {
   maxConcurrent?: number;
   piBinary?: string;
   onUpdate?: () => void;
+  /** Directory for raw per-lane JSONL transcripts (`<rawDir>/<lane>.jsonl`). */
+  rawDir?: string;
 }
 
 interface LaneRuntime {
   child: ChildProcessByStdio<null, Readable, Readable>;
+  raw?: WriteStream;
   finish: () => void;
   settled: boolean;
   startedAt: number;
@@ -101,6 +106,7 @@ export class LaneRunner {
   private readonly maxConcurrent: number;
   private readonly onUpdate?: () => void;
   private readonly piBinary: string;
+  private readonly rawDir?: string;
   private readonly runId: string;
   private readonly runtimes = new Map<string, LaneRuntime>();
   private readonly live: RunProjection;
@@ -111,6 +117,7 @@ export class LaneRunner {
     this.append = opts.append;
     this.maxConcurrent = Math.max(1, Math.floor(opts.maxConcurrent ?? 4));
     this.piBinary = opts.piBinary ?? "pi";
+    if (opts.rawDir) this.rawDir = opts.rawDir;
     this.onUpdate = opts.onUpdate;
     this.live = {
       run: opts.runId,
@@ -282,8 +289,19 @@ export class LaneRunner {
         },
       );
 
+      let raw: WriteStream | undefined;
+      if (this.rawDir) {
+        try {
+          mkdirSync(this.rawDir, { recursive: true });
+          raw = createWriteStream(join(this.rawDir, `${spec.lane}.jsonl`), { flags: "a" });
+        } catch {
+          // Transcript capture is best-effort; the lane must still run.
+        }
+      }
+
       const runtime: LaneRuntime = {
         child,
+        ...(raw ? { raw } : {}),
         finish: resolve,
         settled: false,
         startedAt: Date.now(),
@@ -407,6 +425,7 @@ export class LaneRunner {
 
       const consumeLine = (line: string) => {
         if (!line.trim()) return;
+        if (runtime.raw?.writable) runtime.raw.write(`${line}\n`);
         try {
           handleEvent(JSON.parse(line));
         } catch {
@@ -444,6 +463,9 @@ export class LaneRunner {
       child.once("error", (error) => finish(false, runtime.stderrTail || error.message, `spawn:${error.message}`));
       child.once("close", (code) => {
         if (runtime.stdoutBuffer) consumeLine(runtime.stdoutBuffer);
+        // End the transcript only after the last stdout flush so abandoned or
+        // failed lanes keep their tail lines.
+        runtime.raw?.end();
         if (!runtime.settled) finish(false, runtime.stderrTail, `exit:${code ?? "signal"}`);
       });
     return promise;

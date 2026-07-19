@@ -44,7 +44,9 @@
       "name": "@pickforge/pi-kit",
       "version": "0.1.0",
       "devDependencies": {
+        "@earendil-works/pi-ai": "0.79.10",
         "@earendil-works/pi-coding-agent": "0.79.10",
+        "@earendil-works/pi-tui": "0.79.10",
         "typebox": "1.1.38",
         "typescript": "^5.6.0",
         "vitest": "^2.0.0",

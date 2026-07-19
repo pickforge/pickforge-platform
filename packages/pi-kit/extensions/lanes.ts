@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { appendEvent, newRunId } from "../src/journal-core.ts";
+import { appendEvent, newRunId, rawRunDir } from "../src/journal-core.ts";
+import { LanesTuiComponent } from "../src/lanes-tui.ts";
 import { LaneRunner } from "../src/runner.ts";
 import type { LaneProjection, LaneSpec, RunProjection } from "../src/schema.ts";
 import { MODEL_TABLE, validateLaneSpec } from "../src/table.ts";
@@ -217,6 +218,7 @@ export default function lanesExtension(pi: ExtensionAPI): void {
       const activeRunner = new LaneRunner({
         runId,
         append: appendEvent,
+        rawDir: rawRunDir(runId),
         onUpdate() {
           if (view && lastRun === view) renderWidget(ctx, view);
         },
@@ -427,9 +429,23 @@ export default function lanesExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("lanes", {
-    description: "Show, hide, summarize, or abandon lanes",
+    description: "Show, hide, summarize, abandon lanes, or open the full-screen TUI",
     handler: async (args, ctx) => {
       const [command = "show", lane] = (args.trim() || "show").split(/\s+/, 2);
+      if (command === "tui") {
+        if (!ctx.hasUI) {
+          ctx.ui.notify("lanes tui requires interactive mode", "warning");
+          return;
+        }
+        await ctx.ui.custom<void>(
+          (tui, theme, _keybindings, done) => new LanesTuiComponent(tui, theme, () => done(undefined), lastRun?.id),
+          {
+            overlay: true,
+            overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", row: 0, col: 0 },
+          },
+        );
+        return;
+      }
       if (command === "hide") {
         if (lastRun) lastRun.hidden = true;
         ctx.ui.setWidget("pi-lanes", undefined);
@@ -467,7 +483,7 @@ export default function lanesExtension(pi: ExtensionAPI): void {
         renderWidget(ctx, lastRun);
         return;
       }
-      ctx.ui.notify("Usage: /lanes [show|hide|last|abandon <lane|all>]", "warning");
+      ctx.ui.notify("Usage: /lanes [show|hide|last|tui|abandon <lane|all>]", "warning");
     },
   });
 }

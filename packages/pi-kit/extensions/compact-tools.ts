@@ -29,6 +29,13 @@ function firstLine(text: string): string {
   return idx === -1 ? text : text.slice(0, idx);
 }
 
+/** Logical line count: a single trailing newline does not add a line. */
+function countLines(text: string): number {
+  if (text.length === 0) return 0;
+  const body = text.endsWith("\n") ? text.slice(0, -1) : text;
+  return body.split("\n").length;
+}
+
 function clip(text: string, width: number): string {
   return truncateToWidth(text, width, "…");
 }
@@ -102,7 +109,7 @@ export default function compactTools(pi: ExtensionAPI) {
       if (content?.type !== "text") return new Text(theme.fg("error", "✖ no content"), 0, 0);
 
       const details = result.details as ReadToolDetails | undefined;
-      const lineCount = content.text.split("\n").length;
+      const lineCount = countLines(content.text);
       let text = theme.fg("success", "✔ ") + theme.fg("muted", `${lineCount} lines`);
       if (details?.truncation?.truncated) {
         text += theme.fg("warning", ` of ${details.truncation.totalLines}`);
@@ -173,7 +180,7 @@ export default function compactTools(pi: ExtensionAPI) {
   pi.registerTool({
     ...write,
     renderCall(args, theme) {
-      const lineCount = args.content.split("\n").length;
+      const lineCount = countLines(args.content);
       return new Text(
         `${theme.fg("accent", "▸")} ${theme.fg("toolTitle", "write")} ${theme.fg("text", shortPath(args.path))} ${theme.fg("dim", `(${lineCount} lines)`)}`,
         0,

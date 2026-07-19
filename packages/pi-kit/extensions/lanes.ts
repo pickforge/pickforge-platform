@@ -141,6 +141,16 @@ function renderWidgetUnsafe(ctx: WidgetContext, run: LastRun): void {
 export default function lanesExtension(pi: ExtensionAPI): void {
   let lastRun: LastRun | undefined;
 
+  // Lanes survive ESC/turn cancellation, but not the session itself: on
+  // shutdown (/new, reload, exit) any still-active run is abandoned so child
+  // processes cannot outlive their owning session.
+  pi.on("session_shutdown", () => {
+    if (lastRun && !lastRun.ended) {
+      lastRun.reported = true; // never nudge a session that is going away
+      lastRun.runner.abandonAll("session ended");
+    }
+  });
+
   pi.registerTool({
     name: "lanes_spawn",
     label: "Spawn lanes",

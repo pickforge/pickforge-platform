@@ -33,6 +33,7 @@ function makeHarness(opts: { idle?: boolean } = {}) {
       tools.set(tool.name, tool);
     },
     registerCommand: () => {},
+    on: () => {},
     sendUserMessage: (content: string, options?: unknown) => {
       sent.push({ content, options });
     },
@@ -184,6 +185,31 @@ describe("async lanes extension", () => {
     await call("lanes_spawn", { lanes: [spec] });
     await call("lanes_wait", {});
     await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(sent).toEqual([]);
+  });
+});
+
+describe("session shutdown", () => {
+  it("abandons an active run and suppresses the nudge on session_shutdown", async () => {
+    await installSlowPi(2_000);
+    const handlers = new Map<string, () => void>();
+    const tools = new Map<string, { execute: ToolExecute }>();
+    const sent: unknown[] = [];
+    const pi = {
+      registerTool: (tool: { name: string; execute: ToolExecute }) => tools.set(tool.name, tool),
+      registerCommand: () => {},
+      sendUserMessage: (content: unknown) => sent.push(content),
+      on: (name: string, handler: () => void) => handlers.set(name, handler),
+    } as unknown as ExtensionAPI;
+    const ctx = { hasUI: false, isIdle: () => true, ui: {} } as unknown as ExtensionContext;
+    lanesExtension(pi);
+    await tools.get("lanes_spawn")!.execute("tc", { lanes: [spec] }, undefined, undefined, ctx);
+
+    handlers.get("session_shutdown")!();
+
+    const status = await tools.get("lanes_status")!.execute("tc", {}, undefined, undefined, ctx);
+    expect(status.content[0]!.text).toContain("worker: abandoned");
+    await new Promise((resolve) => setTimeout(resolve, 200));
     expect(sent).toEqual([]);
   });
 });

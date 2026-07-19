@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -11,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runCli } from "../src/cli.js";
 import {
@@ -29,21 +30,38 @@ import {
   type TauriReleaseConfig,
 } from "../src/index.js";
 
-const injectedWriteFailure = vi.hoisted(() => ({ path: null as string | null, remaining: 0 }));
+const injectedFsFailure = vi.hoisted(() => ({
+  operation: null as "chmodSync" | "rmSync" | "writeFileSync" | null,
+  path: null as string | null,
+  remaining: 0,
+}));
 
 vi.mock("node:fs", async () => {
   const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+  function fail(operation: "chmodSync" | "rmSync" | "writeFileSync", path: unknown): void {
+    if (
+      operation === injectedFsFailure.operation &&
+      typeof path === "string" &&
+      path === injectedFsFailure.path &&
+      injectedFsFailure.remaining > 0
+    ) {
+      injectedFsFailure.remaining -= 1;
+      const label = operation === "writeFileSync" ? "write" : operation;
+      throw new Error(`injected ${label} failure for ${path}`);
+    }
+  }
   return {
     ...actual,
+    chmodSync(path: Parameters<typeof actual.chmodSync>[0], ...args: unknown[]) {
+      fail("chmodSync", path);
+      return Reflect.apply(actual.chmodSync, actual, [path, ...args]);
+    },
+    rmSync(path: Parameters<typeof actual.rmSync>[0], ...args: unknown[]) {
+      fail("rmSync", path);
+      return Reflect.apply(actual.rmSync, actual, [path, ...args]);
+    },
     writeFileSync(path: Parameters<typeof actual.writeFileSync>[0], ...args: unknown[]) {
-      if (
-        typeof path === "string" &&
-        path === injectedWriteFailure.path &&
-        injectedWriteFailure.remaining > 0
-      ) {
-        injectedWriteFailure.remaining -= 1;
-        throw new Error(`injected write failure for ${path}`);
-      }
+      fail("writeFileSync", path);
       return Reflect.apply(actual.writeFileSync, actual, [path, ...args]);
     },
   };
@@ -55,8 +73,9 @@ const zstdSquashfsAvailable = squashfsToolsAvailable && hasSquashfsCompressor("z
 const toolOutputMaxBuffer = 64 * 1024 * 1024;
 
 afterEach(() => {
-  injectedWriteFailure.path = null;
-  injectedWriteFailure.remaining = 0;
+  injectedFsFailure.operation = null;
+  injectedFsFailure.path = null;
+  injectedFsFailure.remaining = 0;
   for (const root of tempRoots.splice(0)) {
     rmSync(root, { force: true, recursive: true });
   }
@@ -743,6 +762,26 @@ describe("@pickforge/tauri-release", () => {
   );
 
   it.skipIf(!squashfsToolsAvailable)(
+    "repairs a symlinked AppImage without replacing the symlink",
+    () => {
+      const root = tempRoot();
+      const { appimage: target, runtimePrefix } = createSyntheticAppImage(root, { mode: 0o744 });
+      const appimage = join(root, "PickGauge-nightly_1.0.0_amd64.AppImage");
+      symlinkSync(target, appimage);
+
+      const result = fixAppImage({
+        appimage,
+        env: envWithoutSigning(),
+      });
+
+      expect(result.appimage).toBe(appimage);
+      expect(lstatSync(appimage).isSymbolicLink()).toBe(true);
+      expect(statSync(appimage).mode & 0o777).toBe(0o744);
+      expect(listAppImage(appimage, runtimePrefix.length)).not.toContain("libwayland-client.so.0");
+    },
+  );
+
+  it.skipIf(!squashfsToolsAvailable)(
     "uses the ELF-derived SquashFS offset before scanning for magic bytes",
     () => {
       const root = tempRoot();
@@ -842,6 +881,61 @@ describe("@pickforge/tauri-release", () => {
   );
 
   it.skipIf(!squashfsToolsAvailable)(
+    "patches a nightly latest.json without changing its feed shape",
+    () => {
+      const root = tempRoot();
+      const { appimage } = createSyntheticAppImage(root);
+      const signStub = join(root, "sign-stub.sh");
+      const latestJson = join(root, "nightly-latest.json");
+      writeFileSync(signStub, "#!/bin/sh\nprintf 'nightly-signature\\n' > \"$1.sig\"\n");
+      chmodSync(signStub, 0o755);
+      writeFileSync(
+        latestJson,
+        `${JSON.stringify(
+          {
+            notes: "Nightly channel",
+            platforms: {
+              "linux-x86_64": {
+                signature: "old-signature",
+                url: `https://github.com/pickforge/pickgauge/releases/download/nightly/${basename(appimage)}`,
+              },
+            },
+            pub_date: "2026-07-19T00:00:00.000Z",
+            version: "1.0.0-nightly.20260719.abcdef123456",
+          },
+          null,
+          2,
+        )}\n`,
+      );
+
+      fixAppImage({
+        appimage,
+        env: { ...envWithoutSigning(), TAURI_SIGNING_PRIVATE_KEY: "test-key" },
+        latestJson,
+        signCommand: signStub,
+      });
+      const patched = JSON.parse(readFileSync(latestJson, "utf8")) as {
+        notes: string;
+        platforms: Record<string, { signature: string }>;
+        pub_date: string;
+        version: string;
+      };
+
+      expect(patched).toEqual({
+        notes: "Nightly channel",
+        platforms: {
+          "linux-x86_64": {
+            signature: "nightly-signature",
+            url: `https://github.com/pickforge/pickgauge/releases/download/nightly/${basename(appimage)}`,
+          },
+        },
+        pub_date: "2026-07-19T00:00:00.000Z",
+        version: "1.0.0-nightly.20260719.abcdef123456",
+      });
+    },
+  );
+
+  it.skipIf(!squashfsToolsAvailable)(
     "signs when TAURI_SIGNING_PRIVATE_KEY_PATH is set",
     () => {
       const root = tempRoot();
@@ -865,7 +959,7 @@ describe("@pickforge/tauri-release", () => {
   );
 
   it.skipIf(!squashfsToolsAvailable)(
-    "currently replaces the AppImage and removes its stale signature when signing fails",
+    "leaves the complete release set unchanged when signing fails",
     () => {
       const root = tempRoot();
       const { appimage } = createSyntheticAppImage(root);
@@ -886,14 +980,14 @@ describe("@pickforge/tauri-release", () => {
           signCommand: signStub,
         }),
       ).toThrow(/sign command failed with exit code 7/u);
-      expect(readFileSync(appimage)).not.toEqual(artifactBefore);
-      expect(existsSync(`${appimage}.sig`)).toBe(false);
+      expect(readFileSync(appimage)).toEqual(artifactBefore);
+      expect(readFileSync(`${appimage}.sig`, "utf8")).toBe("stale-signature");
       expect(readFileSync(latestJson)).toEqual(feedBefore);
     },
   );
 
   it.skipIf(!squashfsToolsAvailable)(
-    "currently leaves the release set unchanged when rebuilding fails",
+    "leaves the release set unchanged when rebuilding fails",
     () => {
       const root = tempRoot();
       const { appimage } = createSyntheticAppImage(root);
@@ -918,14 +1012,13 @@ describe("@pickforge/tauri-release", () => {
   );
 
   it.skipIf(!squashfsToolsAvailable)(
-    "currently leaves earlier release entries changed when the feed write fails",
+    "rolls back the artifact and signature when the feed commit fails",
     () => {
       const root = tempRoot();
       const { appimage } = createSyntheticAppImage(root);
       const signStub = join(root, "sign-stub.sh");
       const latestJson = join(root, "latest.json");
       writeFileSync(signStub, "#!/bin/sh\nprintf 'new-signature\\n' > \"$1.sig\"\n");
-      writeFileSync(`${appimage}.sig`, "stale-signature");
       writeLatestJsonFixture(latestJson, "PickGauge_1.0.0_amd64.AppImage");
       chmodSync(signStub, 0o755);
       const artifactBefore = readFileSync(appimage);
@@ -940,20 +1033,23 @@ describe("@pickforge/tauri-release", () => {
           signCommand: signStub,
         }),
       ).toThrow(/injected write failure/u);
-      expect(readFileSync(appimage)).not.toEqual(artifactBefore);
-      expect(readFileSync(`${appimage}.sig`, "utf8")).toBe("new-signature\n");
+      expect(readFileSync(appimage)).toEqual(artifactBefore);
+      expect(existsSync(`${appimage}.sig`)).toBe(false);
       expect(readFileSync(latestJson)).toEqual(feedBefore);
     },
   );
 
   it.skipIf(!squashfsToolsAvailable)(
-    "currently stops before changing the signature or feed when the artifact write fails",
+    "rolls back the complete release set when the artifact commit fails",
     () => {
       const root = tempRoot();
       const { appimage } = createSyntheticAppImage(root);
+      const signStub = join(root, "sign-stub.sh");
       const latestJson = join(root, "latest.json");
+      writeFileSync(signStub, "#!/bin/sh\nprintf 'new-signature\\n' > \"$1.sig\"\n");
       writeFileSync(`${appimage}.sig`, "stale-signature");
       writeLatestJsonFixture(latestJson, "PickGauge_1.0.0_amd64.AppImage");
+      chmodSync(signStub, 0o755);
       const artifactBefore = readFileSync(appimage);
       const signatureBefore = readFileSync(`${appimage}.sig`);
       const feedBefore = readFileSync(latestJson);
@@ -962,12 +1058,157 @@ describe("@pickforge/tauri-release", () => {
       expect(() =>
         fixAppImage({
           appimage,
-          env: envWithoutSigning(),
+          env: { ...envWithoutSigning(), TAURI_SIGNING_PRIVATE_KEY: "test-key" },
+          latestJson,
+          signCommand: signStub,
         }),
       ).toThrow(/injected write failure/u);
       expect(readFileSync(appimage)).toEqual(artifactBefore);
       expect(readFileSync(`${appimage}.sig`)).toEqual(signatureBefore);
       expect(readFileSync(latestJson)).toEqual(feedBefore);
+    },
+  );
+
+  it.skipIf(!squashfsToolsAvailable)(
+    "rolls back the complete release set when the signature commit fails",
+    () => {
+      const root = tempRoot();
+      const { appimage } = createSyntheticAppImage(root);
+      const signaturePath = `${appimage}.sig`;
+      const signStub = join(root, "sign-stub.sh");
+      const latestJson = join(root, "latest.json");
+      writeFileSync(signStub, "#!/bin/sh\nprintf 'new-signature\\n' > \"$1.sig\"\n");
+      writeFileSync(signaturePath, "stale-signature");
+      writeLatestJsonFixture(latestJson, "PickGauge_1.0.0_amd64.AppImage");
+      chmodSync(signStub, 0o755);
+      const artifactBefore = readFileSync(appimage);
+      const signatureBefore = readFileSync(signaturePath);
+      const feedBefore = readFileSync(latestJson);
+      failNextWrite(signaturePath);
+
+      expect(() =>
+        fixAppImage({
+          appimage,
+          env: { ...envWithoutSigning(), TAURI_SIGNING_PRIVATE_KEY: "test-key" },
+          latestJson,
+          signCommand: signStub,
+        }),
+      ).toThrow(/injected write failure/u);
+      expect(readFileSync(appimage)).toEqual(artifactBefore);
+      expect(readFileSync(signaturePath)).toEqual(signatureBefore);
+      expect(readFileSync(latestJson)).toEqual(feedBefore);
+    },
+  );
+
+  it.skipIf(!squashfsToolsAvailable)(
+    "rolls back artifact bytes and mode when its commit chmod fails",
+    () => {
+      const root = tempRoot();
+      const { appimage } = createSyntheticAppImage(root, { mode: 0o741 });
+      const signStub = join(root, "sign-stub.sh");
+      const latestJson = join(root, "latest.json");
+      writeFileSync(signStub, "#!/bin/sh\nprintf 'new-signature\\n' > \"$1.sig\"\n");
+      writeFileSync(`${appimage}.sig`, "stale-signature");
+      writeLatestJsonFixture(latestJson, basename(appimage));
+      chmodSync(signStub, 0o755);
+      const artifactBefore = readFileSync(appimage);
+      const feedBefore = readFileSync(latestJson);
+      failNextFsOperation("chmodSync", appimage);
+
+      expect(() =>
+        fixAppImage({
+          appimage,
+          env: { ...envWithoutSigning(), TAURI_SIGNING_PRIVATE_KEY: "test-key" },
+          latestJson,
+          signCommand: signStub,
+        }),
+      ).toThrow(/injected chmodSync failure/u);
+      expect(readFileSync(appimage)).toEqual(artifactBefore);
+      expect(statSync(appimage).mode & 0o777).toBe(0o741);
+      expect(readFileSync(`${appimage}.sig`, "utf8")).toBe("stale-signature");
+      expect(readFileSync(latestJson)).toEqual(feedBefore);
+    },
+  );
+
+  it.skipIf(!squashfsToolsAvailable)(
+    "rolls back the artifact when unsigned stale-signature removal fails",
+    () => {
+      const root = tempRoot();
+      const { appimage } = createSyntheticAppImage(root, { mode: 0o745 });
+      const signaturePath = `${appimage}.sig`;
+      writeFileSync(signaturePath, "stale-signature");
+      chmodSync(signaturePath, 0o640);
+      const artifactBefore = readFileSync(appimage);
+      failNextFsOperation("rmSync", signaturePath);
+
+      expect(() => fixAppImage({ appimage, env: envWithoutSigning() })).toThrow(
+        /injected rmSync failure/u,
+      );
+      expect(readFileSync(appimage)).toEqual(artifactBefore);
+      expect(statSync(appimage).mode & 0o777).toBe(0o745);
+      expect(readFileSync(signaturePath, "utf8")).toBe("stale-signature");
+      expect(statSync(signaturePath).mode & 0o777).toBe(0o640);
+    },
+  );
+
+  it.skipIf(!squashfsToolsAvailable)(
+    "restores symlinked artifact, signature, and feed entries after a later commit failure",
+    () => {
+      const root = tempRoot();
+      const targetRoot = join(root, "targets");
+      mkdirSync(targetRoot);
+      const { appimage: appimageTarget } = createSyntheticAppImage(targetRoot, { mode: 0o741 });
+      const appimage = join(root, basename(appimageTarget));
+      const signaturePath = `${appimage}.sig`;
+      const signatureTarget = join(targetRoot, "previous.sig");
+      const latestJson = join(root, "latest.json");
+      const latestJsonTarget = join(targetRoot, "previous-latest.json");
+      const signStub = join(root, "sign-stub.sh");
+      symlinkSync(appimageTarget, appimage);
+      writeFileSync(signatureTarget, "stale-signature");
+      chmodSync(signatureTarget, 0o640);
+      symlinkSync(signatureTarget, signaturePath);
+      writeLatestJsonFixture(latestJsonTarget, basename(appimage));
+      chmodSync(latestJsonTarget, 0o600);
+      symlinkSync(latestJsonTarget, latestJson);
+      writeFileSync(signStub, "#!/bin/sh\nprintf 'new-signature\\n' > \"$1.sig\"\n");
+      chmodSync(signStub, 0o755);
+      const artifactBefore = readFileSync(appimage);
+      const signatureBefore = readFileSync(signaturePath);
+      const feedBefore = readFileSync(latestJson);
+      failNextWrite(latestJson);
+
+      expect(() =>
+        fixAppImage({
+          appimage,
+          env: { ...envWithoutSigning(), TAURI_SIGNING_PRIVATE_KEY: "test-key" },
+          latestJson,
+          signCommand: signStub,
+        }),
+      ).toThrow(/injected write failure/u);
+      expect(lstatSync(appimage).isSymbolicLink()).toBe(true);
+      expect(lstatSync(signaturePath).isSymbolicLink()).toBe(true);
+      expect(lstatSync(latestJson).isSymbolicLink()).toBe(true);
+      expect(readFileSync(appimage)).toEqual(artifactBefore);
+      expect(readFileSync(signaturePath)).toEqual(signatureBefore);
+      expect(readFileSync(latestJson)).toEqual(feedBefore);
+      expect(statSync(appimage).mode & 0o777).toBe(0o741);
+      expect(statSync(signaturePath).mode & 0o777).toBe(0o640);
+      expect(statSync(latestJson).mode & 0o777).toBe(0o600);
+    },
+  );
+
+  it.skipIf(!squashfsToolsAvailable)(
+    "removes a dangling stale signature symlink only after unsigned commit",
+    () => {
+      const root = tempRoot();
+      const { appimage } = createSyntheticAppImage(root);
+      const signaturePath = `${appimage}.sig`;
+      symlinkSync(join(root, "missing-signature"), signaturePath);
+
+      fixAppImage({ appimage, env: envWithoutSigning() });
+
+      expect(() => lstatSync(signaturePath)).toThrow();
     },
   );
 
@@ -1244,8 +1485,16 @@ async function captureCli(argv: string[]): Promise<{ code: number; stdout: strin
 }
 
 function failNextWrite(path: string): void {
-  injectedWriteFailure.path = path;
-  injectedWriteFailure.remaining = 1;
+  failNextFsOperation("writeFileSync", path);
+}
+
+function failNextFsOperation(
+  operation: "chmodSync" | "rmSync" | "writeFileSync",
+  path: string,
+): void {
+  injectedFsFailure.operation = operation;
+  injectedFsFailure.path = path;
+  injectedFsFailure.remaining = 1;
 }
 
 function failingMksquashfsEnv(root: string): NodeJS.ProcessEnv {

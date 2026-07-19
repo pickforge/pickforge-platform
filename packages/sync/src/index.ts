@@ -33,17 +33,8 @@ export interface SupabaseQueryResult<T> {
 
 export interface SupabaseQueryBuilderLike<T = unknown> extends PromiseLike<SupabaseQueryResult<T>> {
   select(columns?: string): SupabaseQueryBuilderLike<T>;
-  update(values: unknown): SupabaseQueryBuilderLike<T>;
-  upsert(
-    values: unknown,
-    options?: {
-      onConflict?: string;
-      ignoreDuplicates?: boolean;
-    },
-  ): SupabaseQueryBuilderLike<T>;
   eq(column: string, value: unknown): SupabaseQueryBuilderLike<T>;
   is(column: string, value: unknown): SupabaseQueryBuilderLike<T>;
-  lt(column: string, value: unknown): SupabaseQueryBuilderLike<T>;
   order(
     column: string,
     options?: {
@@ -55,6 +46,7 @@ export interface SupabaseQueryBuilderLike<T = unknown> extends PromiseLike<Supab
 
 export interface SupabaseClientLike {
   from<T = unknown>(table: string): SupabaseQueryBuilderLike<T>;
+  rpc(fn: string, args?: Record<string, unknown>): unknown;
 }
 
 export interface PushGroupOptions {
@@ -171,25 +163,20 @@ export async function pushGroup({
   const validGroup = validateFieldGroup(group);
   const validUpdatedAt = validateUpdatedAt(updatedAt);
   const sanitizedPayload = sanitizeSyncPayload(validGroup, payload);
-  const row = {
+
+  const { written, row } = await applyLwwWrite(supabase, {
     user_id: validUserId,
     field_group: validGroup,
     payload: sanitizedPayload,
     updated_at: validUpdatedAt,
     deleted_at: null,
-  };
+  });
 
-  const written = await writeRowWithLww(supabase, row);
-  if (written !== null) {
-    return { status: "written", record: toSyncRecord(written) };
+  if (written) {
+    return { status: "written", record: toSyncRecord(row) };
   }
 
-  const server = await selectStoredGroup(supabase, validUserId, validGroup);
-  if (server === null) {
-    throw new SyncError("database_error", "Failed to read stale sync group");
-  }
-
-  return { status: "stale", record: server.deleted_at === null ? toSyncRecord(server) : null };
+  return { status: "stale", record: row.deleted_at === null ? toSyncRecord(row) : null };
 }
 
 export async function pullAll({ supabase, userId }: PullAllOptions): Promise<SyncRecord[]> {
@@ -225,23 +212,19 @@ export async function deleteGroup({
   const validGroup = validateFieldGroup(group);
   const validUpdatedAt = validateUpdatedAt(updatedAt);
 
-  const written = await writeRowWithLww(supabase, {
+  const { written, row } = await applyLwwWrite(supabase, {
     user_id: validUserId,
     field_group: validGroup,
     payload: {},
     updated_at: validUpdatedAt,
     deleted_at: validUpdatedAt,
   });
-  if (written !== null) {
+
+  if (written) {
     return { status: "deleted" };
   }
 
-  const server = await selectStoredGroup(supabase, validUserId, validGroup);
-  if (server === null) {
-    throw new SyncError("database_error", "Failed to read stale sync group");
-  }
-
-  return { status: "stale", record: server.deleted_at === null ? toSyncRecord(server) : null };
+  return { status: "stale", record: row.deleted_at === null ? toSyncRecord(row) : null };
 }
 
 async function selectGroup(
@@ -263,58 +246,60 @@ async function selectGroup(
   return data === null ? null : toSyncRecord(data);
 }
 
-async function selectStoredGroup(
-  supabase: SupabaseClientLike,
-  userId: string,
-  group: SyncFieldGroup,
-): Promise<SettingsSyncRow | null> {
-  const { data, error } = await supabase
-    .from<SettingsSyncRow>("settings_sync")
-    .select(SYNC_COLUMNS)
-    .eq("user_id", userId)
-    .eq("field_group", group)
-    .maybeSingle();
-  if (error !== null) {
-    throw databaseError("Failed to pull stored sync group", error);
-  }
-
-  return data;
+interface LwwWriteResult {
+  written: boolean;
+  row: SettingsSyncRow;
 }
 
-async function writeRowWithLww(
+/**
+ * Calls the durable `settings_sync_lww_write` Postgres function (see
+ * supabase/migrations/20260720000000_settings_sync_lww.sql), which locks the
+ * (user_id, field_group) row, compares `row.updated_at` against it, and
+ * performs whichever of insert/update/no-op wins, all inside one durable
+ * operation. It always returns the row that is now authoritative, so callers
+ * never need a follow-up read to learn the outcome.
+ */
+async function applyLwwWrite(
   supabase: SupabaseClientLike,
   row: SettingsSyncRow,
-): Promise<SettingsSyncRow | null> {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const updated = await supabase
-      .from<SettingsSyncRow>("settings_sync")
-      .update(row)
-      .eq("user_id", row.user_id)
-      .eq("field_group", row.field_group)
-      .lt("updated_at", row.updated_at)
-      .select(SYNC_COLUMNS)
-      .maybeSingle();
-    if (updated.error !== null) {
-      throw databaseError("Failed to update sync group", updated.error);
-    }
-    if (updated.data !== null) {
-      return updated.data;
-    }
-
-    const inserted = await supabase
-      .from<SettingsSyncRow>("settings_sync")
-      .upsert(row, { onConflict: "user_id,field_group", ignoreDuplicates: true })
-      .select(SYNC_COLUMNS)
-      .maybeSingle();
-    if (inserted.error !== null) {
-      throw databaseError("Failed to insert sync group", inserted.error);
-    }
-    if (inserted.data !== null) {
-      return inserted.data;
-    }
+): Promise<LwwWriteResult> {
+  const { data, error } = (await supabase.rpc("settings_sync_lww_write", {
+    target_user: row.user_id,
+    target_group: row.field_group,
+    new_payload: row.payload,
+    new_updated_at: row.updated_at,
+    new_deleted_at: row.deleted_at,
+  })) as SupabaseQueryResult<unknown>;
+  if (error !== null) {
+    throw databaseError("Failed to durably write sync group", error);
   }
 
-  return null;
+  return toLwwWriteResult(data);
+}
+
+function toLwwWriteResult(data: unknown): LwwWriteResult {
+  if (
+    !isRecord(data) ||
+    typeof data.written !== "boolean" ||
+    typeof data.user_id !== "string" ||
+    typeof data.field_group !== "string" ||
+    typeof data.updated_at !== "string" ||
+    !isJson(data.payload) ||
+    (data.deleted_at !== null && typeof data.deleted_at !== "string")
+  ) {
+    throw new SyncError("database_error", "settings_sync_lww_write returned an invalid result");
+  }
+
+  return {
+    written: data.written,
+    row: {
+      user_id: data.user_id,
+      field_group: data.field_group,
+      payload: data.payload,
+      updated_at: data.updated_at,
+      deleted_at: data.deleted_at,
+    },
+  };
 }
 
 function walkPayload(group: SyncFieldGroup, value: Json, path: string[]): void {

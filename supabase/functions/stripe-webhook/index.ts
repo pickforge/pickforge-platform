@@ -1,7 +1,7 @@
 import Stripe from "npm:stripe@19.1.0";
 import { createClient } from "npm:@supabase/supabase-js@2.110.0";
-import { processStripeEvent, verifyStripeEvent } from "npm:@pickforge/billing@0.10.0";
-import { createRequiredEnv, createStripeWebhookHandler } from "npm:@pickforge/edge-shared@0.10.0";
+import { processStripeEvent, verifyStripeEvent } from "npm:@pickforge/billing@0.11.0";
+import { createRequiredEnv, createStripeWebhookHandler } from "npm:@pickforge/edge-shared@0.11.0";
 
 const requiredEnv = createRequiredEnv(Deno.env);
 const stripe = new Stripe(requiredEnv("STRIPE_SECRET_KEY"));

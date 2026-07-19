@@ -9,7 +9,10 @@ import {
   createRequiredEnv,
   EdgeSharedError,
   getUserFromRequest,
+  isCheckoutDeletionFenced,
   jsonResponse,
+  markCheckoutSessionExpired,
+  registerCheckoutSession,
 } from "@pickforge/edge-shared";
 
 const requiredEnv = createRequiredEnv(Deno.env);
@@ -40,7 +43,7 @@ Deno.serve(async (req) => {
     const session = await createRegisteredCheckoutSession({
       stripe,
       userId,
-      isDeletionFenced,
+      isDeletionFenced: (id) => isCheckoutDeletionFenced(serviceSupabase, id),
       createSession: async () => {
         const created = await createCreditCheckoutSession({
           stripe,
@@ -56,8 +59,8 @@ Deno.serve(async (req) => {
         }
         return { id: created.id, url: created.url };
       },
-      registerSession: registerCheckoutSession,
-      markSessionExpired: markCheckoutSessionExpired,
+      registerSession: (id, sessionId) => registerCheckoutSession(serviceSupabase, id, sessionId),
+      markSessionExpired: (sessionId) => markCheckoutSessionExpired(serviceSupabase, sessionId),
     });
 
     return respond(200, { url: session.url });
@@ -90,40 +93,6 @@ async function readExistingCustomerId(userId: string): Promise<string | undefine
   return typeof data?.stripe_customer_id === "string" && data.stripe_customer_id.length > 0
     ? data.stripe_customer_id
     : undefined;
-}
-
-async function isDeletionFenced(userId: string): Promise<boolean> {
-  const { data, error } = await serviceSupabase
-    .rpc("checkout_lifecycle_is_deletion_fenced", { target_user: userId })
-    .overrideTypes<boolean, { merge: false }>();
-  if (error !== null || typeof data !== "boolean") {
-    throw new Error("Failed to read account deletion fence", { cause: error });
-  }
-
-  return data;
-}
-
-async function registerCheckoutSession(userId: string, sessionId: string): Promise<boolean> {
-  const { data, error } = await serviceSupabase
-    .rpc("checkout_lifecycle_register_session", {
-      target_user: userId,
-      checkout_session_id: sessionId,
-    })
-    .overrideTypes<boolean, { merge: false }>();
-  if (error !== null || typeof data !== "boolean") {
-    throw new Error("Failed to register Checkout Session", { cause: error });
-  }
-
-  return data;
-}
-
-async function markCheckoutSessionExpired(sessionId: string): Promise<void> {
-  const { error } = await serviceSupabase.rpc("checkout_lifecycle_mark_expired", {
-    checkout_session_id: sessionId,
-  });
-  if (error !== null) {
-    throw new Error("Failed to mark Checkout Session expired", { cause: error });
-  }
 }
 
 function respond(status: number, body: unknown): Response {

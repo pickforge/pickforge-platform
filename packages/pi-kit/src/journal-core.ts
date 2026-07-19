@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -17,6 +17,21 @@ export function journalDir(): string {
   const runsDir = join(dataDir, "runs");
   mkdirSync(runsDir, { recursive: true });
   return runsDir;
+}
+
+/** Directory holding raw per-lane JSONL transcripts for a run. */
+export function rawRunDir(runId: string): string {
+  const dataDir = process.env[DATA_DIR_ENV] ?? join(homedir(), ".pickforge", "pi-kit");
+  return join(dataDir, "raw", runId);
+}
+
+/** All journaled run ids, newest first. */
+export function listRuns(): string[] {
+  return readdirSync(journalDir())
+    .filter((name) => name.endsWith(".jsonl"))
+    .map((name) => name.slice(0, -".jsonl".length))
+    .sort()
+    .reverse();
 }
 
 export function appendEvent(ev: KitEvent): void {

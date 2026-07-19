@@ -4,18 +4,22 @@ import { createCreditCheckoutSession } from "@pickforge/billing";
 import {
   corsHeaders,
   corsPreflightResponse,
-  EdgeSharedError,
+  createCallerSupabaseFactory,
   createRegisteredCheckoutSession,
+  createRequiredEnv,
+  EdgeSharedError,
   getUserFromRequest,
   jsonResponse,
 } from "@pickforge/edge-shared";
 
+const requiredEnv = createRequiredEnv(Deno.env);
 const supabaseUrl = requiredEnv("SUPABASE_URL");
 const supabaseAnonKey = requiredEnv("SUPABASE_ANON_KEY");
 const serviceSupabase = createClient(supabaseUrl, requiredEnv("SUPABASE_SERVICE_ROLE_KEY"), {
   auth: { autoRefreshToken: false, persistSession: false },
 });
 const stripe = new Stripe(requiredEnv("STRIPE_SECRET_KEY"));
+const createCallerSupabase = createCallerSupabaseFactory({ createClient, supabaseUrl, supabaseAnonKey });
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
@@ -28,6 +32,10 @@ Deno.serve(async (req) => {
   try {
     const { userId } = await getUserFromRequest({ supabase: createCallerSupabase(req), req });
     const { pack } = await readCheckoutRequest(req);
+    // Optional client-supplied idempotency token: retries of one purchase reuse it
+    // (Stripe returns the same Session); a new purchase sends a fresh token, and an
+    // absent header lets billing generate a fresh key so distinct purchases never collide.
+    const requestId = req.headers.get("x-idempotency-key") ?? undefined;
     const existingCustomerId = await readExistingCustomerId(userId);
     const session = await createRegisteredCheckoutSession({
       stripe,
@@ -41,6 +49,7 @@ Deno.serve(async (req) => {
           successUrl: requiredEnv("CHECKOUT_SUCCESS_URL"),
           cancelUrl: requiredEnv("CHECKOUT_CANCEL_URL"),
           existingCustomerId,
+          requestId,
         });
         if (!isRecord(created)) {
           throw new Error("Stripe returned an invalid Checkout Session");
@@ -66,13 +75,6 @@ Deno.serve(async (req) => {
     return respond(500, { error: "internal_error" });
   }
 });
-
-function createCallerSupabase(req: Request) {
-  return createClient(supabaseUrl, supabaseAnonKey, {
-    auth: { autoRefreshToken: false, persistSession: false },
-    global: { headers: { Authorization: req.headers.get("authorization") ?? "" } },
-  });
-}
 
 async function readExistingCustomerId(userId: string): Promise<string | undefined> {
   const { data, error } = await serviceSupabase
@@ -148,15 +150,6 @@ async function readCheckoutRequest(req: Request): Promise<{ pack: unknown }> {
   }
 
   return { pack: body.pack };
-}
-
-function requiredEnv(name: string): string {
-  const value = Deno.env.get(name);
-  if (value === undefined || value.length === 0) {
-    throw new Error(`${name} is required`);
-  }
-
-  return value;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

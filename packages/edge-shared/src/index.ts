@@ -725,12 +725,12 @@ export function createDeleteAccountHandler({
         }
       }
 
-      await settleDeletionFixpoint(admin, userId, sessionIds, customerIds);
-      await finalizeAccountDeletion(admin, userId, customerIds);
-      await deleteStripeCustomers(stripe, customerIds, deletedCustomerIds);
-      await settleDeletionFixpoint(admin, userId, sessionIds, customerIds);
-      await finalizeAccountDeletion(admin, userId, customerIds);
-      await deleteStripeCustomers(stripe, customerIds, deletedCustomerIds);
+      // Two settle→finalize→delete passes: deleting a customer can terminalize a
+      // late refund/session (see the "rechecks and deletes a customer terminalized
+      // after the first frozen snapshot" contract test), so a second pass re-reads
+      // the lifecycle and cleans up anything the first pass's deletions revealed.
+      await runDeletionSettlementPass(admin, stripe, userId, sessionIds, customerIds, deletedCustomerIds);
+      await runDeletionSettlementPass(admin, stripe, userId, sessionIds, customerIds, deletedCustomerIds);
 
       await deleteAuthUserAtomically(admin, userId);
 
@@ -814,6 +814,70 @@ export function corsPreflightResponse(): Response {
   return new Response(null, { status: 204, headers: corsHeaders() });
 }
 
+// --- Deno Edge Function adapter helpers -------------------------------------
+// Hoisted from the individual supabase/functions to remove duplicated boilerplate.
+// Kept runtime-agnostic (no Deno globals, no @supabase/supabase-js import) via
+// dependency injection so the package stays UI-free and Node/Bun-testable.
+
+export interface CallerSupabaseClientOptions {
+  auth: { autoRefreshToken: false; persistSession: false };
+  global: { headers: { Authorization: string } };
+}
+
+export interface CreateCallerSupabaseFactoryOptions<TClient> {
+  createClient: (
+    supabaseUrl: string,
+    supabaseKey: string,
+    options: CallerSupabaseClientOptions,
+  ) => TClient;
+  supabaseUrl: string;
+  supabaseAnonKey: string;
+}
+
+/**
+ * Builds a required-env reader over an injected env source (e.g. `Deno.env`),
+ * throwing when a variable is unset or empty.
+ */
+export function createRequiredEnv(
+  env: { get(name: string): string | undefined },
+): (name: string) => string {
+  return (name: string): string => {
+    const value = env.get(name);
+    if (value === undefined || value.length === 0) {
+      throw new Error(`${name} is required`);
+    }
+
+    return value;
+  };
+}
+
+/**
+ * Builds a per-request caller-scoped Supabase client factory that forwards the
+ * inbound Authorization header, without persisting sessions.
+ */
+export function createCallerSupabaseFactory<TClient>({
+  createClient,
+  supabaseUrl,
+  supabaseAnonKey,
+}: CreateCallerSupabaseFactoryOptions<TClient>): (req: Request) => TClient {
+  return (req: Request): TClient =>
+    createClient(supabaseUrl, supabaseAnonKey, {
+      auth: { autoRefreshToken: false, persistSession: false },
+      global: { headers: { Authorization: req.headers.get("authorization") ?? "" } },
+    });
+}
+
+/** Merges CORS headers onto a handler response without mutating its body. */
+export async function withCors(response: Response | Promise<Response>): Promise<Response> {
+  const resolved = await response;
+  const headers = new Headers(resolved.headers);
+  for (const [name, value] of Object.entries(corsHeaders())) {
+    headers.set(name, value);
+  }
+
+  return new Response(resolved.body, { status: resolved.status, headers });
+}
+
 export function createStripeWebhookHandler<TStripe = unknown, TSupabase = unknown>({
   stripe,
   supabase,
@@ -848,6 +912,14 @@ export function createStripeWebhookHandler<TStripe = unknown, TSupabase = unknow
     try {
       return jsonResponse(200, await processStripeEvent({ stripe, supabase, event }));
     } catch (error) {
+      // A refund_terminal_failure (money stuck) must never surface as an anonymous
+      // 500: emit structured, secret-free diagnostics keyed by the Stripe event.
+      logMoneyPathError({
+        operation: "stripe_webhook_processing_failed",
+        event_id: event.id,
+        event_type: event.type,
+        error_code: errorCode(error),
+      });
       return jsonResponse(500, { error: "webhook_processing_failed" });
     }
   };
@@ -1019,14 +1091,45 @@ function databaseError(message: string, cause: SupabaseErrorLike): EdgeSharedErr
   return new EdgeSharedError("database_error", message, { cause });
 }
 
+function logMoneyPathError(fields: {
+  operation: string;
+  event_id?: string;
+  event_type?: string;
+  checkout_session_id?: string;
+  error_code?: string | null;
+}): void {
+  // Structured, secret-free diagnostics: only ids and error codes are emitted —
+  // never tokens, Stripe secrets, or request/response bodies.
+  console.error(JSON.stringify({ scope: "edge-shared", ...fields }));
+}
+
+function errorCode(error: unknown): string {
+  if (isRecord(error) && typeof error.code === "string" && error.code.length > 0) {
+    return error.code;
+  }
+  if (error instanceof Error && error.name.length > 0) {
+    return error.name;
+  }
+
+  return "unknown";
+}
+
 function accountErrorResponse(error: unknown): Response {
   if (error instanceof EdgeSharedError) {
     if (error.code === "unauthorized") return jsonResponse(401, { error: error.code });
-    if (error.code === "deletion_incomplete") return jsonResponse(503, { error: error.code });
-    if (error.code === "database_error") return jsonResponse(500, { error: "internal_error" });
+    if (error.code === "deletion_incomplete") {
+      // Deletion blocked on pending refund/cleanup reconciliation — money-adjacent.
+      logMoneyPathError({ operation: "account_deletion_incomplete", error_code: error.code });
+      return jsonResponse(503, { error: error.code });
+    }
+    if (error.code === "database_error") {
+      logMoneyPathError({ operation: "account_database_error", error_code: error.code });
+      return jsonResponse(500, { error: "internal_error" });
+    }
     return jsonResponse(400, { error: error.code });
   }
 
+  logMoneyPathError({ operation: "account_internal_error", error_code: errorCode(error) });
   return jsonResponse(500, { error: "internal_error" });
 }
 
@@ -1069,6 +1172,19 @@ async function markCheckoutSessionExpired(
   if (error !== null) {
     throw databaseError("Failed to mark Checkout Session expired", error);
   }
+}
+
+async function runDeletionSettlementPass(
+  admin: AccountAdminClientLike,
+  stripe: StripeCustomerClientLike,
+  userId: string,
+  sessionIds: Set<string>,
+  customerIds: Set<string>,
+  deletedCustomerIds: Set<string>,
+): Promise<void> {
+  await settleDeletionFixpoint(admin, userId, sessionIds, customerIds);
+  await finalizeAccountDeletion(admin, userId, customerIds);
+  await deleteStripeCustomers(stripe, customerIds, deletedCustomerIds);
 }
 
 async function settleDeletionFixpoint(

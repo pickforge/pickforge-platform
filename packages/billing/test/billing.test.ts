@@ -517,14 +517,30 @@ describe("@pickforge/billing", () => {
         amount: 1000,
         status,
       });
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
 
-      await expect(
-        processStripeEvent({
-          supabase,
-          stripe,
-          event: checkoutSessionEvent({ sessionId: `cs_${status}` }),
-        }),
-      ).rejects.toMatchObject({ code: "refund_terminal_failure" });
+      try {
+        await expect(
+          processStripeEvent({
+            supabase,
+            stripe,
+            event: checkoutSessionEvent({ sessionId: `cs_${status}` }),
+          }),
+        ).rejects.toMatchObject({ code: "refund_terminal_failure" });
+
+        expect(consoleError).toHaveBeenCalledWith(
+          JSON.stringify({
+            scope: "billing",
+            operation: "refund_reconciliation",
+            event_id: "evt_checkout",
+            event_type: "checkout.session.completed",
+            checkout_session_id: `cs_${status}`,
+            error_code: "refund_terminal_failure",
+          }),
+        );
+      } finally {
+        consoleError.mockRestore();
+      }
 
       expect(supabase.lifecycleSessions.get(`cs_${status}`)).toBe("refund_pending");
       expect(supabase.refundFailures.get(`cs_${status}`)).toEqual({
@@ -726,19 +742,33 @@ describe("@pickforge/billing", () => {
     expect(supabase.tables.stripe_events).toHaveLength(0);
   });
 
-  it("does not lose or duplicate ledger rows when post-effect stripe_events recording fails", async () => {
+  it("logs and swallows a non-unique post-effect stripe_events failure without losing or duplicating ledger rows", async () => {
     const supabase = new MemorySupabase();
     supabase.failNextInsert("stripe_events", transientDatabaseError());
     const event = checkoutSessionEvent();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
 
-    await expect(processStripeEvent({ supabase, stripe: fakeStripe(), event })).resolves.toEqual({
-      handled: true,
-      duplicate: false,
-    });
-    await expect(processStripeEvent({ supabase, stripe: fakeStripe(), event })).resolves.toEqual({
-      handled: false,
-      duplicate: true,
-    });
+    try {
+      await expect(processStripeEvent({ supabase, stripe: fakeStripe(), event })).resolves.toEqual({
+        handled: true,
+        duplicate: false,
+      });
+      await expect(processStripeEvent({ supabase, stripe: fakeStripe(), event })).resolves.toEqual({
+        handled: false,
+        duplicate: true,
+      });
+
+      expect(consoleError).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(consoleError.mock.calls[0]![0] as string)).toEqual({
+        scope: "billing",
+        operation: "record_stripe_event",
+        event_id: "evt_checkout",
+        event_type: "checkout.session.completed",
+        error_code: "XX000",
+      });
+    } finally {
+      consoleError.mockRestore();
+    }
 
     expect(supabase.tables.credit_ledger).toHaveLength(1);
     expect(supabase.tables.stripe_events).toEqual([
@@ -746,6 +776,26 @@ describe("@pickforge/billing", () => {
         event_id: "evt_checkout",
       }),
     ]);
+  });
+
+  it("silently ignores a 23505 unique-violation when recording the post-effect stripe_events row", async () => {
+    const supabase = new MemorySupabase();
+    supabase.failNextInsert("stripe_events", { code: "23505", message: "duplicate key value" });
+    const event = checkoutSessionEvent();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      await expect(processStripeEvent({ supabase, stripe: fakeStripe(), event })).resolves.toEqual({
+        handled: true,
+        duplicate: false,
+      });
+
+      expect(consoleError).not.toHaveBeenCalled();
+    } finally {
+      consoleError.mockRestore();
+    }
+
+    expect(supabase.tables.credit_ledger).toHaveLength(1);
   });
 
   it("uses stripe_events as the dedupe record for unknown events", async () => {
@@ -769,7 +819,7 @@ describe("@pickforge/billing", () => {
     expect(supabase.tables.credit_ledger).toHaveLength(0);
   });
 
-  it("creates payment checkout sessions with a persistent customer request and no credit metadata", async () => {
+  it("creates payment checkout sessions with a persistent customer request and a deterministic idempotency key", async () => {
     const stripe = fakeStripe();
 
     await createCreditCheckoutSession({
@@ -778,16 +828,20 @@ describe("@pickforge/billing", () => {
       priceId: "price_123",
       successUrl: "https://pickforge.dev/success",
       cancelUrl: "https://pickforge.dev/cancel",
+      requestId: "req_first",
     });
 
-    expect(stripe.checkout.sessions.create).toHaveBeenCalledWith({
-      mode: "payment",
-      customer_creation: "always",
-      client_reference_id: USER_ID,
-      line_items: [{ price: "price_123", quantity: 1 }],
-      success_url: "https://pickforge.dev/success",
-      cancel_url: "https://pickforge.dev/cancel",
-    });
+    expect(stripe.checkout.sessions.create).toHaveBeenCalledWith(
+      {
+        mode: "payment",
+        customer_creation: "always",
+        client_reference_id: USER_ID,
+        line_items: [{ price: "price_123", quantity: 1 }],
+        success_url: "https://pickforge.dev/success",
+        cancel_url: "https://pickforge.dev/cancel",
+      },
+      { idempotencyKey: `checkout-session:${USER_ID}:req_first` },
+    );
   });
 
   it("reuses an existing Stripe customer for repeat credit purchases", async () => {
@@ -800,16 +854,82 @@ describe("@pickforge/billing", () => {
       successUrl: "https://pickforge.dev/success",
       cancelUrl: "https://pickforge.dev/cancel",
       existingCustomerId: "cus_123",
+      requestId: "req_repeat",
     });
 
-    expect(stripe.checkout.sessions.create).toHaveBeenCalledWith({
-      mode: "payment",
-      customer: "cus_123",
-      client_reference_id: USER_ID,
-      line_items: [{ price: "price_123", quantity: 1 }],
-      success_url: "https://pickforge.dev/success",
-      cancel_url: "https://pickforge.dev/cancel",
+    expect(stripe.checkout.sessions.create).toHaveBeenCalledWith(
+      {
+        mode: "payment",
+        customer: "cus_123",
+        client_reference_id: USER_ID,
+        line_items: [{ price: "price_123", quantity: 1 }],
+        success_url: "https://pickforge.dev/success",
+        cancel_url: "https://pickforge.dev/cancel",
+      },
+      { idempotencyKey: `checkout-session:${USER_ID}:req_repeat` },
+    );
+  });
+
+  it("reuses one idempotency key across retries of a purchase attempt but never across distinct purchases", async () => {
+    const stripe = fakeStripe();
+
+    await createCreditCheckoutSession({
+      stripe,
+      userId: USER_ID,
+      priceId: "price_123",
+      successUrl: "https://pickforge.dev/success",
+      cancelUrl: "https://pickforge.dev/cancel",
+      requestId: "attempt_a",
     });
+    await createCreditCheckoutSession({
+      stripe,
+      userId: USER_ID,
+      priceId: "price_123",
+      successUrl: "https://pickforge.dev/success",
+      cancelUrl: "https://pickforge.dev/cancel",
+      requestId: "attempt_a",
+    });
+    await createCreditCheckoutSession({
+      stripe,
+      userId: USER_ID,
+      priceId: "price_123",
+      successUrl: "https://pickforge.dev/success",
+      cancelUrl: "https://pickforge.dev/cancel",
+      requestId: "attempt_b",
+    });
+
+    const keys = stripe.checkout.sessions.create.mock.calls.map(([, options]) => options.idempotencyKey);
+    expect(keys).toEqual([
+      `checkout-session:${USER_ID}:attempt_a`,
+      `checkout-session:${USER_ID}:attempt_a`,
+      `checkout-session:${USER_ID}:attempt_b`,
+    ]);
+  });
+
+  it("generates a fresh non-colliding idempotency key when no requestId is supplied", async () => {
+    const stripe = fakeStripe();
+
+    await createCreditCheckoutSession({
+      stripe,
+      userId: USER_ID,
+      priceId: "price_123",
+      successUrl: "https://pickforge.dev/success",
+      cancelUrl: "https://pickforge.dev/cancel",
+    });
+    await createCreditCheckoutSession({
+      stripe,
+      userId: USER_ID,
+      priceId: "price_123",
+      successUrl: "https://pickforge.dev/success",
+      cancelUrl: "https://pickforge.dev/cancel",
+    });
+
+    const [firstKey, secondKey] = stripe.checkout.sessions.create.mock.calls.map(
+      ([, options]) => options.idempotencyKey,
+    );
+    expect(firstKey).toMatch(new RegExp(`^checkout-session:${USER_ID}:[0-9a-f-]{36}$`));
+    expect(secondKey).toMatch(new RegExp(`^checkout-session:${USER_ID}:[0-9a-f-]{36}$`));
+    expect(firstKey).not.toBe(secondKey);
   });
 
   it("reads balances through the credit_balance_cents rpc", async () => {
@@ -888,7 +1008,7 @@ function fakeStripe(options: { event?: StripeEventLike } = {}) {
   return {
     checkout: {
       sessions: {
-        create: vi.fn(async (params) => ({
+        create: vi.fn(async (params, _options: { idempotencyKey: string }) => ({
           id: "cs_created",
           ...params,
         })),

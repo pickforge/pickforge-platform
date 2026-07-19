@@ -80,7 +80,10 @@ interface StripeRefundEventObject {
 export interface StripeClientLike {
   checkout: {
     sessions: {
-      create<TSession = unknown>(params: StripeCheckoutSessionCreateParams): Promise<TSession>;
+      create<TSession = unknown>(
+        params: StripeCheckoutSessionCreateParams,
+        options: { idempotencyKey: string },
+      ): Promise<TSession>;
     };
   };
   customers: {
@@ -200,6 +203,12 @@ export interface CreateCreditCheckoutSessionOptions {
   successUrl: string;
   cancelUrl: string;
   existingCustomerId?: string;
+  /**
+   * Stable per-attempt identity for the Stripe idempotency key. Retries of the
+   * same purchase must reuse the same value; a genuinely new purchase must pass
+   * a fresh value (or omit it, in which case a fresh one is generated).
+   */
+  requestId?: string;
 }
 
 export interface GetCreditBalanceOptions {
@@ -285,26 +294,39 @@ export async function createCreditCheckoutSession<TSession = unknown>({
   successUrl,
   cancelUrl,
   existingCustomerId,
+  requestId,
 }: CreateCreditCheckoutSessionOptions): Promise<TSession> {
   const validUserId = validateUuid(userId, "userId");
   const validPriceId = validateNonEmptyString(priceId, "priceId");
   const validSuccessUrl = validateNonEmptyString(successUrl, "successUrl");
   const validCancelUrl = validateNonEmptyString(cancelUrl, "cancelUrl");
   const customer = typeof existingCustomerId === "string" && existingCustomerId.trim().length > 0 ? existingCustomerId : undefined;
+  // Deterministic idempotency key mirroring the refund pattern: the same purchase
+  // attempt (network/SDK/app retry) reuses this key and Stripe returns the one
+  // Session, while a distinct purchase supplies a fresh requestId and therefore a
+  // distinct key, so a legitimately new purchase can never collide with an old one.
+  const purchaseRequestId =
+    typeof requestId === "string" && requestId.trim().length > 0
+      ? requestId.trim()
+      : globalThis.crypto.randomUUID();
+  const idempotencyKey = `checkout-session:${validUserId}:${purchaseRequestId}`;
 
-  return stripe.checkout.sessions.create<TSession>({
-    mode: "payment",
-    ...(customer === undefined ? { customer_creation: "always" as const } : { customer }),
-    client_reference_id: validUserId,
-    line_items: [
-      {
-        price: validPriceId,
-        quantity: 1,
-      },
-    ],
-    success_url: validSuccessUrl,
-    cancel_url: validCancelUrl,
-  });
+  return stripe.checkout.sessions.create<TSession>(
+    {
+      mode: "payment",
+      ...(customer === undefined ? { customer_creation: "always" as const } : { customer }),
+      client_reference_id: validUserId,
+      line_items: [
+        {
+          price: validPriceId,
+          quantity: 1,
+        },
+      ],
+      success_url: validSuccessUrl,
+      cancel_url: validCancelUrl,
+    },
+    { idempotencyKey },
+  );
 }
 
 export async function getCreditBalanceCents({
@@ -435,6 +457,7 @@ async function processCheckoutSessionMoneyEvent({
       stripe,
       sessionId,
       eventId: event.id,
+      eventType: event.type,
       paymentIntentId,
       amountCents,
       cleanupLateCustomer: reconciliation === "refund_missing_user",
@@ -496,9 +519,10 @@ async function processRefundLifecycleEvent({
       return { handled: true, duplicate: false, reconciliation: "deletion_race_refunded" };
     }
     if (summary.hasNonterminal) {
-      throw new BillingError(
+      throw refundReconciliationError(
         "refund_incomplete",
         "The PaymentIntent still has another nonterminal Refund",
+        { eventId: event.id, eventType: event.type, sessionId },
       );
     }
     await recordCheckoutRefundFailure(supabase, sessionId, event.id, refundId, "partial");
@@ -507,6 +531,7 @@ async function processRefundLifecycleEvent({
       stripe,
       sessionId,
       eventId: event.id,
+      eventType: event.type,
       paymentIntentId,
       amountCents: Number(data.amount_cents),
       cleanupLateCustomer,
@@ -536,9 +561,10 @@ async function processRefundLifecycleEvent({
     return { handled: true, duplicate: false, reconciliation: "deletion_race_refunded" };
   }
   if (refundSummary.hasNonterminal) {
-    throw new BillingError(
+    throw refundReconciliationError(
       "refund_incomplete",
       "The PaymentIntent still has a nonterminal Refund and is not safe to retry",
+      { eventId: event.id, eventType: event.type, sessionId },
     );
   }
   await performDeletionRefund({
@@ -546,6 +572,7 @@ async function processRefundLifecycleEvent({
     stripe,
     sessionId,
     eventId: event.id,
+    eventType: event.type,
     paymentIntentId,
     amountCents: Number(data.amount_cents),
     cleanupLateCustomer,
@@ -583,6 +610,7 @@ async function performDeletionRefund({
   stripe,
   sessionId,
   eventId,
+  eventType,
   paymentIntentId,
   amountCents,
   cleanupLateCustomer,
@@ -592,6 +620,7 @@ async function performDeletionRefund({
   stripe: Pick<StripeClientLike, "customers" | "refunds">;
   sessionId: string;
   eventId: string;
+  eventType: string;
   paymentIntentId: string;
   amountCents: number;
   cleanupLateCustomer: boolean;
@@ -608,7 +637,11 @@ async function performDeletionRefund({
     !Number.isSafeInteger(prepared.data.attempt) ||
     Number(prepared.data.attempt) <= 0
   ) {
-    throw new BillingError("refund_incomplete", "Checkout Session refund state is not recoverable");
+    throw refundReconciliationError(
+      "refund_incomplete",
+      "Checkout Session refund state is not recoverable",
+      { eventId, eventType, sessionId },
+    );
   }
   const attempt = Number(prepared.data.attempt);
   const mustCleanupCustomer =
@@ -626,9 +659,10 @@ async function performDeletionRefund({
       summary.succeededRefunds,
     );
     if (summary.hasNonterminal) {
-      throw new BillingError(
+      throw refundReconciliationError(
         "refund_incomplete",
         "The PaymentIntent still has a nonterminal Refund and is not safe to retry",
+        { eventId, eventType, sessionId },
       );
     }
     const succeededCents = Math.max(summary.succeededCents, knownSucceededCents);
@@ -699,9 +733,10 @@ async function performDeletionRefund({
         message: `Expected retry_required, received ${String(reconciliation.status)}`,
       });
     }
-    throw new BillingError(
+    throw refundReconciliationError(
       "refund_terminal_failure",
       `The deletion-race refund reached terminal status ${refundStatus}`,
+      { eventId, eventType, sessionId },
     );
   }
   if (refundStatus !== "succeeded") {
@@ -710,7 +745,11 @@ async function performDeletionRefund({
         message: `Expected pending, received ${String(reconciliation.status)}`,
       });
     }
-    throw new BillingError("refund_incomplete", "The deletion-race refund has not succeeded");
+    throw refundReconciliationError(
+      "refund_incomplete",
+      "The deletion-race refund has not succeeded",
+      { eventId, eventType, sessionId },
+    );
   }
   if (reconciliation.status !== "succeeded") {
     throw databaseError("Invalid succeeded Stripe Refund reconciliation", {
@@ -736,6 +775,7 @@ async function performDeletionRefund({
       stripe,
       sessionId,
       eventId,
+      eventType,
       paymentIntentId,
       amountCents,
       cleanupLateCustomer: mustCleanupCustomer,
@@ -920,14 +960,30 @@ async function recordStripeEventBestEffort(
   supabase: SupabaseClientLike,
   event: StripeEventLike,
 ): Promise<void> {
+  // The money-path effect already committed; recording the event is best-effort.
+  // A 23505 unique-violation is the expected duplicate and is silently ignorable;
+  // every other swallowed failure is logged so a lost idempotency record is visible.
   try {
-    await (supabase.from("stripe_events") as SupabaseQueryBuilderLike)
+    const { error } = await (supabase.from("stripe_events") as SupabaseQueryBuilderLike)
       .insert({
         event_id: event.id,
         type: event.type,
       });
-  } catch {
-    return;
+    if (error !== null && error.code !== "23505") {
+      logMoneyPathError({
+        operation: "record_stripe_event",
+        event_id: event.id,
+        event_type: event.type,
+        error_code: error.code ?? null,
+      });
+    }
+  } catch (error) {
+    logMoneyPathError({
+      operation: "record_stripe_event",
+      event_id: event.id,
+      event_type: event.type,
+      error_code: errorCode(error),
+    });
   }
 }
 
@@ -1106,4 +1162,41 @@ function isUniqueViolation(error: SupabaseErrorLike): boolean {
 
 function databaseError(message: string, cause: SupabaseErrorLike): BillingError {
   return new BillingError("database_error", message, { cause });
+}
+
+function refundReconciliationError(
+  code: Extract<BillingErrorCode, "refund_incomplete" | "refund_terminal_failure">,
+  message: string,
+  context: { eventId: string; eventType: string; sessionId: string },
+): BillingError {
+  logMoneyPathError({
+    operation: "refund_reconciliation",
+    event_id: context.eventId,
+    event_type: context.eventType,
+    checkout_session_id: context.sessionId,
+    error_code: code,
+  });
+  return new BillingError(code, message);
+}
+
+function logMoneyPathError(fields: {
+  operation: string;
+  event_id?: string;
+  event_type?: string;
+  checkout_session_id?: string;
+  error_code?: string | null;
+}): void {
+  // Structured, secret-free money-path diagnostics: only ids and error codes are
+  // emitted — never tokens, Stripe secrets, or request/response bodies.
+  console.error(JSON.stringify({ scope: "billing", ...fields }));
+}
+
+function errorCode(error: unknown): string {
+  if (isRecord(error) && typeof error.code === "string" && error.code.length > 0) {
+    return error.code;
+  }
+  if (error instanceof Error && error.name.length > 0) {
+    return error.name;
+  }
+  return "unknown";
 }

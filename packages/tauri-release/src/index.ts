@@ -8,9 +8,11 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -160,6 +162,21 @@ interface LatestJsonPatchTarget {
   parsed: JsonRecord;
   platforms: Array<{ platform: string; value: JsonRecord }>;
 }
+
+interface ReleaseFileContents {
+  path: string;
+  data: Buffer;
+  mode: number;
+}
+
+type ExistingReleaseFileSnapshot =
+  | (ReleaseFileContents & { kind: "file" })
+  | (ReleaseFileContents & { kind: "symlink"; linkTarget: string });
+
+type ReleaseFileSnapshot =
+  | ExistingReleaseFileSnapshot
+  | { path: string; kind: "dangling-symlink"; linkTarget: string }
+  | { path: string; kind: "missing" };
 
 export class ReleaseToolError extends Error {
   constructor(message: string) {
@@ -392,11 +409,15 @@ export function fixAppImage(options: FixAppImageOptions): FixAppImageResult {
 
   const appimage = resolve(options.appimage);
   const signaturePath = `${appimage}.sig`;
-  if (options.latestJson !== undefined) {
-    readLatestJsonPatchTarget(options.latestJson, appimage);
-  }
-  const originalMode = statSync(appimage).mode & 0o7777;
-  const original = readFileSync(appimage);
+  const appimageSnapshot = snapshotReleaseFile(appimage, true);
+  const signatureSnapshot = snapshotReleaseFile(signaturePath, false);
+  const latestJsonSnapshot =
+    options.latestJson === undefined ? undefined : snapshotReleaseFile(options.latestJson, true);
+  const latestJsonTarget =
+    options.latestJson === undefined
+      ? undefined
+      : readLatestJsonPatchTarget(options.latestJson, appimage);
+  const original = appimageSnapshot.data;
   const offset = findSquashfsOffset(original);
   const runtimePrefix = original.subarray(0, offset);
   const compression = squashfsCompression(original, offset);
@@ -405,6 +426,10 @@ export function fixAppImage(options: FixAppImageOptions): FixAppImageResult {
   try {
     const appDir = join(tempDir, "AppDir");
     const squashfs = join(tempDir, "fixed.squashfs");
+    const stagedAppimage = join(tempDir, basename(appimage));
+    const stagedSignature = `${stagedAppimage}.sig`;
+    const stagedLatestJson =
+      options.latestJson === undefined ? undefined : join(tempDir, basename(options.latestJson));
 
     runTool("unsquashfs", ["-dest", appDir, "-offset", String(offset), appimage], env);
     const strippedCount = stripWaylandLibraries(appDir);
@@ -413,24 +438,47 @@ export function fixAppImage(options: FixAppImageOptions): FixAppImageResult {
       [appDir, squashfs, "-comp", compression, "-root-owned", "-noappend"],
       env,
     );
-    writeFileSync(appimage, Buffer.concat([runtimePrefix, readFileSync(squashfs)]));
-    chmodSync(appimage, originalMode);
-    verifyNoWaylandLibraries(appimage, runtimePrefix.length, env);
+    writeFileSync(stagedAppimage, Buffer.concat([runtimePrefix, readFileSync(squashfs)]));
+    chmodSync(stagedAppimage, appimageSnapshot.mode);
 
+    let signature: string | undefined;
     if (signed) {
-      if (existsSync(signaturePath)) {
-        unlinkSync(signaturePath);
-      }
-      runSignCommand(appimage, options.signCommand, env);
-      readSignatureFile(signaturePath);
-    } else if (existsSync(signaturePath)) {
-      unlinkSync(signaturePath);
+      runSignCommand(stagedAppimage, options.signCommand, env);
+      signature = readSignatureFile(stagedSignature);
     }
 
     const platformsPatched =
-      options.latestJson === undefined
+      latestJsonTarget === undefined || stagedLatestJson === undefined || signature === undefined
         ? []
-        : patchLatestJsonSignatures(options.latestJson, appimage, signaturePath, signed);
+        : stageLatestJsonSignatures(latestJsonTarget, signature, stagedLatestJson);
+    verifyStagedReleaseSet({
+      appimage: stagedAppimage,
+      appimageMode: appimageSnapshot.mode,
+      appimageOffset: runtimePrefix.length,
+      env,
+      latestJson: stagedLatestJson,
+      liveAppimage: appimage,
+      signature,
+      signaturePath: signed ? stagedSignature : undefined,
+    });
+
+    commitReleaseSet({
+      appimage,
+      appimageMode: appimageSnapshot.mode,
+      appimageData: readFileSync(stagedAppimage),
+      latestJson: options.latestJson,
+      latestJsonData:
+        stagedLatestJson === undefined ? undefined : readFileSync(stagedLatestJson),
+      latestJsonMode: latestJsonSnapshot?.mode,
+      signatureData: signed ? readFileSync(stagedSignature) : undefined,
+      signatureMode: signed ? statSync(stagedSignature).mode & 0o7777 : undefined,
+      signaturePath,
+      snapshots: {
+        appimage: appimageSnapshot,
+        latestJson: latestJsonSnapshot,
+        signature: signatureSnapshot,
+      },
+    });
 
     return {
       appimage,
@@ -851,26 +899,178 @@ function runSignCommand(
   runShellCommand(`${signCommand} ${shellQuote(appimage)}`, env);
 }
 
-function patchLatestJsonSignatures(
-  latestJson: string,
-  appimage: string,
-  signaturePath: string,
-  signed: boolean,
+function stageLatestJsonSignatures(
+  target: LatestJsonPatchTarget,
+  signature: string,
+  stagedLatestJson: string,
 ): string[] {
-  if (!signed) {
-    throw new ReleaseToolError("--latest-json requires TAURI_SIGNING_PRIVATE_KEY");
-  }
-
-  const signature = readSignatureFile(signaturePath);
-  const target = readLatestJsonPatchTarget(latestJson, appimage);
   for (const { value } of target.platforms) {
     value.signature = signature;
   }
 
-  writeFileSync(latestJson, `${JSON.stringify(target.parsed, null, 2)}\n`);
+  writeFileSync(stagedLatestJson, `${JSON.stringify(target.parsed, null, 2)}\n`);
   return target.platforms
     .map(({ platform }) => platform)
     .sort((left, right) => left.localeCompare(right));
+}
+
+function verifyStagedReleaseSet(options: {
+  appimage: string;
+  appimageMode: number;
+  appimageOffset: number;
+  env: NodeJS.ProcessEnv;
+  latestJson?: string;
+  liveAppimage: string;
+  signature?: string;
+  signaturePath?: string;
+}): void {
+  verifyNoWaylandLibraries(options.appimage, options.appimageOffset, options.env);
+  if ((statSync(options.appimage).mode & 0o7777) !== options.appimageMode) {
+    throw new ReleaseToolError("staged AppImage did not preserve its executable mode");
+  }
+
+  if (options.signaturePath !== undefined) {
+    const stagedSignature = readSignatureFile(options.signaturePath);
+    if (stagedSignature !== options.signature) {
+      throw new ReleaseToolError("staged AppImage signature changed during verification");
+    }
+  }
+
+  if (options.latestJson !== undefined) {
+    if (options.signature === undefined) {
+      throw new ReleaseToolError("staged latest.json is missing its AppImage signature");
+    }
+    const target = readLatestJsonPatchTarget(options.latestJson, options.liveAppimage);
+    if (target.platforms.some(({ value }) => value.signature !== options.signature)) {
+      throw new ReleaseToolError("staged latest.json does not contain the AppImage signature");
+    }
+  }
+}
+
+function commitReleaseSet(options: {
+  appimage: string;
+  appimageData: Buffer;
+  appimageMode: number;
+  signaturePath: string;
+  signatureData?: Buffer;
+  signatureMode?: number;
+  latestJson?: string;
+  latestJsonData?: Buffer;
+  latestJsonMode?: number;
+  snapshots: {
+    appimage: ExistingReleaseFileSnapshot;
+    signature: ReleaseFileSnapshot;
+    latestJson?: ExistingReleaseFileSnapshot;
+  };
+}): void {
+  const rollbackJournal: ReleaseFileSnapshot[] = [];
+  try {
+    rollbackJournal.push(options.snapshots.appimage);
+    writeReleaseFile(options.appimage, options.appimageData, options.appimageMode);
+
+    rollbackJournal.push(options.snapshots.signature);
+    rmSync(options.signaturePath, { force: true });
+    if (options.signatureData !== undefined) {
+      writeReleaseFile(
+        options.signaturePath,
+        options.signatureData,
+        options.signatureMode ?? 0o644,
+      );
+    }
+
+    if (
+      options.latestJson !== undefined &&
+      options.latestJsonData !== undefined &&
+      options.snapshots.latestJson !== undefined
+    ) {
+      rollbackJournal.push(options.snapshots.latestJson);
+      writeReleaseFile(
+        options.latestJson,
+        options.latestJsonData,
+        options.latestJsonMode ?? 0o644,
+      );
+    }
+  } catch (error) {
+    const rollbackErrors: string[] = [];
+    for (const snapshot of rollbackJournal.reverse()) {
+      try {
+        restoreReleaseFile(snapshot);
+      } catch (rollbackError) {
+        rollbackErrors.push(
+          `${basename(snapshot.path)}: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+        );
+      }
+    }
+    if (rollbackErrors.length > 0) {
+      const commitError = error instanceof Error ? error.message : String(error);
+      throw new ReleaseToolError(
+        `AppImage release commit failed (${commitError}) and rollback was incomplete: ${rollbackErrors.join("; ")}`,
+      );
+    }
+    throw error;
+  }
+}
+
+function writeReleaseFile(path: string, data: Buffer, mode: number): void {
+  writeFileSync(path, data);
+  chmodSync(path, mode);
+}
+
+function snapshotReleaseFile(path: string, required: true): ExistingReleaseFileSnapshot;
+function snapshotReleaseFile(path: string, required: false): ReleaseFileSnapshot;
+function snapshotReleaseFile(path: string, required: boolean): ReleaseFileSnapshot {
+  let entry;
+  try {
+    entry = lstatSync(path);
+  } catch (error) {
+    if (isFileNotFoundError(error) && !required) {
+      return { path, kind: "missing" };
+    }
+    throw error;
+  }
+
+  const kind = entry.isSymbolicLink() ? "symlink" : entry.isFile() ? "file" : null;
+  if (kind === "symlink" && !existsSync(path)) {
+    if (!required) {
+      return { path, kind: "dangling-symlink", linkTarget: readlinkSync(path) };
+    }
+    throw new ReleaseToolError(`${basename(path)} must point to a file`);
+  }
+  const target = statSync(path);
+  if (kind === null || !target.isFile()) {
+    throw new ReleaseToolError(`${basename(path)} must be a file`);
+  }
+  const contents = {
+    path,
+    data: readFileSync(path),
+    mode: target.mode & 0o7777,
+  };
+  return kind === "symlink"
+    ? { ...contents, kind, linkTarget: readlinkSync(path) }
+    : { ...contents, kind };
+}
+
+function restoreReleaseFile(snapshot: ReleaseFileSnapshot): void {
+  rmSync(snapshot.path, { force: true });
+  if (snapshot.kind === "missing") {
+    return;
+  }
+  if (snapshot.kind === "dangling-symlink") {
+    symlinkSync(snapshot.linkTarget, snapshot.path);
+    return;
+  }
+  if (snapshot.kind === "symlink") {
+    symlinkSync(snapshot.linkTarget, snapshot.path);
+  }
+  writeReleaseFile(snapshot.path, snapshot.data, snapshot.mode);
+}
+
+function isFileNotFoundError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    (error as NodeJS.ErrnoException).code === "ENOENT"
+  );
 }
 
 function readSignatureFile(signaturePath: string): string {

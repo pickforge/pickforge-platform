@@ -11,6 +11,7 @@
       "extensions/lanes.ts",
       "extensions/gates.ts",
       "extensions/delegation.ts",
+      "extensions/grill-review.ts",
       "extensions/vault.ts",
       "extensions/compact-tools.ts",
       "extensions/ember-footer.ts"

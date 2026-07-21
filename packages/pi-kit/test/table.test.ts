@@ -37,6 +37,12 @@ describe("validateLaneSpec", () => {
     expect(validateLaneSpec({ ...valid, model, effort: "xhigh" })).toBeNull();
   });
 
+  it("enforces the Grok effort pin", () => {
+    const model = "xai/grok-4.5";
+    expect(validateLaneSpec({ ...valid, model, effort: "medium" })).toContain("pinned to effort high");
+    expect(validateLaneSpec({ ...valid, model, effort: "high" })).toBeNull();
+  });
+
   it("lists the table for an unknown selector", () => {
     const error = validateLaneSpec({ ...valid, model: "unknown/model" });
     expect(error).toContain("not in the current table");
@@ -47,5 +53,9 @@ describe("validateLaneSpec", () => {
 describe("estimateCost", () => {
   it("applies per-million input and output prices", () => {
     expect(estimateCost("openai-codex/gpt-5.6-sol", 1_000_000, 500_000)).toBe(8.75);
+  });
+
+  it("uses Grok routing prices", () => {
+    expect(estimateCost("xai/grok-4.5", 1_000_000, 500_000)).toBe(5);
   });
 });

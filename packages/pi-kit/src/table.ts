@@ -20,6 +20,7 @@ export const MODEL_TABLE: ModelRow[] = [
   { selector: "anthropic/claude-fable-5", name: "Fable 5", prior: "high", inPerM: 3, outPerM: 15, vision: true },
   { selector: "anthropic/claude-opus-4-8", name: "Opus 4.8", prior: "xhigh", inPerM: 10, outPerM: 40, vision: true },
   { selector: "anthropic/claude-sonnet-5", name: "Sonnet 5", prior: "medium", inPerM: 3, outPerM: 15, vision: true },
+  { selector: "xai/grok-4.5", name: "Grok 4.5", prior: "high", inPerM: 2, outPerM: 6, vision: true },
   { selector: "ollama/glm-5.2:cloud", name: "GLM-5.2", prior: "medium", inPerM: 0.6, outPerM: 2.2, vision: false },
 ];
 

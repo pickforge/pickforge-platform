@@ -29,10 +29,6 @@ interface LastRun {
   hidden: boolean;
   /** True once the coordinated run has settled and the summary is available. */
   ended: boolean;
-  /** True once the model has consumed the final results (wait or nudge). */
-  reported: boolean;
-  /** Number of lanes_wait calls currently attached; suppresses the settle nudge. */
-  waiters: number;
   timer?: NodeJS.Timeout;
 }
 
@@ -226,25 +222,6 @@ export default function lanesExtension(pi: ExtensionAPI, options: LanesExtension
     renderWidget(ctx, run);
   }
 
-  function sendSettleNudge(run: LastRun, ctx: ExtensionContext): void {
-    if (lastRun !== run || !run.ended || run.reported || run.waiters > 0) return;
-    try {
-      if (ctx.isIdle()) {
-        run.reported = true;
-        pi.sendUserMessage(
-          `[lanes] run ${run.id} settled. Call lanes_status for the results, then continue where we left off.`,
-        );
-      } else {
-        pi.sendUserMessage(
-          `[lanes] run ${run.id} settled — results available via lanes_status/lanes_wait when convenient.`,
-          { deliverAs: "followUp" },
-        );
-      }
-    } catch {
-      // Nudge is best-effort; lanes_status still works.
-    }
-  }
-
   async function monitorSettlement(run: LastRun, ctx: ExtensionContext): Promise<void> {
     try {
       updateRun(run, await coordinator.wait());
@@ -252,15 +229,15 @@ export default function lanesExtension(pi: ExtensionAPI, options: LanesExtension
       return;
     } finally {
       clearInterval(run.timer);
+      // Settling a background run must update only its UI state. Starting or
+      // queueing a parent turn here would prevent the user from continuing.
       if (lastRun === run) renderWidget(ctx, run);
     }
-    sendSettleNudge(run, ctx);
   }
 
   // Lanes survive ESC/turn cancellation, but not the session itself: on
   // shutdown (/new, reload, exit) active children are stopped and reaped.
   pi.on("session_shutdown", async () => {
-    if (lastRun) lastRun.reported = true;
     try {
       await coordinator.shutdown("session ended");
       if (lastRun) {
@@ -281,7 +258,7 @@ export default function lanesExtension(pi: ExtensionAPI, options: LanesExtension
   pi.registerTool({
     name: "lanes_spawn",
     label: "Spawn lanes",
-    description: `Spawn independent Pi lanes that run concurrently in the background (non-blocking: this tool returns immediately; lanes survive turn cancellation). Collect results with lanes_wait, inspect progress or a specific lane with lanes_status, stop lanes only with lanes_abandon. While lanes run you can keep working with the user. You MUST state an explicit model and effort for every lane. Any effort off|minimal|low|medium|high|xhigh is allowed per lane (the value in parentheses is only that model's starting prior). Models: ${MODEL_TABLE.map((row) => `${row.selector} (prior ${row.prior})`).join(", ")}.`,
+    description: `Spawn independent Pi lanes that run concurrently in the background (non-blocking: this tool returns immediately; lanes survive turn cancellation). Never wait on an active run: finish the parent turn so the user can keep messaging, inspect progress with lanes_status only when needed, and collect results after the run settles with lanes_wait or lanes_status. Stop lanes only with lanes_abandon. You MUST state an explicit model and effort for every lane. Any effort off|minimal|low|medium|high|xhigh is allowed per lane (the value in parentheses is only that model's starting prior). Models: ${MODEL_TABLE.map((row) => `${row.selector} (prior ${row.prior})`).join(", ")}.`,
     parameters: Type.Object({
       lanes: Type.Array(
         Type.Object({
@@ -339,8 +316,6 @@ export default function lanesExtension(pi: ExtensionAPI, options: LanesExtension
           ctx,
           hidden: false,
           ended: snapshot.state === "ended",
-          reported: false,
-          waiters: 0,
         };
         if (ctx.hasUI && !view.ended) {
           view.timer = setInterval(() => renderLiveWidget(ctx, view), 1_000);
@@ -354,8 +329,8 @@ export default function lanesExtension(pi: ExtensionAPI, options: LanesExtension
           `Run ${view.id} spawned with ${specs.length} lane${specs.length === 1 ? "" : "s"} (non-blocking):`,
           ...specs.map((spec) => `  ${spec.lane}: ${spec.model}:${spec.effort}`),
           "Lanes run in the background and survive turn cancellation.",
-          "Use lanes_status to check progress or answer questions about a lane, lanes_wait to block for final results, lanes_abandon to stop lanes.",
-          "You can keep working with the user meanwhile — do not poll lanes_status in a loop.",
+          "Finish the parent turn now so the user can keep messaging while lanes run.",
+          "Use lanes_status only when progress is needed; collect results after completion with lanes_wait or lanes_status; use lanes_abandon to stop lanes.",
         ].join("\n");
         return { content: [{ type: "text" as const, text }], details: { run: view.id, lanes: specs.length } };
       } catch (error) {
@@ -390,7 +365,7 @@ export default function lanesExtension(pi: ExtensionAPI, options: LanesExtension
     name: "lanes_status",
     label: "Lane status",
     description:
-      "Report live status of the current lane run without blocking: per-lane state, current activity, tokens, cost, and (for settled lanes) answers. Pass `lane` for a detailed view of one lane — use this when the user asks about a specific lane. Do not call in a polling loop; prefer lanes_wait when you only need the final results.",
+      "Report live status of the current lane run without blocking: per-lane state, current activity, tokens, cost, and (for settled lanes) answers. Pass `lane` for a detailed view of one lane — use this when the user asks about a specific lane. Do not call in a polling loop.",
     parameters: Type.Object({
       lane: Type.Optional(Type.String()),
     }),
@@ -410,7 +385,6 @@ export default function lanesExtension(pi: ExtensionAPI, options: LanesExtension
         const snapshot = coordinator.status(params.lane);
         if (!params.lane) updateRun(lastRun, snapshot);
         else lastRun.ended = snapshot.state === "ended";
-        if (snapshot.state === "ended") lastRun.reported = true;
         const { text } = summarizeRun(snapshot, params.lane);
         return { content: [{ type: "text" as const, text }], details: undefined };
       } catch (error) {
@@ -421,43 +395,34 @@ export default function lanesExtension(pi: ExtensionAPI, options: LanesExtension
 
   pi.registerTool({
     name: "lanes_wait",
-    label: "Wait for lanes",
+    label: "Collect lane results",
     description:
-      "Block until the current lane run settles and return the final per-lane results. Call this when you have nothing else to do for the user, or when the user asks for the results. Cancelling this wait does NOT stop the lanes — they keep running and lanes_status/lanes_wait remain available.",
+      "Return final results only after the current lane run has settled. This tool never blocks an active parent session: while lanes are running it returns immediately so the model can finish the turn and the user can keep messaging.",
     parameters: Type.Object({}),
-    async execute(_toolCallId, _params, signal) {
-      let attachedRun: LastRun | undefined;
+    async execute() {
       try {
         if (!lastRun) {
           return { content: [{ type: "text" as const, text: "No lane run has been spawned this session." }], details: undefined };
         }
         const run = lastRun;
-        let snapshot = run.snapshot;
-        if (run.ended) {
-          snapshot = coordinator.status();
-          updateRun(run, snapshot);
-        } else {
-          run.waiters++;
-          attachedRun = run;
-          snapshot = await coordinator.wait(signal);
-          updateRun(run, snapshot);
-          if (snapshot.state !== "ended") {
-            return {
-              content: [
-                { type: "text" as const, text: `Wait detached; run ${run.id} keeps running. Use lanes_status or lanes_wait again.` },
-              ],
-              details: undefined,
-            };
-          }
+        if (!run.ended) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Run ${run.id} keeps running in the background. Finish the parent turn now; use lanes_status later if the user asks for progress.`,
+              },
+            ],
+            details: undefined,
+          };
         }
-        run.reported = true;
+        const snapshot = coordinator.status();
+        updateRun(run, snapshot);
         const { text, lanes } = summarizeRun(snapshot);
         const ok = lanes.every((lane) => lane.state === "done");
         return { content: [{ type: "text" as const, text }], details: lanes, isError: !ok };
       } catch (error) {
         return toolFailure("lanes_wait", error);
-      } finally {
-        if (attachedRun) attachedRun.waiters--;
       }
     },
   });

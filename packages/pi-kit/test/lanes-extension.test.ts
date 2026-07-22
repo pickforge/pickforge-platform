@@ -175,13 +175,13 @@ describe("async lanes extension", () => {
     const { tools } = makeHarness();
     expect([...tools.keys()]).toEqual(["lanes_spawn", "lanes_status", "lanes_wait", "lanes_abandon"]);
     expect(tools.get("lanes_spawn")!.description).toBe(
-      `Spawn independent Pi lanes that run concurrently in the background (non-blocking: this tool returns immediately; lanes survive turn cancellation). Collect results with lanes_wait, inspect progress or a specific lane with lanes_status, stop lanes only with lanes_abandon. While lanes run you can keep working with the user. You MUST state an explicit model and effort for every lane. Any effort off|minimal|low|medium|high|xhigh is allowed per lane (the value in parentheses is only that model's starting prior). Models: ${MODEL_TABLE.map((row) => `${row.selector} (prior ${row.prior})`).join(", ")}.`,
+      `Spawn independent Pi lanes that run concurrently in the background (non-blocking: this tool returns immediately; lanes survive turn cancellation). Never wait on an active run: finish the parent turn so the user can keep messaging, inspect progress with lanes_status only when needed, and collect results after the run settles with lanes_wait or lanes_status. Stop lanes only with lanes_abandon. You MUST state an explicit model and effort for every lane. Any effort off|minimal|low|medium|high|xhigh is allowed per lane (the value in parentheses is only that model's starting prior). Models: ${MODEL_TABLE.map((row) => `${row.selector} (prior ${row.prior})`).join(", ")}.`,
     );
     expect(tools.get("lanes_status")!.description).toBe(
-      "Report live status of the current lane run without blocking: per-lane state, current activity, tokens, cost, and (for settled lanes) answers. Pass `lane` for a detailed view of one lane — use this when the user asks about a specific lane. Do not call in a polling loop; prefer lanes_wait when you only need the final results.",
+      "Report live status of the current lane run without blocking: per-lane state, current activity, tokens, cost, and (for settled lanes) answers. Pass `lane` for a detailed view of one lane — use this when the user asks about a specific lane. Do not call in a polling loop.",
     );
     expect(tools.get("lanes_wait")!.description).toBe(
-      "Block until the current lane run settles and return the final per-lane results. Call this when you have nothing else to do for the user, or when the user asks for the results. Cancelling this wait does NOT stop the lanes — they keep running and lanes_status/lanes_wait remain available.",
+      "Return final results only after the current lane run has settled. This tool never blocks an active parent session: while lanes are running it returns immediately so the model can finish the turn and the user can keep messaging.",
     );
     expect(tools.get("lanes_abandon")!.description).toBe(
       "Explicitly stop lanes of the current run. Pass `lane` to stop one lane, omit it to stop all. This is the only way to stop lanes — they are not cancelled by ESC or turn cancellation.",
@@ -201,8 +201,8 @@ describe("async lanes extension", () => {
         `Run ${run} spawned with 1 lane (non-blocking):`,
         "  worker: openai-codex/gpt-5.6-sol:medium",
         "Lanes run in the background and survive turn cancellation.",
-        "Use lanes_status to check progress or answer questions about a lane, lanes_wait to block for final results, lanes_abandon to stop lanes.",
-        "You can keep working with the user meanwhile — do not poll lanes_status in a loop.",
+        "Finish the parent turn now so the user can keep messaging while lanes run.",
+        "Use lanes_status only when progress is needed; collect results after completion with lanes_wait or lanes_status; use lanes_abandon to stop lanes.",
       ].join("\n"),
     );
     expect(readRun(run)).toEqual(
@@ -215,6 +215,7 @@ describe("async lanes extension", () => {
     const status = await call("lanes_status", {});
     expect(status.content[0]!.text).toMatch(/worker: (queued|running)/);
 
+    await new Promise((resolve) => setTimeout(resolve, 500));
     const final = await call("lanes_wait", {});
     expect(final.isError).toBeFalsy();
     expect(final.content[0]!.text).toContain("worker: done");
@@ -225,7 +226,7 @@ describe("async lanes extension", () => {
     await installSlowPi(10);
     const { call } = makeHarness();
     await call("lanes_spawn", { lanes: [spec] });
-    await call("lanes_wait", {});
+    await new Promise((resolve) => setTimeout(resolve, 100));
 
     const detail = await call("lanes_status", { lane: "worker" });
     expect(detail.content[0]!.text).toContain("worker: done");
@@ -244,23 +245,23 @@ describe("async lanes extension", () => {
     expect(second.isError).toBe(true);
     expect(second.content[0]!.text).toContain("still active");
 
-    await call("lanes_wait", {});
+    await new Promise((resolve) => setTimeout(resolve, 500));
     const third = await call("lanes_spawn", { lanes: [{ ...spec, lane: "again" }] });
     expect(third.isError).toBeFalsy();
-    await call("lanes_wait", {});
+    await new Promise((resolve) => setTimeout(resolve, 500));
   });
 
-  it("aborting lanes_wait detaches the wait without stopping lanes", async () => {
+  it("lanes_wait never blocks the parent session while lanes are active", async () => {
     await installSlowPi(400);
     const { call } = makeHarness();
     await call("lanes_spawn", { lanes: [spec] });
 
-    const controller = new AbortController();
-    const waiting = call("lanes_wait", {}, controller.signal);
-    controller.abort();
-    const detached = await waiting;
-    expect(detached.content[0]!.text).toContain("keeps running");
+    const started = Date.now();
+    const active = await call("lanes_wait", {});
+    expect(Date.now() - started).toBeLessThan(250);
+    expect(active.content[0]!.text).toContain("keeps running in the background");
 
+    await new Promise((resolve) => setTimeout(resolve, 500));
     const final = await call("lanes_wait", {});
     expect(final.content[0]!.text).toContain("worker: done");
   });
@@ -275,32 +276,23 @@ describe("async lanes extension", () => {
 
     const result = await call("lanes_abandon", { lane: "worker", reason: "test stop" });
     expect(result.content[0]!.text).toContain("worker: abandoned");
+    await new Promise((resolve) => setTimeout(resolve, 25));
     const final = await call("lanes_wait", {});
     expect(final.isError).toBe(true);
     expect(final.content[0]!.text).toContain("test stop");
   });
 
-  it("nudges an idle session once when the run settles unobserved", async () => {
+  it("does not start a parent turn when a background run settles", async () => {
     await installSlowPi(50);
     const { call, sent } = makeHarness({ idle: true });
     await call("lanes_spawn", { lanes: [spec] });
-    await waitFor(() => sent.length > 0);
-    expect(sent[0]!.content).toContain("settled");
-    expect(sent[0]!.content).toContain("lanes_status");
-  });
-
-  it("does not nudge when the results were already collected via lanes_wait", async () => {
-    await installSlowPi(50);
-    const { call, sent } = makeHarness({ idle: true });
-    await call("lanes_spawn", { lanes: [spec] });
-    await call("lanes_wait", {});
     await new Promise((resolve) => setTimeout(resolve, 150));
     expect(sent).toEqual([]);
   });
 });
 
 describe("failure containment", () => {
-  it.each(["spawn", "status", "wait", "abandon"] as const)(
+  it.each(["spawn", "status", "abandon"] as const)(
     "returns a concise isError tool result when coordinator %s throws",
     async (operation) => {
       const coordinator = new FaultCoordinator();
@@ -321,6 +313,20 @@ describe("failure containment", () => {
       ]);
     },
   );
+
+  it("contains a coordinator status failure while collecting settled results", async () => {
+    const coordinator = new FaultCoordinator();
+    const { call } = makeHarness({ createCoordinator: () => coordinator });
+    await call("lanes_spawn", { lanes: [spec] });
+    coordinator.snapshot!.state = "ended";
+    await call("lanes_status", {});
+    coordinator.fail = "status";
+
+    const result = await call("lanes_wait", {});
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toEqual([{ type: "text", text: "lanes_wait failed: injected status failure" }]);
+  });
 
   it("contains throwing UI calls across spawn and every command path", async () => {
     const coordinator = new FaultCoordinator();
@@ -364,7 +370,7 @@ describe("failure containment", () => {
 });
 
 describe("session shutdown", () => {
-  it("abandons an active run and suppresses the nudge on session_shutdown", async () => {
+  it("abandons an active run without starting a parent turn on session_shutdown", async () => {
     await installSlowPi(2_000);
     const { call, handlers, sent } = makeHarness({ idle: true });
     await call("lanes_spawn", { lanes: [spec] });

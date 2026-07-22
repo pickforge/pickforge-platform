@@ -6,6 +6,10 @@
 
 export type Effort = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
+export type LaneMode = "read-only" | "workspace-write";
+export type LaneOrigin = "pi" | "mcp";
+export type ExecutionRoute = "pi" | "claude-code";
+
 export type LaneState = "queued" | "running" | "done" | "failed" | "abandoned";
 
 /** A single dispatched subagent lane. Model and effort MUST be explicit. */
@@ -17,6 +21,8 @@ export interface LaneSpec {
   /** full selector "provider/model-id", e.g. "openai-codex/gpt-5.6-sol" */
   model: string;
   effort: Effort;
+  /** tool and workspace access policy; Pi-origin calls default to workspace-write */
+  mode?: LaneMode;
   /** working directory; defaults to the parent session cwd */
   cwd?: string;
   /** why this model/effort was chosen (journaled for audit) */

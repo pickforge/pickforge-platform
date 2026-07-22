@@ -4,6 +4,9 @@
   "description": "Personal Pi sovereignty kit: lane runner + TUI, model policy, event journal, delivery gates, vault promotion.",
   "type": "module",
   "private": true,
+  "bin": {
+    "pickforge-lanes-mcp": "./mcp/server.ts"
+  },
   "pi": {
     "extensions": [
       "extensions/table.ts",
@@ -22,7 +25,8 @@
   },
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "mcp": "bun mcp/server.ts"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.79.10",
@@ -31,5 +35,9 @@
     "typebox": "1.1.38",
     "@earendil-works/pi-ai": "0.79.10",
     "@earendil-works/pi-tui": "0.79.10"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "zod": "^4.4.3"
   }
 }

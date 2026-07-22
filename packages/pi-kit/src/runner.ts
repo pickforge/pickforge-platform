@@ -1,27 +1,47 @@
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import { createWriteStream, mkdirSync, type WriteStream } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
-import type { KitEvent, LaneProjection, LaneSpec, RunProjection } from "./schema.ts";
-import { estimateCost, validateLaneSpec } from "./table.ts";
+import { StringDecoder } from "node:string_decoder";
+import { createClaudeCodeAdapter } from "./adapters/claude-code.ts";
+import { PiExecutionAdapter } from "./adapters/pi.ts";
+import type {
+  LaneEventParser,
+  LaneExecutionAdapter,
+  LaneProcessPlan,
+  NormalizedLaneEvent,
+} from "./execution-adapter.ts";
+import type { KitEvent, LaneOrigin, LaneProjection, LaneSpec, RunProjection } from "./schema.ts";
+import { estimateCost, findModel, normalizeLaneSpec, validateLaneSpec } from "./table.ts";
 
 export interface RunnerOptions {
   runId: string;
   append: (ev: KitEvent) => void;
   maxConcurrent?: number;
   piBinary?: string;
+  adapters?: readonly LaneExecutionAdapter[];
+  origin?: LaneOrigin;
   onUpdate?: () => void;
-  /** Directory for raw per-lane JSONL transcripts (`<rawDir>/<lane>.jsonl`). */
+  /** Directory for canonical per-lane JSONL transcripts (`<rawDir>/<lane>.jsonl`). */
   rawDir?: string;
 }
 
+type TerminalOutcome =
+  | { type: "end"; ok: boolean; answer: string; stopReason?: string }
+  | { type: "abandoned" };
+
 interface LaneRuntime {
   child: ChildProcessByStdio<null, Readable, Readable>;
+  parser: LaneEventParser;
   raw?: WriteStream;
-  finish: () => void;
-  settled: boolean;
+  terminal?: TerminalOutcome;
+  closed: boolean;
+  terminating: boolean;
+  parserEnded: boolean;
   startedAt: number;
   stdoutBuffer: string;
+  stdoutBytes: number;
+  stdoutOverflow: boolean;
   stderrTail: string;
   answer: string;
   statusTail: string;
@@ -30,12 +50,20 @@ interface LaneRuntime {
   tokensIn: number;
   tokensOut: number;
   cacheRead: number;
-  cacheWrite: number;
+  context: number;
+  rawBytes: number;
+  rawCapped: boolean;
+  taskWritten: boolean;
+}
+
+interface PreparedLane {
+  spec: LaneSpec;
+  adapter: LaneExecutionAdapter;
 }
 
 type JsonRecord = Record<string, unknown>;
 
-const MAX_STDOUT_BUFFER = 4 * 1024 * 1024;
+const MAX_STREAM_BYTES = 4 * 1024 * 1024;
 
 /** Live runners with children, reaped synchronously if the parent dies. */
 const ACTIVE_RUNNERS = new Set<LaneRunner>();
@@ -68,28 +96,13 @@ function isRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null;
 }
 
-function usageNumber(usage: JsonRecord, ...keys: string[]): number {
-  for (const key of keys) {
-    const value = usage[key];
-    if (typeof value === "number" && Number.isFinite(value)) return value;
-  }
-  return 0;
-}
-
-function messageText(message: unknown): string | undefined {
-  if (!isRecord(message) || message.role !== "assistant" || !Array.isArray(message.content)) return undefined;
-  let text = "";
-  for (const part of message.content) {
-    if (isRecord(part) && part.type === "text" && typeof part.text === "string") text += part.text;
-  }
-  return text || undefined;
-}
-
 function toolSummary(tool: string, args: unknown): string {
   let summary: string | undefined;
   if (isRecord(args)) {
-    if (tool === "bash" && typeof args.command === "string") summary = args.command;
-    if (["read", "write", "edit"].includes(tool) && typeof args.path === "string") summary = args.path;
+    if (tool.toLowerCase() === "bash" && typeof args.command === "string") summary = args.command;
+    for (const key of ["path", "file_path", "filePath"]) {
+      if (summary === undefined && typeof args[key] === "string") summary = args[key];
+    }
   }
   if (summary === undefined) {
     try {
@@ -101,27 +114,42 @@ function toolSummary(tool: string, args: unknown): string {
   return summary.replace(/\s+/g, " ").trim().slice(0, 80);
 }
 
+function validUsage(event: Extract<NormalizedLaneEvent, { type: "usage" }>): boolean {
+  return [event.input, event.output, event.cacheRead, event.context].every(
+    (value) => typeof value === "number" && Number.isFinite(value) && value >= 0,
+  );
+}
+
+function isAssistantError(event: Extract<NormalizedLaneEvent, { type: "assistant_end" }>): boolean {
+  return event.isError === true;
+}
+
 export class LaneRunner {
   private readonly append: (ev: KitEvent) => void;
   private readonly maxConcurrent: number;
   private readonly onUpdate?: () => void;
-  private readonly piBinary: string;
+  private readonly adapters: readonly LaneExecutionAdapter[];
+  private readonly origin: LaneOrigin;
   private readonly rawDir?: string;
   private readonly runId: string;
   private readonly runtimes = new Map<string, LaneRuntime>();
   private readonly live: RunProjection;
   private dispatching = false;
+  private shuttingDown = false;
+  private dispatchPromise?: Promise<LaneProjection[]>;
+  private shutdownPromise?: Promise<void>;
 
   constructor(opts: RunnerOptions) {
     this.runId = opts.runId;
     this.append = opts.append;
     this.maxConcurrent = Math.max(1, Math.floor(opts.maxConcurrent ?? 4));
-    this.piBinary = opts.piBinary ?? "pi";
+    this.adapters = opts.adapters ?? [new PiExecutionAdapter(opts.piBinary), createClaudeCodeAdapter()];
+    this.origin = opts.origin ?? "pi";
     if (opts.rawDir) this.rawDir = opts.rawDir;
     this.onUpdate = opts.onUpdate;
     this.live = {
       run: opts.runId,
-      origin: "runner",
+      origin: this.origin,
       createdAt: new Date().toISOString(),
       ended: false,
       lanes: new Map(),
@@ -135,17 +163,43 @@ export class LaneRunner {
     return this.live;
   }
 
-  async dispatch(specs: LaneSpec[]): Promise<LaneProjection[]> {
-    if (this.dispatching) throw new Error("LaneRunner.dispatch may only be called once");
+  dispatch(specs: LaneSpec[]): Promise<LaneProjection[]> {
+    if (this.shuttingDown) return Promise.reject(new Error("LaneRunner is shutting down"));
+    if (this.dispatching) return Promise.reject(new Error("LaneRunner.dispatch may only be called once"));
+    const promise = this.dispatchRun(specs);
+    this.dispatchPromise = promise;
+    return promise;
+  }
 
+  private async dispatchRun(specs: LaneSpec[]): Promise<LaneProjection[]> {
     const violations: string[] = [];
     const seen = new Set<string>();
-    specs.forEach((spec, index) => {
-      const reason = validateLaneSpec(spec);
-      if (reason) violations.push(`${spec.lane || `lane-${index + 1}`}: ${reason}`);
-      if (spec.lane) {
-        if (seen.has(spec.lane)) violations.push(`${spec.lane}: duplicate lane id`);
-        seen.add(spec.lane);
+    const prepared: PreparedLane[] = [];
+    specs.forEach((input, index) => {
+      const label = input.lane || `lane-${index + 1}`;
+      const reason = validateLaneSpec(input, { origin: this.origin });
+      if (reason) violations.push(`${label}: ${reason}`);
+      if (input.lane) {
+        if (seen.has(input.lane)) violations.push(`${input.lane}: duplicate lane id`);
+        seen.add(input.lane);
+      }
+      if (reason) return;
+
+      try {
+        const spec = normalizeLaneSpec(input, { origin: this.origin });
+        const row = findModel(spec.model)!;
+        const matches = this.adapters.filter((adapter) => adapter.route === row.route);
+        if (matches.length !== 1) {
+          violations.push(
+            `${label}: expected exactly one execution adapter for route ${row.route}; found ${matches.length}`,
+          );
+          return;
+        }
+        const adapter = matches[0]!;
+        adapter.preflight(spec);
+        prepared.push({ spec, adapter });
+      } catch (error) {
+        violations.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
       }
     });
     if (violations.length > 0) throw new Error(`Invalid lane specs:\n${violations.join("\n")}`);
@@ -153,23 +207,26 @@ export class LaneRunner {
     this.dispatching = true;
     installExitHook();
     ACTIVE_RUNNERS.add(this);
-    for (const spec of specs) {
+    for (const { spec } of prepared) {
       this.record({ v: 1, t: new Date().toISOString(), run: this.runId, lane: spec.lane, type: "lane_created", spec });
     }
 
     let next = 0;
-    const workers = Array.from({ length: Math.min(this.maxConcurrent, specs.length) }, async () => {
-      while (next < specs.length) {
-        const spec = specs[next++];
-        if (spec && this.live.lanes.get(spec.lane)?.state === "queued") await this.runLane(spec);
+    const workers = Array.from({ length: Math.min(this.maxConcurrent, prepared.length) }, async () => {
+      while (next < prepared.length) {
+        const lane = prepared[next++];
+        if (lane && this.live.lanes.get(lane.spec.lane)?.state === "queued") await this.runLane(lane);
       }
     });
-    await Promise.all(workers);
-    ACTIVE_RUNNERS.delete(this);
+    try {
+      await Promise.all(workers);
+    } finally {
+      ACTIVE_RUNNERS.delete(this);
+    }
 
     this.live.ended = true;
     this.live.ok = [...this.live.lanes.values()].every((lane) => lane.state === "done");
-    this.onUpdate?.();
+    this.notify();
     return [...this.live.lanes.values()];
   }
 
@@ -178,17 +235,9 @@ export class LaneRunner {
     if (!projection || ["done", "failed", "abandoned"].includes(projection.state)) return;
 
     const runtime = this.runtimes.get(lane);
-    if (runtime) {
-      runtime.settled = true;
-      clearTimeout(runtime.statusTimer);
-      this.terminate(runtime);
-    }
-
+    if (runtime?.terminal) return;
     this.record({ v: 1, t: new Date().toISOString(), run: this.runId, lane, type: "lane_abandoned", reason });
-    if (runtime) {
-      this.runtimes.delete(lane);
-      runtime.finish();
-    }
+    if (runtime) this.requestTerminal(runtime, { type: "abandoned" });
   }
 
   /** Abandon every non-terminal lane (abort signal, shutdown). */
@@ -198,21 +247,49 @@ export class LaneRunner {
     }
   }
 
+  /** Abandon active lanes and wait until dispatch has observed every child close. */
+  shutdown(reason: string): Promise<void> {
+    if (!this.shutdownPromise) {
+      this.shuttingDown = true;
+      this.shutdownPromise = this.finishShutdown(reason);
+    }
+    return this.shutdownPromise;
+  }
+
   /** Synchronous last-resort kill of every live child. Called from the process exit hook. */
   reapAll(): void {
     for (const runtime of this.runtimes.values()) killTree(runtime.child, "SIGKILL");
   }
 
+  private async finishShutdown(reason: string): Promise<void> {
+    this.abandonAll(reason);
+    try {
+      await this.dispatchPromise;
+    } catch {
+      // Dispatch validation/preflight errors own no live children.
+    } finally {
+      ACTIVE_RUNNERS.delete(this);
+    }
+  }
+
   /** SIGTERM the child's process group now, escalate to SIGKILL after 5s. */
   private terminate(runtime: LaneRuntime): void {
+    if (runtime.terminating || runtime.closed) return;
+    runtime.terminating = true;
     killTree(runtime.child, "SIGTERM");
     const killTimer = setTimeout(() => killTree(runtime.child, "SIGKILL"), 5_000);
     killTimer.unref();
     runtime.child.once("close", () => clearTimeout(killTimer));
   }
 
+  private requestTerminal(runtime: LaneRuntime, outcome: TerminalOutcome): void {
+    if (runtime.terminal) return;
+    runtime.terminal = outcome;
+    clearTimeout(runtime.statusTimer);
+    this.terminate(runtime);
+  }
+
   private record(event: KitEvent): void {
-    this.append(event);
     if (event.type === "lane_created") {
       this.live.lanes.set(event.spec.lane, {
         spec: event.spec,
@@ -257,217 +334,370 @@ export class LaneRunner {
         }
       }
     }
-    this.onUpdate?.();
+    try {
+      this.append(event);
+    } catch {}
+    this.notify();
   }
 
-  private runLane(spec: LaneSpec): Promise<void> {
-    const { promise, resolve } = Promise.withResolvers<void>();
-      const slash = spec.model.indexOf("/");
-      const provider = spec.model.slice(0, slash);
-      const modelId = spec.model.slice(slash + 1);
-      const child = spawn(
-        this.piBinary,
-        [
-          "--mode",
-          "json",
-          "--no-extensions",
-          "--no-session",
-          "-p",
-          "--provider",
-          provider,
-          "--model",
-          modelId,
-          "--thinking",
-          spec.effort,
-          spec.task,
-        ],
-        {
-          cwd: spec.cwd ?? process.cwd(),
-          env: { ...process.env, PIKIT_CHILD: "1" },
-          stdio: ["ignore", "pipe", "pipe"],
-          detached: true,
-        },
-      );
+  private notify(): void {
+    try {
+      this.onUpdate?.();
+    } catch {}
+  }
 
-      let raw: WriteStream | undefined;
-      if (this.rawDir) {
-        try {
-          mkdirSync(this.rawDir, { recursive: true });
-          raw = createWriteStream(join(this.rawDir, `${spec.lane}.jsonl`), { flags: "a" });
-        } catch {
-          // Transcript capture is best-effort; the lane must still run.
-        }
-      }
+  private transcriptPath(lane: string): { directory: string; path: string } {
+    const directory = resolve(this.rawDir!);
+    const path = resolve(directory, `${lane}.jsonl`);
+    const childPath = relative(directory, path);
+    if (childPath === ".." || childPath.startsWith(`..${sep}`) || isAbsolute(childPath)) {
+      throw new Error(`Transcript path for lane ${lane} escapes rawDir`);
+    }
+    return { directory, path };
+  }
 
-      const runtime: LaneRuntime = {
-        child,
-        ...(raw ? { raw } : {}),
-        finish: resolve,
-        settled: false,
-        startedAt: Date.now(),
-        stdoutBuffer: "",
-        stderrTail: "",
-        answer: "",
-        statusTail: "",
-        lastStatusAt: 0,
-        tokensIn: 0,
-        tokensOut: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-      };
-      this.runtimes.set(spec.lane, runtime);
-
-      const finish = (ok: boolean, answer: string, stopReason?: string) => {
-        if (runtime.settled) return;
-        runtime.settled = true;
-        clearTimeout(runtime.statusTimer);
-        this.runtimes.delete(spec.lane);
-        this.terminate(runtime);
+  private async runLane({ spec, adapter }: PreparedLane): Promise<void> {
+    const preparationStartedAt = Date.now();
+    try {
+      await adapter.prepare?.(spec);
+    } catch (error) {
+      if (this.live.lanes.get(spec.lane)?.state === "queued") {
+        const message = error instanceof Error ? error.message : String(error);
         this.record({
           v: 1,
           t: new Date().toISOString(),
           run: this.runId,
           lane: spec.lane,
           type: "lane_end",
-          ok,
-          ...(stopReason ? { stopReason } : {}),
-          answer: answer.slice(0, 4_000),
-          durationMs: Date.now() - runtime.startedAt,
+          ok: false,
+          stopReason: `prepare:${message}`,
+          answer: message,
+          durationMs: Date.now() - preparationStartedAt,
         });
-        resolve();
-      };
+      }
+      return;
+    }
+    if (this.live.lanes.get(spec.lane)?.state !== "queued") return;
 
-      const emitStatus = () => {
-        runtime.statusTimer = undefined;
-        if (runtime.settled || !runtime.statusTail) return;
-        runtime.lastStatusAt = Date.now();
-        this.record({
-          v: 1,
-          t: new Date().toISOString(),
-          run: this.runId,
-          lane: spec.lane,
-          type: "lane_status",
-          text: runtime.statusTail.slice(-120),
+    let plan: LaneProcessPlan;
+    let parser: LaneEventParser;
+    try {
+      plan = adapter.build(spec);
+      parser = adapter.createParser(spec);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.record({
+        v: 1,
+        t: new Date().toISOString(),
+        run: this.runId,
+        lane: spec.lane,
+        type: "lane_end",
+        ok: false,
+        stopReason: `setup:${message}`,
+        answer: message,
+        durationMs: Date.now() - preparationStartedAt,
+      });
+      return;
+    }
+
+    const { promise, resolve } = Promise.withResolvers<void>();
+    let child: ChildProcessByStdio<null, Readable, Readable>;
+    try {
+      child = spawn(plan.command, plan.args, {
+        cwd: plan.cwd,
+        env: plan.env,
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
+      });
+    } catch (error) {
+      this.record({
+        v: 1,
+        t: new Date().toISOString(),
+        run: this.runId,
+        lane: spec.lane,
+        type: "lane_end",
+        ok: false,
+        stopReason: `spawn:${error instanceof Error ? error.message : String(error)}`,
+        answer: error instanceof Error ? error.message : String(error),
+        durationMs: 0,
+      });
+      resolve();
+      return promise;
+    }
+
+    let raw: WriteStream | undefined;
+    if (this.rawDir) {
+      try {
+        const transcript = this.transcriptPath(spec.lane);
+        mkdirSync(transcript.directory, { recursive: true });
+        raw = createWriteStream(transcript.path, { flags: "a" });
+        raw.on("error", () => {
+          // Transcript capture is best-effort; the lane must still run and settle.
         });
-      };
+      } catch {
+        // Transcript capture is best-effort; the lane must still run.
+      }
+    }
 
-      const handleEvent = (event: unknown) => {
-        if (runtime.settled || !isRecord(event) || typeof event.type !== "string") return;
-        if (event.type === "tool_execution_start" && typeof event.toolName === "string") {
+    const runtime: LaneRuntime = {
+      child,
+      parser,
+      ...(raw ? { raw } : {}),
+      closed: false,
+      terminating: false,
+      parserEnded: false,
+      startedAt: Date.now(),
+      stdoutBuffer: "",
+      stdoutBytes: 0,
+      stdoutOverflow: false,
+      stderrTail: "",
+      answer: "",
+      statusTail: "",
+      lastStatusAt: 0,
+      tokensIn: 0,
+      tokensOut: 0,
+      cacheRead: 0,
+      context: 0,
+      rawBytes: 0,
+      rawCapped: false,
+      taskWritten: false,
+    };
+    this.runtimes.set(spec.lane, runtime);
+    this.writeCanonical(runtime, { v: 1, type: "task", text: spec.task });
+
+    const emitStatus = () => {
+      runtime.statusTimer = undefined;
+      if (runtime.terminal || !runtime.statusTail) return;
+      runtime.lastStatusAt = Date.now();
+      this.record({
+        v: 1,
+        t: new Date().toISOString(),
+        run: this.runId,
+        lane: spec.lane,
+        type: "lane_status",
+        text: runtime.statusTail.slice(-120),
+      });
+    };
+
+    const handleEvent = (event: NormalizedLaneEvent, allowSuccess = true) => {
+      if (!isRecord(event) || event.v !== 1 || typeof event.type !== "string") return;
+      if (event.type === "task") {
+        if (!runtime.taskWritten) this.writeCanonical(runtime, { v: 1, type: "task", text: spec.task });
+        return;
+      }
+      if (event.type === "usage") {
+        if (!validUsage(event)) return;
+        if (
+          event.input === runtime.tokensIn &&
+          event.output === runtime.tokensOut &&
+          event.cacheRead === runtime.cacheRead &&
+          event.context === runtime.context
+        ) {
+          return;
+        }
+      }
+      this.writeCanonical(runtime, event);
+
+      switch (event.type) {
+        case "thinking_delta":
+          break;
+        case "text_delta": {
+          if (runtime.answer.length < 4_000) runtime.answer += event.delta.slice(0, 4_000 - runtime.answer.length);
+          runtime.statusTail = `${runtime.statusTail}${event.delta}`.replace(/\s+/g, " ").trim().slice(-120);
+          const elapsed = Date.now() - runtime.lastStatusAt;
+          if (elapsed >= 1_000) emitStatus();
+          else if (!runtime.statusTimer) {
+            runtime.statusTimer = setTimeout(emitStatus, 1_000 - elapsed);
+            runtime.statusTimer.unref();
+          }
+          break;
+        }
+        case "tool_start":
           this.record({
             v: 1,
             t: new Date().toISOString(),
             run: this.runId,
             lane: spec.lane,
             type: "lane_tool",
-            tool: event.toolName,
-            summary: toolSummary(event.toolName, event.args),
+            tool: event.tool,
+            summary: toolSummary(event.tool, event.input),
           });
-          return;
-        }
-        if (event.type === "message_start" && isRecord(event.message) && event.message.role === "assistant") {
-          runtime.answer = "";
-          runtime.statusTail = "";
-          return;
-        }
-        if (event.type === "message_update" && isRecord(event.assistantMessageEvent)) {
-          const update = event.assistantMessageEvent;
-          if (update.type === "text_delta" && typeof update.delta === "string") {
-            if (runtime.answer.length < 4_000) runtime.answer += update.delta.slice(0, 4_000 - runtime.answer.length);
-            runtime.statusTail = `${runtime.statusTail}${update.delta}`.replace(/\s+/g, " ").trim().slice(-120);
-            const elapsed = Date.now() - runtime.lastStatusAt;
-            if (elapsed >= 1_000) emitStatus();
-            else if (!runtime.statusTimer) {
-              runtime.statusTimer = setTimeout(emitStatus, 1_000 - elapsed);
-              runtime.statusTimer.unref();
-            }
-          }
-          return;
-        }
-        if (event.type === "message_end" && isRecord(event.message) && event.message.role === "assistant") {
-          const completeText = messageText(event.message);
-          if (completeText !== undefined) runtime.answer = completeText.slice(0, 4_000);
-          if (isRecord(event.message.usage)) {
-            const usage = event.message.usage;
-            runtime.tokensIn += usageNumber(usage, "input", "inputTokens", "input_tokens");
-            runtime.tokensOut += usageNumber(usage, "output", "outputTokens", "output_tokens");
-            runtime.cacheRead += usageNumber(usage, "cacheRead", "cacheReadTokens", "cache_read");
-            runtime.cacheWrite += usageNumber(usage, "cacheWrite", "cacheWriteTokens", "cache_write");
-            const reportedTotal = usageNumber(usage, "totalTokens", "total_tokens", "total", "contextTokens");
-            this.record({
-              v: 1,
-              t: new Date().toISOString(),
-              run: this.runId,
-              lane: spec.lane,
-              type: "lane_usage",
-              input: runtime.tokensIn,
-              output: runtime.tokensOut,
-              cacheRead: runtime.cacheRead,
-              cost: estimateCost(spec.model, runtime.tokensIn, runtime.tokensOut),
-              context: reportedTotal || runtime.tokensIn + runtime.tokensOut,
-            });
-          }
-          return;
-        }
-        if (event.type === "agent_end") {
-          if (Array.isArray(event.messages)) {
-            for (let index = event.messages.length - 1; index >= 0; index--) {
-              const text = messageText(event.messages[index]);
-              if (text !== undefined) {
-                runtime.answer = text.slice(0, 4_000);
-                break;
-              }
-            }
-          }
-          finish(true, runtime.answer);
-        }
-      };
-
-      const consumeLine = (line: string) => {
-        if (!line.trim()) return;
-        if (runtime.raw?.writable) runtime.raw.write(`${line}\n`);
-        try {
-          handleEvent(JSON.parse(line));
-        } catch {
-          // Ignore malformed child output; process exit still yields a terminal lane event.
-        }
-      };
-
-      child.once("spawn", () => {
-        if (!runtime.settled) {
+          break;
+        case "tool_end":
+          break;
+        case "usage":
+          runtime.tokensIn = event.input;
+          runtime.tokensOut = event.output;
+          runtime.cacheRead = event.cacheRead;
+          runtime.context = event.context;
           this.record({
             v: 1,
             t: new Date().toISOString(),
             run: this.runId,
             lane: spec.lane,
-            type: "lane_start",
-            pid: child.pid!,
+            type: "lane_usage",
+            input: event.input,
+            output: event.output,
+            cacheRead: event.cacheRead,
+            cost: estimateCost(spec.model, event.input, event.output),
+            context: event.context,
           });
+          break;
+        case "assistant_end":
+          runtime.answer = event.text.slice(0, 4_000);
+          if (isAssistantError(event)) {
+            this.requestTerminal(runtime, {
+              type: "end",
+              ok: false,
+              answer: runtime.answer,
+              stopReason: "assistant-error",
+            });
+          } else if (allowSuccess) {
+            this.requestTerminal(runtime, { type: "end", ok: true, answer: runtime.answer });
+          }
+          break;
+      }
+    };
+
+    const feedParser = (line: string) => {
+      try {
+        for (const event of parser.feedLine(line)) handleEvent(event);
+      } catch (error) {
+        this.requestTerminal(runtime, {
+          type: "end",
+          ok: false,
+          answer: runtime.stderrTail,
+          stopReason: `parser:${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+    };
+
+    child.once("spawn", () => {
+      if (!runtime.closed && !runtime.terminal) {
+        this.record({
+          v: 1,
+          t: new Date().toISOString(),
+          run: this.runId,
+          lane: spec.lane,
+          type: "lane_start",
+          pid: child.pid!,
+        });
+      }
+    });
+    const stdoutDecoder = new StringDecoder("utf8");
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (runtime.stdoutOverflow) return;
+      runtime.stdoutBytes += chunk.length;
+      if (runtime.stdoutBytes > MAX_STREAM_BYTES) {
+        runtime.stdoutOverflow = true;
+        runtime.stdoutBuffer = "";
+        this.requestTerminal(runtime, {
+          type: "end",
+          ok: false,
+          answer: runtime.answer,
+          stopReason: "stdout-overflow",
+        });
+        return;
+      }
+      runtime.stdoutBuffer += stdoutDecoder.write(chunk);
+      let newline = runtime.stdoutBuffer.indexOf("\n");
+      while (newline >= 0) {
+        const line = runtime.stdoutBuffer.slice(0, newline);
+        runtime.stdoutBuffer = runtime.stdoutBuffer.slice(newline + 1);
+        if (line.trim()) feedParser(line);
+        newline = runtime.stdoutBuffer.indexOf("\n");
+      }
+    });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      runtime.stderrTail = `${runtime.stderrTail}${chunk}`.slice(-500);
+    });
+    child.once("error", (error) => {
+      this.requestTerminal(runtime, {
+        type: "end",
+        ok: false,
+        answer: runtime.stderrTail || error.message,
+        stopReason: `spawn:${error.message}`,
+      });
+    });
+    child.once("close", (code) => {
+      runtime.closed = true;
+      clearTimeout(runtime.statusTimer);
+      if (!runtime.stdoutOverflow) {
+        runtime.stdoutBuffer += stdoutDecoder.end();
+        if (runtime.stdoutBuffer) feedParser(runtime.stdoutBuffer);
+      }
+      runtime.stdoutBuffer = "";
+
+      if (!runtime.parserEnded) {
+        runtime.parserEnded = true;
+        try {
+          for (const event of parser.end()) handleEvent(event, code === 0);
+        } catch (error) {
+          if (!runtime.terminal) {
+            runtime.terminal = {
+              type: "end",
+              ok: false,
+              answer: runtime.stderrTail,
+              stopReason: `parser:${error instanceof Error ? error.message : String(error)}`,
+            };
+          }
         }
-      });
-      child.stdout.setEncoding("utf8");
-      child.stdout.on("data", (chunk: string) => {
-        if (runtime.stdoutBuffer.length + chunk.length > MAX_STDOUT_BUFFER) {
-          finish(false, runtime.answer, "stdout-overflow");
-          return;
-        }
-        runtime.stdoutBuffer += chunk;
-        const lines = runtime.stdoutBuffer.split("\n");
-        runtime.stdoutBuffer = lines.pop() ?? "";
-        for (const line of lines) consumeLine(line);
-      });
-      child.stderr.setEncoding("utf8");
-      child.stderr.on("data", (chunk: string) => {
-        runtime.stderrTail = `${runtime.stderrTail}${chunk}`.slice(-500);
-      });
-      child.once("error", (error) => finish(false, runtime.stderrTail || error.message, `spawn:${error.message}`));
-      child.once("close", (code) => {
-        if (runtime.stdoutBuffer) consumeLine(runtime.stdoutBuffer);
-        // End the transcript only after the last stdout flush so abandoned or
-        // failed lanes keep their tail lines.
-        runtime.raw?.end();
-        if (!runtime.settled) finish(false, runtime.stderrTail, `exit:${code ?? "signal"}`);
-      });
+      }
+      if (!runtime.terminal) {
+        runtime.terminal = {
+          type: "end",
+          ok: false,
+          answer: runtime.stderrTail || runtime.answer,
+          stopReason: `exit:${code ?? "signal"}`,
+        };
+      }
+
+      const outcome = runtime.terminal;
+      if (outcome.type === "end") {
+        this.record({
+          v: 1,
+          t: new Date().toISOString(),
+          run: this.runId,
+          lane: spec.lane,
+          type: "lane_end",
+          ok: outcome.ok,
+          ...(outcome.stopReason ? { stopReason: outcome.stopReason } : {}),
+          answer: outcome.answer.slice(0, 4_000),
+          durationMs: Date.now() - runtime.startedAt,
+        });
+      }
+      this.runtimes.delete(spec.lane);
+
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        resolve();
+      };
+      if (runtime.raw && !runtime.raw.destroyed) {
+        runtime.raw.once("error", finish);
+        runtime.raw.end(finish);
+      } else {
+        finish();
+      }
+    });
     return promise;
+  }
+
+  private writeCanonical(runtime: LaneRuntime, event: NormalizedLaneEvent): void {
+    if (event.type === "task") {
+      if (runtime.taskWritten) return;
+      runtime.taskWritten = true;
+    }
+    if (!runtime.raw?.writable || runtime.rawCapped) return;
+    const line = `${JSON.stringify(event)}\n`;
+    const bytes = Buffer.byteLength(line);
+    if (runtime.rawBytes + bytes > MAX_STREAM_BYTES) {
+      runtime.rawCapped = true;
+      return;
+    }
+    runtime.rawBytes += bytes;
+    runtime.raw.write(line);
   }
 }

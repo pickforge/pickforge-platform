@@ -28,6 +28,14 @@ function firstText(content: unknown): string {
   return text;
 }
 
+function inputText(input: unknown): string {
+  try {
+    return JSON.stringify(input) ?? "";
+  } catch {
+    return String(input);
+  }
+}
+
 const MAX_ENTRY_TEXT = 20_000;
 const MAX_RESULT_TEXT = 4_000;
 
@@ -47,7 +55,8 @@ export class LaneTranscript {
       return;
     }
     if (!isRecord(event) || typeof event.type !== "string") return;
-    this.handle(event);
+    if (event.v === 1 && this.handleNormalized(event)) return;
+    this.handlePi(event);
   }
 
   feedChunk(chunk: string): void {
@@ -70,7 +79,53 @@ export class LaneTranscript {
     this.version++;
   }
 
-  private handle(event: JsonRecord): void {
+  private handleNormalized(event: JsonRecord): boolean {
+    switch (event.type) {
+      case "task":
+        if (typeof event.text !== "string") return true;
+        if (this.entries.length === 0) this.push("task", event.text.slice(0, MAX_ENTRY_TEXT));
+        return true;
+      case "thinking_delta":
+        if (typeof event.delta === "string") this.appendDelta("thinking", "normalized-thinking", event.delta);
+        return true;
+      case "text_delta":
+        if (typeof event.delta === "string") this.appendDelta("text", "normalized-text", event.delta);
+        return true;
+      case "tool_start":
+        if (typeof event.tool !== "string") return true;
+        this.currentKey = "";
+        this.push("tool", inputText(event.input).slice(0, MAX_RESULT_TEXT), event.tool);
+        return true;
+      case "tool_end":
+        if (typeof event.tool !== "string" || typeof event.text !== "string") return true;
+        this.currentKey = "";
+        this.push(
+          "tool_result",
+          event.text.slice(0, MAX_RESULT_TEXT),
+          event.isError === true ? `${event.tool} (error)` : event.tool,
+        );
+        return true;
+      case "usage":
+        return true;
+      case "assistant_end": {
+        if (typeof event.text !== "string" || !event.text) return true;
+        const rendered = this.entries
+          .filter((entry) => entry.kind === "text")
+          .map((entry) => entry.text)
+          .join("");
+        if (!rendered) this.push("text", event.text.slice(0, MAX_ENTRY_TEXT));
+        else if (event.text.startsWith(rendered) && event.text.length > rendered.length) {
+          this.appendDelta("text", "normalized-text", event.text.slice(rendered.length));
+        }
+        this.currentKey = "";
+        return true;
+      }
+      default:
+        return false;
+    }
+  }
+
+  private handlePi(event: JsonRecord): void {
     if (event.type === "message_start" && isRecord(event.message) && event.message.role === "user") {
       if (this.entries.length === 0) this.push("task", firstText(event.message.content).slice(0, MAX_ENTRY_TEXT));
       return;

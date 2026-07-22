@@ -9,8 +9,15 @@
  * Toggle with /footer. Requires pi-bar to be uninstalled or hidden, since
  * both replace the footer.
  */
-import { calculateCost, type AssistantMessage, type Usage } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  type AssistantMessage,
+  calculateCost,
+  type Usage,
+} from "@earendil-works/pi-ai";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 /** Status keys whose text is already surfaced elsewhere in the footer. */
@@ -27,7 +34,9 @@ function fmtDuration(elapsedMs: number): string {
   const hours = Math.floor(totalSeconds / 3_600);
   const minutes = Math.floor((totalSeconds % 3_600) / 60);
   const seconds = totalSeconds % 60;
-  const clock = `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
+  const clock = `${minutes.toString().padStart(2, "0")}:${
+    seconds.toString().padStart(2, "0")
+  }`;
   return hours > 0 ? `${hours}:${clock}` : clock;
 }
 
@@ -38,7 +47,12 @@ function pricedCost(ctx: ExtensionContext, message: AssistantMessage): number {
     const modelId = message.model;
     if (!provider || !modelId || message.usage.totalTokens <= 0) return 0;
     const model = ctx.modelRegistry.find(provider, modelId);
-    if (!model || !Object.values(model.cost).some((rate) => typeof rate === "number" && rate > 0)) return 0;
+    if (
+      !model ||
+      !Object.values(model.cost).some((rate) =>
+        typeof rate === "number" && rate > 0
+      )
+    ) return 0;
     const estimatedUsage: Usage = {
       ...message.usage,
       cost: { ...message.usage.cost },
@@ -71,9 +85,15 @@ export default function emberFooter(pi: ExtensionAPI) {
         for (const entry of entries) {
           if (entry.type === "message" && entry.message.role === "assistant") {
             cachedCost += pricedCost(ctx, entry.message as AssistantMessage);
-          } else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.usage) {
+          } else if (
+            entry.type === "message" && entry.message.role === "toolResult" &&
+            entry.message.usage
+          ) {
             cachedCost += entry.message.usage.cost.total;
-          } else if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
+          } else if (
+            (entry.type === "branch_summary" || entry.type === "compaction") &&
+            entry.usage
+          ) {
             cachedCost += entry.usage.cost.total;
           }
         }
@@ -99,91 +119,127 @@ export default function emberFooter(pi: ExtensionAPI) {
     if (!ctx.hasUI) return;
     try {
       ctx.ui.setFooter((tui, theme, footerData) => {
-        const render = () => {
-          try {
-            tui.requestRender();
-          } catch {
-            // Rendering callbacks must never break the session.
-          }
-        };
-        requestRender = render;
-        const unsubscribe = footerData.onBranchChange(render);
-        const sep = theme.fg("dim", " · ");
-
-        return {
-          dispose() {
+        try {
+          const render = () => {
             try {
-              unsubscribe();
+              tui.requestRender();
             } catch {
-              // Footer cleanup is best-effort.
+              // Rendering callbacks must never break the session.
             }
-            if (requestRender === render) requestRender = undefined;
-          },
-          invalidate() {},
-          render(width: number): string[] {
-            const cost = sessionCost(ctx);
-            let contextTokens: number | null = null;
-            let contextWindow = 0;
-            try {
-              const usage = ctx.getContextUsage();
-              contextTokens = usage?.tokens ?? null;
-              contextWindow = usage?.contextWindow ?? 0;
-            } catch {
-              // Footer must never break the session.
-            }
+          };
+          requestRender = render;
+          const unsubscribe = footerData.onBranchChange(render);
+          const sep = theme.fg("dim", " · ");
 
-            const model = ctx.model?.id ?? "no-model";
-            const thinking = pi.getThinkingLevel();
-            const pressurePct =
-              contextTokens !== null && contextWindow > 0 ? (contextTokens / contextWindow) * 100 : null;
-            const pressureColor =
-              pressurePct === null ? "muted" : pressurePct < 50 ? "success" : pressurePct < 80 ? "warning" : "error";
-            const pressure =
-              pressurePct === null ? "—" : `${pressurePct.toFixed(0)}% of ${fmtTokens(contextWindow)}`;
-            const branch = footerData.getGitBranch();
-            const now = Date.now();
-            let costText = `$${cost.toFixed(2)}`;
-            try {
-              if (ctx.model && ctx.modelRegistry.isUsingOAuth(ctx.model)) costText += " est";
-            } catch {
-              // Footer must never break the session.
-            }
+          return {
+            dispose() {
+              try {
+                unsubscribe();
+              } catch {
+                // Footer cleanup is best-effort.
+              }
+              if (requestRender === render) requestRender = undefined;
+            },
+            invalidate() {},
+            render(width: number): string[] {
+              try {
+                const cost = sessionCost(ctx);
+                let contextTokens: number | null = null;
+                let contextWindow = 0;
+                try {
+                  const usage = ctx.getContextUsage();
+                  contextTokens = usage?.tokens ?? null;
+                  contextWindow = usage?.contextWindow ?? 0;
+                } catch {
+                  // Footer must never break the session.
+                }
 
-            const left = [
-              theme.fg("accent", model),
-              theme.fg("muted", `think ${thinking}`),
-              theme.fg(pressureColor, pressure),
-              theme.fg("muted", `session ${fmtDuration(now - sessionStartedAt)}`),
-              ...(workingStartedAt !== null
-                ? [theme.fg("warning", `working ${fmtDuration(now - workingStartedAt)}`)]
-                : workedElapsedMs !== null
-                  ? [theme.fg("muted", `worked ${fmtDuration(workedElapsedMs)}`)]
-                  : []),
-            ].join(sep);
-            const right = [
-              ...(branch ? [theme.fg("muted", ` ${branch}`)] : []),
-              theme.fg("dim", costText),
-            ].join(sep);
+                const model = ctx.model?.id ?? "no-model";
+                const thinking = pi.getThinkingLevel();
+                const pressurePct = contextTokens !== null && contextWindow > 0
+                  ? (contextTokens / contextWindow) * 100
+                  : null;
+                const pressureColor = pressurePct === null
+                  ? "muted"
+                  : pressurePct < 50
+                  ? "success"
+                  : pressurePct < 80
+                  ? "warning"
+                  : "error";
+                const pressure = pressurePct === null
+                  ? "—"
+                  : `${pressurePct.toFixed(0)}% of ${fmtTokens(contextWindow)}`;
+                const branch = footerData.getGitBranch();
+                const now = Date.now();
+                let costText = `$${cost.toFixed(2)}`;
+                try {
+                  if (ctx.model && ctx.modelRegistry.isUsingOAuth(ctx.model)) {
+                    costText += " est";
+                  }
+                } catch {
+                  // Footer must never break the session.
+                }
 
-            const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
-            const lines = [truncateToWidth(left + pad + right, width)];
+                const left = [
+                  theme.fg("accent", model),
+                  theme.fg("muted", `think ${thinking}`),
+                  theme.fg(pressureColor, pressure),
+                  theme.fg(
+                    "muted",
+                    `session ${fmtDuration(now - sessionStartedAt)}`,
+                  ),
+                  ...(workingStartedAt !== null
+                    ? [
+                      theme.fg(
+                        "warning",
+                        `working ${fmtDuration(now - workingStartedAt)}`,
+                      ),
+                    ]
+                    : workedElapsedMs !== null
+                    ? [
+                      theme.fg(
+                        "muted",
+                        `worked ${fmtDuration(workedElapsedMs)}`,
+                      ),
+                    ]
+                    : []),
+                ].join(sep);
+                const right = [
+                  ...(branch ? [theme.fg("muted", ` ${branch}`)] : []),
+                  theme.fg("dim", costText),
+                ].join(sep);
 
-            // Line 2: extension statuses, text only, deduplicated.
-            const seen = new Set<string>();
-            const statuses: string[] = [];
-            for (const [key, text] of footerData.getExtensionStatuses()) {
-              if (HIDDEN_STATUS_KEYS.has(key)) continue;
-              const clean = text.trim();
-              if (!clean || seen.has(clean)) continue;
-              seen.add(clean);
-              statuses.push(clean);
-            }
-            if (statuses.length > 0) {
-              lines.push(truncateToWidth(statuses.join(sep), width));
-            }
-            return lines;
-          },
-        };
+                const pad = " ".repeat(
+                  Math.max(1, width - visibleWidth(left) - visibleWidth(right)),
+                );
+                const lines = [truncateToWidth(left + pad + right, width)];
+
+                // Line 2: extension statuses, text only, deduplicated.
+                const seen = new Set<string>();
+                const statuses: string[] = [];
+                for (const [key, text] of footerData.getExtensionStatuses()) {
+                  if (HIDDEN_STATUS_KEYS.has(key)) continue;
+                  const clean = text.trim();
+                  if (!clean || seen.has(clean)) continue;
+                  seen.add(clean);
+                  statuses.push(clean);
+                }
+                if (statuses.length > 0) {
+                  lines.push(truncateToWidth(statuses.join(sep), width));
+                }
+                return lines;
+              } catch {
+                return [];
+              }
+            },
+          };
+        } catch {
+          return {
+            dispose() {},
+            invalidate() {},
+            render: () => [],
+          };
+        }
       });
     } catch {
       // Footer installation must never break the session.

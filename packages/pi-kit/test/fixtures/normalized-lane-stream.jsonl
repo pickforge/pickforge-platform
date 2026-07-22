@@ -1,0 +1,8 @@
+{"v":1,"type":"task","text":"Run the normalized fixture task"}
+{"v":1,"type":"thinking_delta","delta":"Inspecting fixture."}
+{"v":1,"type":"tool_start","tool":"read","input":{"path":"README.md"}}
+{"v":1,"type":"tool_end","tool":"read","text":"fixture contents","isError":false}
+{"v":1,"type":"text_delta","delta":"Normalized "}
+{"v":1,"type":"text_delta","delta":"answer."}
+{"v":1,"type":"usage","input":120,"output":40,"cacheRead":50,"context":230}
+{"v":1,"type":"assistant_end","text":"Normalized answer."}

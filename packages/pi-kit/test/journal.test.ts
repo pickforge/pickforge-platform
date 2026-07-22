@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   appendEvent,
   journalDir,
+  listRuns,
   readRun,
   reduceRun,
 } from "../src/journal-core.ts";
@@ -68,6 +69,28 @@ describe("journal core", () => {
     for (const item of events) appendEvent(item);
 
     expect(readRun(run)).toEqual(events);
+  });
+
+  it("lists only journal runs in newest-first order", () => {
+    appendEvent({
+      v: 1,
+      t: "2026-07-16T12:00:00.000Z",
+      run: "run-20260716",
+      type: "run_created",
+      lanes: 0,
+      origin: "test",
+    });
+    appendEvent({
+      v: 1,
+      t: "2026-07-17T12:00:00.000Z",
+      run: "run-20260717",
+      type: "run_created",
+      lanes: 0,
+      origin: "test",
+    });
+    appendFileSync(join(journalDir(), "notes.txt"), "not a run", "utf8");
+
+    expect(listRuns()).toEqual(["run-20260717", "run-20260716"]);
   });
 
   it("uses cumulative lane usage and reduces terminal states and totals", () => {

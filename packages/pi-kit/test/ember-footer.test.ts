@@ -1,10 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import emberFooter from "../extensions/ember-footer.ts";
 
 type Handler = (event: unknown, ctx: ExtensionContext) => void | Promise<void>;
-type FooterFactory = (tui: { requestRender(): void }, theme: Theme, data: FooterData) => FooterComponent;
+type FooterFactory = (
+  tui: { requestRender(): void },
+  theme: Theme,
+  data: FooterData,
+) => FooterComponent;
 type FooterComponent = { render(width: number): string[]; dispose?(): void };
 type Theme = { fg(_color: string, text: string): string };
 type FooterData = {
@@ -25,7 +32,14 @@ function usage(input: number, output: number, total = 0) {
   };
 }
 
-function makeHarness(opts: { stalePricing?: boolean; throwRender?: boolean } = {}) {
+function makeHarness(
+  opts: {
+    stalePricing?: boolean;
+    throwRender?: boolean;
+    throwTheme?: boolean;
+    throwFooterData?: boolean;
+  } = {},
+) {
   const handlers = new Map<string, Handler>();
   let footerFactory: FooterFactory | undefined;
   let renders = 0;
@@ -45,7 +59,10 @@ function makeHarness(opts: { stalePricing?: boolean; throwRender?: boolean } = {
     id: "gpt-5.6-sol",
     cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
   };
-  const staleModel = { ...pricedModel, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+  const staleModel = {
+    ...pricedModel,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  };
   const model = opts.stalePricing ? staleModel : pricedModel;
   let registeredModel = model;
   const ctx = {
@@ -53,7 +70,9 @@ function makeHarness(opts: { stalePricing?: boolean; throwRender?: boolean } = {
     model,
     modelRegistry: {
       find: (provider: string, id: string) =>
-        provider === model.provider && id === model.id ? registeredModel : undefined,
+        provider === model.provider && id === model.id
+          ? registeredModel
+          : undefined,
       refresh: async () => {
         await Promise.resolve();
         registeredModel = pricedModel;
@@ -92,11 +111,22 @@ function makeHarness(opts: { stalePricing?: boolean; throwRender?: boolean } = {
           renders++;
         },
       },
-      { fg: (_color, text) => text },
       {
-        onBranchChange: () => () => {},
+        fg: (_color, text) => {
+          if (opts.throwTheme) throw new Error("theme unavailable");
+          return text;
+        },
+      },
+      {
+        onBranchChange: () => {
+          if (opts.throwFooterData) throw new Error("footer data unavailable");
+          return () => {};
+        },
         getGitBranch: () => null,
-        getExtensionStatuses: () => new Map(),
+        getExtensionStatuses: () => {
+          if (opts.throwFooterData) throw new Error("footer data unavailable");
+          return new Map();
+        },
       },
     );
     return component.render(200).join("\n");
@@ -127,6 +157,16 @@ describe("ember footer", () => {
     await emit("session_start");
 
     expect(render()).toContain("$0.02 est");
+  });
+
+  it("contains deferred footer factory and render failures", async () => {
+    const themeHarness = makeHarness({ throwTheme: true });
+    await themeHarness.emit("session_start");
+    expect(() => themeHarness.render()).not.toThrow();
+
+    const dataHarness = makeHarness({ throwFooterData: true });
+    await dataHarness.emit("session_start");
+    expect(() => dataHarness.render()).not.toThrow();
   });
 
   it("contains timer and agent render callback failures", async () => {

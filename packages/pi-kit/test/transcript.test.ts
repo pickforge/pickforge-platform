@@ -1,9 +1,35 @@
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { LaneTranscript } from "../src/transcript.ts";
 
+const normalizedFixture = fileURLToPath(new URL("./fixtures/normalized-lane-stream.jsonl", import.meta.url));
+const piFixture = fileURLToPath(new URL("./fixtures/lane-stream.jsonl", import.meta.url));
 const line = (obj: unknown) => JSON.stringify(obj);
 
 describe("LaneTranscript", () => {
+  it("renders canonical normalized JSONL", async () => {
+    const transcript = new LaneTranscript();
+
+    transcript.feedChunk(await readFile(normalizedFixture, "utf8"));
+
+    expect(transcript.entries).toEqual([
+      { kind: "task", text: "Run the normalized fixture task" },
+      { kind: "thinking", text: "Inspecting fixture." },
+      { kind: "tool", title: "read", text: '{"path":"README.md"}' },
+      { kind: "tool_result", title: "read", text: "fixture contents" },
+      { kind: "text", text: "Normalized answer." },
+    ]);
+  });
+
+  it("keeps archived Pi JSONL transcripts readable", async () => {
+    const transcript = new LaneTranscript();
+
+    transcript.feedChunk(await readFile(piFixture, "utf8"));
+
+    expect(transcript.entries).toEqual([{ kind: "text", text: "Hello from lane." }]);
+  });
+
   it("reduces a raw pi json stream into ordered entries", () => {
     const t = new LaneTranscript();
     t.feed(line({ type: "message_start", message: { role: "user", content: [{ type: "text", text: "do the task" }] } }));

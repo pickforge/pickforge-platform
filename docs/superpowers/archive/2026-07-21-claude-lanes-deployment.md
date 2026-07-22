@@ -1,3 +1,5 @@
+pi-kit extracted to ElbertePlinio/pi-kit per issue #54.
+
 # Managed Claude Lanes Deployment Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

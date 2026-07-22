@@ -1,8 +1,0 @@
-{"type":"session","version":3,"id":"fixture-session","timestamp":"2026-07-16T00:00:00.000Z","cwd":"/tmp"}
-{"type":"agent_start"}
-{"type":"tool_execution_start","toolCallId":"tool-1","toolName":"bash","args":{"command":"printf 'fixture tool output'"}}
-{"type":"message_start","message":{"role":"assistant","content":[]}}
-{"type":"message_update","message":{"role":"assistant","content":[{"type":"text","text":"Hello from "}]},"assistantMessageEvent":{"type":"text_delta","delta":"Hello from "}}
-{"type":"message_update","message":{"role":"assistant","content":[{"type":"text","text":"Hello from lane."}]},"assistantMessageEvent":{"type":"text_delta","delta":"lane."}}
-{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Hello from lane."}],"usage":{"input":1200,"output":300,"cacheRead":40,"cacheWrite":10,"totalTokens":1550}}}
-{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"Hello from lane."}],"usage":{"input":1200,"output":300,"cacheRead":40,"cacheWrite":10,"totalTokens":1550}}]}

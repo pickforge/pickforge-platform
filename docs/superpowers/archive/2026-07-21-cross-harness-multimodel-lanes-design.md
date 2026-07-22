@@ -1,3 +1,5 @@
+pi-kit extracted to ElbertePlinio/pi-kit per issue #54.
+
 # Cross-Harness Multi-Model Lanes Design
 
 **Status:** Approved through Plannotator feedback on 2026-07-21

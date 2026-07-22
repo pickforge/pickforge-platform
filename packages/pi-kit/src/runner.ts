@@ -18,6 +18,7 @@ export interface RunnerOptions {
   runId: string;
   append: (ev: KitEvent) => void;
   maxConcurrent?: number;
+  maxAttempts?: number;
   piBinary?: string;
   adapters?: readonly LaneExecutionAdapter[];
   origin?: LaneOrigin;
@@ -40,7 +41,6 @@ interface LaneRuntime {
   parserEnded: boolean;
   startedAt: number;
   stdoutBuffer: string;
-  stdoutBytes: number;
   stdoutOverflow: boolean;
   stderrTail: string;
   answer: string;
@@ -59,6 +59,20 @@ interface LaneRuntime {
 interface PreparedLane {
   spec: LaneSpec;
   adapter: LaneExecutionAdapter;
+}
+
+interface LaneAttemptResult {
+  outcome: TerminalOutcome;
+  tokensIn: number;
+  tokensOut: number;
+  cost: number;
+  context: number;
+}
+
+interface AttemptUsage {
+  tokensIn: number;
+  tokensOut: number;
+  cost: number;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -127,6 +141,7 @@ function isAssistantError(event: Extract<NormalizedLaneEvent, { type: "assistant
 export class LaneRunner {
   private readonly append: (ev: KitEvent) => void;
   private readonly maxConcurrent: number;
+  private readonly maxAttempts: number;
   private readonly onUpdate?: () => void;
   private readonly adapters: readonly LaneExecutionAdapter[];
   private readonly origin: LaneOrigin;
@@ -143,6 +158,7 @@ export class LaneRunner {
     this.runId = opts.runId;
     this.append = opts.append;
     this.maxConcurrent = Math.max(1, Math.floor(opts.maxConcurrent ?? 4));
+    this.maxAttempts = Math.max(1, Math.floor(opts.maxAttempts ?? 2));
     this.adapters = opts.adapters ?? [new PiExecutionAdapter(opts.piBinary), createClaudeCodeAdapter()];
     this.origin = opts.origin ?? "pi";
     if (opts.rawDir) this.rawDir = opts.rawDir;
@@ -258,6 +274,7 @@ export class LaneRunner {
 
   /** Synchronous last-resort kill of every live child. Called from the process exit hook. */
   reapAll(): void {
+    this.shuttingDown = true;
     for (const runtime of this.runtimes.values()) killTree(runtime.child, "SIGKILL");
   }
 
@@ -306,6 +323,7 @@ export class LaneRunner {
           case "lane_start":
             lane.state = "running";
             lane.pid = event.pid;
+            lane.startedAtMs ??= Date.parse(event.t);
             break;
           case "lane_tool":
             lane.currentTool = `${event.tool}: ${event.summary}`;
@@ -330,6 +348,9 @@ export class LaneRunner {
           case "lane_abandoned":
             lane.state = "abandoned";
             lane.abandonReason = event.reason;
+            if (lane.startedAtMs !== undefined) {
+              lane.durationMs = Math.max(0, Date.parse(event.t) - lane.startedAtMs);
+            }
             break;
         }
       }
@@ -356,28 +377,70 @@ export class LaneRunner {
     return { directory, path };
   }
 
-  private async runLane({ spec, adapter }: PreparedLane): Promise<void> {
-    const preparationStartedAt = Date.now();
-    try {
-      await adapter.prepare?.(spec);
-    } catch (error) {
-      if (this.live.lanes.get(spec.lane)?.state === "queued") {
-        const message = error instanceof Error ? error.message : String(error);
+  private async runLane(prepared: PreparedLane): Promise<void> {
+    const startedAt = Date.now();
+    let usage: AttemptUsage = { tokensIn: 0, tokensOut: 0, cost: 0 };
+
+    for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
+      const result = await this.runLaneAttempt(prepared, usage);
+      usage = {
+        tokensIn: usage.tokensIn + result.tokensIn,
+        tokensOut: usage.tokensOut + result.tokensOut,
+        cost: usage.cost + result.cost,
+      };
+      if (result.outcome.type === "abandoned") return;
+      if (result.outcome.ok || attempt === this.maxAttempts || this.shuttingDown) {
         this.record({
           v: 1,
           t: new Date().toISOString(),
           run: this.runId,
-          lane: spec.lane,
+          lane: prepared.spec.lane,
           type: "lane_end",
-          ok: false,
-          stopReason: `prepare:${message}`,
-          answer: message,
-          durationMs: Date.now() - preparationStartedAt,
+          ok: result.outcome.ok,
+          ...(result.outcome.stopReason ? { stopReason: result.outcome.stopReason } : {}),
+          answer: result.outcome.answer.slice(0, 4_000),
+          durationMs: Date.now() - startedAt,
         });
+        return;
       }
-      return;
+      const projection = this.live.lanes.get(prepared.spec.lane);
+      if (projection) projection.currentTool = undefined;
+      this.record({
+        v: 1,
+        t: new Date().toISOString(),
+        run: this.runId,
+        lane: prepared.spec.lane,
+        type: "lane_status",
+        text: `attempt ${attempt} failed${result.outcome.stopReason ? ` (${result.outcome.stopReason})` : ""}; retrying`,
+      });
     }
-    if (this.live.lanes.get(spec.lane)?.state !== "queued") return;
+  }
+
+  private async runLaneAttempt({ spec, adapter }: PreparedLane, prior: AttemptUsage): Promise<LaneAttemptResult> {
+    try {
+      await adapter.prepare?.(spec);
+    } catch (error) {
+      if (this.live.lanes.get(spec.lane)?.state !== "abandoned") {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          outcome: { type: "end", ok: false, stopReason: `prepare:${message}`, answer: message },
+          tokensIn: 0,
+          tokensOut: 0,
+          cost: 0,
+          context: 0,
+        };
+      }
+      return {
+        outcome: { type: "abandoned" },
+        tokensIn: 0,
+        tokensOut: 0,
+        cost: 0,
+        context: 0,
+      };
+    }
+    if (this.live.lanes.get(spec.lane)?.state === "abandoned") {
+      return { outcome: { type: "abandoned" }, tokensIn: 0, tokensOut: 0, cost: 0, context: 0 };
+    }
 
     let plan: LaneProcessPlan;
     let parser: LaneEventParser;
@@ -386,21 +449,16 @@ export class LaneRunner {
       parser = adapter.createParser(spec);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      this.record({
-        v: 1,
-        t: new Date().toISOString(),
-        run: this.runId,
-        lane: spec.lane,
-        type: "lane_end",
-        ok: false,
-        stopReason: `setup:${message}`,
-        answer: message,
-        durationMs: Date.now() - preparationStartedAt,
-      });
-      return;
+      return {
+        outcome: { type: "end", ok: false, stopReason: `setup:${message}`, answer: message },
+        tokensIn: 0,
+        tokensOut: 0,
+        cost: 0,
+        context: 0,
+      };
     }
 
-    const { promise, resolve } = Promise.withResolvers<void>();
+    const { promise, resolve } = Promise.withResolvers<LaneAttemptResult>();
     let child: ChildProcessByStdio<null, Readable, Readable>;
     try {
       child = spawn(plan.command, plan.args, {
@@ -410,18 +468,14 @@ export class LaneRunner {
         detached: true,
       });
     } catch (error) {
-      this.record({
-        v: 1,
-        t: new Date().toISOString(),
-        run: this.runId,
-        lane: spec.lane,
-        type: "lane_end",
-        ok: false,
-        stopReason: `spawn:${error instanceof Error ? error.message : String(error)}`,
-        answer: error instanceof Error ? error.message : String(error),
-        durationMs: 0,
+      const message = error instanceof Error ? error.message : String(error);
+      resolve({
+        outcome: { type: "end", ok: false, stopReason: `spawn:${message}`, answer: message },
+        tokensIn: 0,
+        tokensOut: 0,
+        cost: 0,
+        context: 0,
       });
-      resolve();
       return promise;
     }
 
@@ -448,7 +502,6 @@ export class LaneRunner {
       parserEnded: false,
       startedAt: Date.now(),
       stdoutBuffer: "",
-      stdoutBytes: 0,
       stdoutOverflow: false,
       stderrTail: "",
       answer: "",
@@ -536,10 +589,10 @@ export class LaneRunner {
             run: this.runId,
             lane: spec.lane,
             type: "lane_usage",
-            input: event.input,
-            output: event.output,
+            input: prior.tokensIn + event.input,
+            output: prior.tokensOut + event.output,
             cacheRead: event.cacheRead,
-            cost: estimateCost(spec.model, event.input, event.output),
+            cost: prior.cost + estimateCost(spec.model, event.input, event.output),
             context: event.context,
           });
           break;
@@ -585,28 +638,31 @@ export class LaneRunner {
       }
     });
     const stdoutDecoder = new StringDecoder("utf8");
+    const failStdoutOverflow = () => {
+      runtime.stdoutOverflow = true;
+      runtime.stdoutBuffer = "";
+      this.requestTerminal(runtime, {
+        type: "end",
+        ok: false,
+        answer: runtime.answer,
+        stopReason: "stdout-overflow",
+      });
+    };
     child.stdout.on("data", (chunk: Buffer) => {
       if (runtime.stdoutOverflow) return;
-      runtime.stdoutBytes += chunk.length;
-      if (runtime.stdoutBytes > MAX_STREAM_BYTES) {
-        runtime.stdoutOverflow = true;
-        runtime.stdoutBuffer = "";
-        this.requestTerminal(runtime, {
-          type: "end",
-          ok: false,
-          answer: runtime.answer,
-          stopReason: "stdout-overflow",
-        });
-        return;
-      }
       runtime.stdoutBuffer += stdoutDecoder.write(chunk);
       let newline = runtime.stdoutBuffer.indexOf("\n");
       while (newline >= 0) {
         const line = runtime.stdoutBuffer.slice(0, newline);
         runtime.stdoutBuffer = runtime.stdoutBuffer.slice(newline + 1);
+        if (Buffer.byteLength(line) > MAX_STREAM_BYTES) {
+          failStdoutOverflow();
+          return;
+        }
         if (line.trim()) feedParser(line);
         newline = runtime.stdoutBuffer.indexOf("\n");
       }
+      if (Buffer.byteLength(runtime.stdoutBuffer) > MAX_STREAM_BYTES) failStdoutOverflow();
     });
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
@@ -654,26 +710,19 @@ export class LaneRunner {
       }
 
       const outcome = runtime.terminal;
-      if (outcome.type === "end") {
-        this.record({
-          v: 1,
-          t: new Date().toISOString(),
-          run: this.runId,
-          lane: spec.lane,
-          type: "lane_end",
-          ok: outcome.ok,
-          ...(outcome.stopReason ? { stopReason: outcome.stopReason } : {}),
-          answer: outcome.answer.slice(0, 4_000),
-          durationMs: Date.now() - runtime.startedAt,
-        });
-      }
       this.runtimes.delete(spec.lane);
 
       let finished = false;
       const finish = () => {
         if (finished) return;
         finished = true;
-        resolve();
+        resolve({
+          outcome,
+          tokensIn: runtime.tokensIn,
+          tokensOut: runtime.tokensOut,
+          cost: estimateCost(spec.model, runtime.tokensIn, runtime.tokensOut),
+          context: runtime.context,
+        });
       };
       if (runtime.raw && !runtime.raw.destroyed) {
         runtime.raw.once("error", finish);

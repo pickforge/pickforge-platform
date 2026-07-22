@@ -87,6 +87,7 @@ export function reduceRun(events: KitEvent[]): RunProjection {
     if (event.type === "run_end") {
       projection.ended = true;
       projection.ok = event.ok;
+      projection.durationMs = event.durationMs;
       continue;
     }
     if (event.type === "lane_created") {
@@ -110,6 +111,7 @@ export function reduceRun(events: KitEvent[]): RunProjection {
       case "lane_start":
         lane.state = "running";
         lane.pid = event.pid;
+        lane.startedAtMs ??= Date.parse(event.t);
         break;
       case "lane_tool":
         lane.currentTool = event.tool;
@@ -131,6 +133,9 @@ export function reduceRun(events: KitEvent[]): RunProjection {
       case "lane_abandoned":
         lane.state = "abandoned";
         lane.abandonReason = event.reason;
+        if (lane.startedAtMs !== undefined) {
+          lane.durationMs = Math.max(0, Date.parse(event.t) - lane.startedAtMs);
+        }
         break;
     }
   }

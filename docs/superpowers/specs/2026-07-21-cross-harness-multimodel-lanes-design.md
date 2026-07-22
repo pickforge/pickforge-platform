@@ -183,7 +183,7 @@ The Claude parser targets Claude Code 2.1.216 `stream-json` with `--verbose --in
 - A second spawn while a run is active is rejected.
 - Lane IDs must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`; resolved transcript paths must remain beneath the configured run directory.
 - Children inherit only the scrubbed runtime allowlist: path/home/user/shell, temporary-directory, locale, terminal, and XDG variables. Pi adds `PIKIT_CHILD=1`; provider credentials, cookies, cloud secrets, and agent sockets are not copied.
-- Child stdout and canonical transcript capture are capped at 4 MiB per lane; stdout overflow fails the lane. Final answers are capped at 4,000 characters.
+- Canonical transcript capture is capped at 4 MiB per lane. Child stdout is streamed, with a 4 MiB per-record cap; one oversized or unterminated record fails the lane, while cumulative newline-terminated records do not. Final answers are capped at 4,000 characters.
 - MCP and Pi handler exceptions become bounded tool errors. Parser, spawn, exit, and authentication failures become failed lanes without route substitution.
 - Parent/session shutdown uses one idempotent async path: mark lanes abandoned, send SIGTERM, escalate to SIGKILL after the existing timeout, await every child `close`, then close the harness transport and exit. Synchronous process-exit reaping remains the last-resort fallback.
 - Journal and canonical transcript writes remain best-effort and must never crash the parent harness or determine settlement.

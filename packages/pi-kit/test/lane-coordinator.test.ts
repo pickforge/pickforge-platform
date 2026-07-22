@@ -46,6 +46,7 @@ class FakeRunner implements LaneRunnerPort {
         spec,
         state: "running",
         pid: 123,
+        startedAtMs: Date.parse("2026-07-21T12:00:00.000Z"),
         tokensIn: 10,
         tokensOut: 2,
         cost: 0.25,
@@ -144,6 +145,7 @@ describe("LaneCoordinator", () => {
     expect(first).toMatchObject({
       run: "run-1",
       state: "active",
+      durationMs: 0,
       totals: { cost: 0, tokensIn: 0, tokensOut: 0 },
       lanes: [{ lane: "worker", model: solSpec.model, effort: "medium", mode: "workspace-write", state: "running" }],
     });
@@ -159,6 +161,10 @@ describe("LaneCoordinator", () => {
     await expect(coordinator.spawn([{ ...solSpec, lane: "second" }])).rejects.toThrow("still active");
 
     advance(250);
+    expect(coordinator.status()).toMatchObject({
+      durationMs: 250,
+      lanes: [{ lane: "worker", durationMs: 250 }],
+    });
     runners[0]!.settle();
     await coordinator.wait();
     expect(events.at(-1)).toMatchObject({ type: "run_end", ok: true, durationMs: 250 });
@@ -370,6 +376,7 @@ describe("LaneCoordinator", () => {
     expect(filtered).toEqual({
       run: "run-1",
       state: "active",
+      durationMs: 0,
       totals: { cost: 0, tokensIn: 0, tokensOut: 0 },
       lanes: [{
         lane: "worker",

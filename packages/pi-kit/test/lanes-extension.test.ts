@@ -78,6 +78,7 @@ class FaultCoordinator implements LanesCoordinatorPort {
     this.snapshot = {
       run: "run-injected",
       state: "active",
+      durationMs: 65_000,
       totals: { cost: 0, tokensIn: 0, tokensOut: 0 },
       lanes: specs.map((lane) => ({
         lane: lane.lane,
@@ -85,6 +86,7 @@ class FaultCoordinator implements LanesCoordinatorPort {
         effort: lane.effort,
         mode: lane.mode ?? "workspace-write",
         state: "running",
+        durationMs: 5_000,
         tokensIn: 0,
         tokensOut: 0,
         cost: 0,
@@ -158,6 +160,25 @@ async function waitFor(check: () => boolean, timeoutMs = 5_000): Promise<void> {
   }
 }
 
+
+/** Poll until the coordinated run has settled, then return lanes_wait results. */
+async function collectWhenSettled(
+  call: (name: string, params?: Record<string, unknown>, signal?: AbortSignal) => Promise<ToolResult>,
+  timeoutMs = 5_000,
+): Promise<ToolResult> {
+  let lastStatus = "";
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    const status = await call("lanes_status", {});
+    lastStatus = status.content[0]?.text ?? "";
+    if (!status.isError && lastStatus.includes("(ended)")) {
+      return call("lanes_wait", {});
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`collectWhenSettled timeout: ${lastStatus || "no status"}`);
+}
+
 beforeEach(async () => {
   dataDir = await mkdtemp(join(tmpdir(), "pi-kit-lanes-ext-"));
   process.env.PIKIT_DATA_DIR = dataDir;
@@ -215,18 +236,38 @@ describe("async lanes extension", () => {
     const status = await call("lanes_status", {});
     expect(status.content[0]!.text).toMatch(/worker: (queued|running)/);
 
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    const final = await call("lanes_wait", {});
+    const final = await collectWhenSettled(call);
     expect(final.isError).toBeFalsy();
     expect(final.content[0]!.text).toContain("worker: done");
     expect(final.content[0]!.text).toContain("Hello from lane.");
+  });
+
+  it("renders live whole-run and per-lane durations in the widget and status summary", async () => {
+    const coordinator = new FaultCoordinator();
+    const widgets: string[][] = [];
+    const ui = {
+      theme: { fg: (_color: string, text: string) => text },
+      setWidget: (_id: string, lines?: string[]) => { if (lines) widgets.push(lines); },
+      setStatus: () => {},
+    } as unknown as ExtensionContext["ui"];
+    const { call, handlers } = makeHarness({ hasUI: true, ui, createCoordinator: () => coordinator });
+
+    await call("lanes_spawn", { lanes: [spec] });
+    const rendered = widgets.at(-1)!.join("\n");
+    expect(rendered).toContain("1m05s");
+    expect(rendered).toContain("5s");
+
+    const status = await call("lanes_status", {});
+    expect(status.content[0]!.text).toContain("(active) · 1m05s");
+    expect(status.content[0]!.text).toContain("$0.0000 · 5s");
+    await handlers.get("session_shutdown")!();
   });
 
   it("lanes_status with a lane filter returns the detailed single-lane view", async () => {
     await installSlowPi(10);
     const { call } = makeHarness();
     await call("lanes_spawn", { lanes: [spec] });
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await collectWhenSettled(call);
 
     const detail = await call("lanes_status", { lane: "worker" });
     expect(detail.content[0]!.text).toContain("worker: done");
@@ -245,10 +286,10 @@ describe("async lanes extension", () => {
     expect(second.isError).toBe(true);
     expect(second.content[0]!.text).toContain("still active");
 
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await collectWhenSettled(call);
     const third = await call("lanes_spawn", { lanes: [{ ...spec, lane: "again" }] });
     expect(third.isError).toBeFalsy();
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await collectWhenSettled(call);
   });
 
   it("lanes_wait never blocks the parent session while lanes are active", async () => {
@@ -261,8 +302,7 @@ describe("async lanes extension", () => {
     expect(Date.now() - started).toBeLessThan(250);
     expect(active.content[0]!.text).toContain("keeps running in the background");
 
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    const final = await call("lanes_wait", {});
+    const final = await collectWhenSettled(call);
     expect(final.content[0]!.text).toContain("worker: done");
   });
 
@@ -276,8 +316,7 @@ describe("async lanes extension", () => {
 
     const result = await call("lanes_abandon", { lane: "worker", reason: "test stop" });
     expect(result.content[0]!.text).toContain("worker: abandoned");
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    const final = await call("lanes_wait", {});
+    const final = await collectWhenSettled(call);
     expect(final.isError).toBe(true);
     expect(final.content[0]!.text).toContain("test stop");
   });
@@ -286,7 +325,7 @@ describe("async lanes extension", () => {
     await installSlowPi(50);
     const { call, sent } = makeHarness({ idle: true });
     await call("lanes_spawn", { lanes: [spec] });
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await collectWhenSettled(call);
     expect(sent).toEqual([]);
   });
 });

@@ -405,6 +405,66 @@ describe("LaneRunner", () => {
     expect(endCalls).toBe(1);
   });
 
+  it("retries a failed lane once immediately and preserves cumulative usage", async () => {
+    const attemptsFile = join(dataDir, "retry-attempts");
+    const binary = await executable(
+      "retry-once",
+      `#!/usr/bin/env node\nconst { existsSync, writeFileSync } = require("node:fs");\nconst first = !existsSync(${JSON.stringify(attemptsFile)});\nwriteFileSync(${JSON.stringify(attemptsFile)}, first ? "1" : "2");\nconsole.log(JSON.stringify({v:1,type:"usage",input:first?10:20,output:first?2:3,cacheRead:0,context:first?12:23}));\nif (first) { console.error("temporary failure"); process.exit(7); }\nconsole.log(JSON.stringify({v:1,type:"assistant_end",text:"recovered"}));\nsetInterval(() => {}, 1000);\n`,
+    );
+    const events: KitEvent[] = [];
+    const runner = new LaneRunner({
+      runId: "retry-once",
+      append: (event) => events.push(event),
+      adapters: [normalizedAdapter("pi", binary)],
+    });
+
+    const [lane] = await runner.dispatch([validSpec]);
+
+    expect(await readFile(attemptsFile, "utf8")).toBe("2");
+    expect(events.filter((event) => event.type === "lane_start")).toHaveLength(2);
+    expect(events.filter((event) => event.type === "lane_end")).toHaveLength(1);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "lane_status",
+      text: expect.stringContaining("retrying"),
+    }));
+    expect(lane).toMatchObject({
+      state: "done",
+      answer: "recovered",
+      tokensIn: 30,
+      tokensOut: 5,
+      cost: estimateCost(validSpec.model, 10, 2) + estimateCost(validSpec.model, 20, 3),
+    });
+  });
+
+  it("retries a failed lane before a still-running sibling settles", async () => {
+    const attemptsFile = join(dataDir, "concurrent-retry-attempts");
+    const binary = await executable(
+      "concurrent-retry",
+      `#!/usr/bin/env node\nconst { existsSync, writeFileSync } = require("node:fs");\nif (process.env.LANE === "sibling") { setTimeout(() => { console.log(JSON.stringify({v:1,type:"assistant_end",text:"sibling done"})); }, 400); setInterval(() => {}, 1000); } else { const first = !existsSync(${JSON.stringify(attemptsFile)}); writeFileSync(${JSON.stringify(attemptsFile)}, first ? "1" : "2"); if (first) process.exit(7); console.log(JSON.stringify({v:1,type:"assistant_end",text:"worker recovered"})); setInterval(() => {}, 1000); }\n`,
+    );
+    const adapter = normalizedAdapter("pi", binary);
+    const build = adapter.build.bind(adapter);
+    adapter.build = (spec) => {
+      const plan = build(spec);
+      return { ...plan, env: { ...plan.env, LANE: spec.lane } };
+    };
+    const events: KitEvent[] = [];
+    const runner = new LaneRunner({
+      runId: "concurrent-retry",
+      append: (event) => events.push(event),
+      adapters: [adapter],
+    });
+
+    await runner.dispatch([validSpec, { ...validSpec, lane: "sibling" }]);
+
+    const workerStarts = events
+      .map((event, index) => ({ event, index }))
+      .filter(({ event }) => event.type === "lane_start" && event.lane === "worker");
+    const siblingEnd = events.findIndex((event) => event.type === "lane_end" && event.lane === "sibling");
+    expect(workerStarts).toHaveLength(2);
+    expect(workerStarts[1]!.index).toBeLessThan(siblingEnd);
+  });
+
   it("does not settle failure until close", async () => {
     const binary = await executable(
       "slow-failure",
@@ -436,9 +496,10 @@ describe("LaneRunner", () => {
       `#!/usr/bin/env node\nprocess.on("SIGTERM", () => setTimeout(() => process.exit(0), 120));\nconsole.log(JSON.stringify({v:1,type:"task",text:"Run the fixture task"}));\nsetInterval(() => {}, 1000);\n`,
     );
     const ready = Promise.withResolvers<void>();
+    const events: KitEvent[] = [];
     const runner = new LaneRunner({
       runId: "slow-abandon",
-      append() {},
+      append: (event) => events.push(event),
       adapters: [
         normalizedAdapter("pi", binary, (event) => {
           if (event.type === "task") ready.resolve();
@@ -455,7 +516,8 @@ describe("LaneRunner", () => {
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(settled).toBe(false);
     const [lane] = await dispatch;
-    expect(lane).toMatchObject({ state: "abandoned", abandonReason: "test stop" });
+    expect(lane).toMatchObject({ state: "abandoned", abandonReason: "test stop", durationMs: expect.any(Number) });
+    expect(events.filter((event) => event.type === "lane_start")).toHaveLength(1);
   });
 
   it("does not let a late spawn event overwrite immediate abandonment", async () => {
@@ -498,10 +560,10 @@ describe("LaneRunner", () => {
     expect((await stat(join(rawDir, "worker.jsonl"))).size).toBeLessThanOrEqual(4 * 1024 * 1024);
   });
 
-  it("caps cumulative stdout bytes across newline-terminated valid, malformed, and ignored records", async () => {
+  it("streams more than 4 MiB of newline-terminated records without failing the lane", async () => {
     const binary = await executable(
       "newline-overflow",
-      `#!/usr/bin/env node\nconst records = [\n  JSON.stringify({v:1,type:"thinking_delta",delta:"x".repeat(1000)}),\n  "malformed-" + "x".repeat(1000),\n  JSON.stringify({v:1,type:"ignored",text:"x".repeat(1000)}),\n];\nfor (let index = 0; index < 5000; index++) process.stdout.write(records[index % records.length] + "\\n");\nsetInterval(() => {}, 1000);\n`,
+      `#!/usr/bin/env node\nconst records = [\n  JSON.stringify({v:1,type:"thinking_delta",delta:"x".repeat(1000)}),\n  "malformed-" + "x".repeat(1000),\n  JSON.stringify({v:1,type:"ignored",text:"x".repeat(1000)}),\n];\nfor (let index = 0; index < 5000; index++) process.stdout.write(records[index % records.length] + "\\n");\nconsole.log(JSON.stringify({v:1,type:"assistant_end",text:"completed after large streamed output"}));\nsetInterval(() => {}, 1000);\n`,
     );
     const counts = { valid: 0, malformed: 0, ignored: 0 };
     const adapter: LaneExecutionAdapter = {
@@ -540,8 +602,8 @@ describe("LaneRunner", () => {
 
     const [lane] = await runner.dispatch([validSpec]);
 
-    expect(lane).toMatchObject({ state: "failed" });
-    expect(events.find((event) => event.type === "lane_end")).toMatchObject({ stopReason: "stdout-overflow" });
+    expect(lane).toMatchObject({ state: "done", answer: "completed after large streamed output" });
+    expect(events.find((event) => event.type === "lane_end")).toMatchObject({ ok: true });
     expect(counts.valid).toBeGreaterThan(0);
     expect(counts.malformed).toBeGreaterThan(0);
     expect(counts.ignored).toBeGreaterThan(0);

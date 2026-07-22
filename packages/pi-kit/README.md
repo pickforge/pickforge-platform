@@ -86,7 +86,7 @@ Stdout is reserved for protocol traffic; diagnostics use stderr. Closing stdin t
 
 Run journals are append-only JSONL at `~/.pickforge/pi-kit/runs/<run>.jsonl`; canonical per-lane transcripts are at `~/.pickforge/pi-kit/raw/<run>/<lane>.jsonl`. Set `PIKIT_DATA_DIR` to move both roots. Journal and transcript writes are best-effort and never determine lane settlement or crash the parent.
 
-Canonical transcript events are `task`, `thinking_delta`, `text_delta`, `tool_start`, `tool_end`, cumulative `usage`, and `assistant_end`. `LaneTranscript` also reads archived Pi JSONL. Canonical transcript capture is capped at 4 MiB per lane, and child stdout over 4 MiB fails the lane. Stored final answers are capped at 4,000 characters; rendered text/thinking entries at 20,000 characters and tool inputs/results at 4,000 characters. Parser and spawn failures become failed lanes; missing routes fail before child spawn.
+Canonical transcript events are `task`, `thinking_delta`, `text_delta`, `tool_start`, `tool_end`, cumulative `usage`, and `assistant_end`. `LaneTranscript` also reads archived Pi JSONL. Canonical transcript capture is capped at 4 MiB per lane. Child stdout is parsed as a stream; a single record over 4 MiB fails the lane, while cumulative newline-terminated records do not. Stored final answers are capped at 4,000 characters; rendered text/thinking entries at 20,000 characters and tool inputs/results at 4,000 characters. Parser and spawn failures become failed lanes; missing routes fail before child spawn.
 
 ## Validation
 

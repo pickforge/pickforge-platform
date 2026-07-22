@@ -115,6 +115,7 @@ function renderWidgetUnsafe(ctx: WidgetContext, run: LastRun): void {
     `${progress} ${theme.fg("text", `${settled}/${lanes.length}`)}`,
     theme.fg("warning", `$${run.snapshot.totals.cost.toFixed(4)}`),
     theme.fg("muted", `↑${fmtTokens(run.snapshot.totals.tokensIn)} ↓${fmtTokens(run.snapshot.totals.tokensOut)}`),
+    theme.fg("dim", fmtDuration(run.snapshot.durationMs)),
   ].join(dot);
 
   const nameWidth = Math.min(24, Math.max(...lanes.map((l) => l.lane.length), 4));
@@ -357,7 +358,7 @@ export default function lanesExtension(pi: ExtensionAPI, options: LanesExtension
         lanes: [lane],
       };
     }
-    const header = `run ${snapshot.run} (${snapshot.state}) · $${snapshot.totals.cost.toFixed(4)} · tok ${snapshot.totals.tokensIn}/${snapshot.totals.tokensOut}`;
+    const header = `run ${snapshot.run} (${snapshot.state}) · ${fmtDuration(snapshot.durationMs)} · $${snapshot.totals.cost.toFixed(4)} · tok ${snapshot.totals.tokensIn}/${snapshot.totals.tokensOut}`;
     return { text: [header, ...snapshot.lanes.map((lane) => summarizeLane(lane, snapshot.state === "ended"))].join("\n"), lanes: snapshot.lanes };
   }
 
@@ -405,6 +406,10 @@ export default function lanesExtension(pi: ExtensionAPI, options: LanesExtension
           return { content: [{ type: "text" as const, text: "No lane run has been spawned this session." }], details: undefined };
         }
         const run = lastRun;
+        // Always refresh via synchronous status(): non-blocking for the parent turn,
+        // and does not race monitorSettlement for settled runs.
+        const snapshot = coordinator.status();
+        updateRun(run, snapshot);
         if (!run.ended) {
           return {
             content: [
@@ -416,8 +421,6 @@ export default function lanesExtension(pi: ExtensionAPI, options: LanesExtension
             details: undefined,
           };
         }
-        const snapshot = coordinator.status();
-        updateRun(run, snapshot);
         const { text, lanes } = summarizeRun(snapshot);
         const ok = lanes.every((lane) => lane.state === "done");
         return { content: [{ type: "text" as const, text }], details: lanes, isError: !ok };

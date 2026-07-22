@@ -54,6 +54,7 @@ export interface RunSnapshotDto {
   run: string;
   state: "active" | "ended";
   ok?: boolean;
+  durationMs: number;
   totals: {
     cost: number;
     tokensIn: number;
@@ -69,6 +70,7 @@ interface CoordinatedRun {
   runner: LaneRunnerPort;
   ended: boolean;
   ok?: boolean;
+  durationMs?: number;
   settled: Promise<void>;
 }
 
@@ -81,7 +83,11 @@ function finite(value: number): number {
   return Number.isFinite(value) ? value : 0;
 }
 
-function snapshotLane(lane: LaneProjection): LaneSnapshotDto {
+function snapshotLane(lane: LaneProjection, nowMs: number): LaneSnapshotDto {
+  const durationMs = lane.durationMs ??
+    (lane.state === "running" && lane.startedAtMs !== undefined
+      ? Math.max(0, nowMs - lane.startedAtMs)
+      : undefined);
   return {
     lane: lane.spec.lane,
     model: lane.spec.model,
@@ -95,7 +101,7 @@ function snapshotLane(lane: LaneProjection): LaneSnapshotDto {
     cost: finite(lane.cost),
     context: finite(lane.context),
     ...(lane.answer !== undefined ? { answer: lane.answer } : {}),
-    ...(lane.durationMs !== undefined ? { durationMs: finite(lane.durationMs) } : {}),
+    ...(durationMs !== undefined ? { durationMs: finite(durationMs) } : {}),
     ...(lane.abandonReason !== undefined ? { abandonReason: lane.abandonReason } : {}),
   };
 }
@@ -244,16 +250,18 @@ export class LaneCoordinator {
       if (!lane) throw new Error(`Unknown lane "${laneName}"`);
       lanes = [lane];
     }
+    const nowMs = this.clock().getTime();
     return {
       run: run.id,
       state: run.ended ? "ended" : "active",
       ...(run.ended ? { ok: run.ok ?? false } : {}),
+      durationMs: run.durationMs ?? Math.max(0, nowMs - run.startedAt),
       totals: {
         cost: finite(projection.totalCost),
         tokensIn: finite(projection.totalTokensIn),
         tokensOut: finite(projection.totalTokensOut),
       },
-      lanes: lanes.map(snapshotLane),
+      lanes: lanes.map((lane) => snapshotLane(lane, nowMs)),
     };
   }
 
@@ -269,13 +277,14 @@ export class LaneCoordinator {
     run.ok = ok;
     const endedAt = this.clock();
     const elapsed = endedAt.getTime() - run.startedAt;
+    run.durationMs = Number.isFinite(elapsed) ? Math.max(0, elapsed) : 0;
     this.appendLifecycleEvent({
       v: 1,
       t: endedAt.toISOString(),
       run: run.id,
       type: "run_end",
       ok,
-      durationMs: Number.isFinite(elapsed) ? Math.max(0, elapsed) : 0,
+      durationMs: run.durationMs,
     });
   }
 

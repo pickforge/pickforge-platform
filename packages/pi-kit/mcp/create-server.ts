@@ -44,6 +44,7 @@ const runSnapshotSchema = z.object({
   run: z.string(),
   state: runStateSchema,
   ok: z.boolean().optional(),
+  durationMs: z.number(),
   totals: z.object({
     cost: z.number(),
     tokensIn: z.number(),
@@ -73,6 +74,7 @@ function wireSnapshot(snapshot: RunSnapshotDto): WireRunSnapshot {
     run: snapshot.run,
     state: snapshot.state,
     ...(snapshot.ok !== undefined ? { ok: snapshot.ok } : {}),
+    durationMs: finite(snapshot.durationMs),
     totals: {
       cost: finite(snapshot.totals.cost),
       tokensIn: finite(snapshot.totals.tokensIn),

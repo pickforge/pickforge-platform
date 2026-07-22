@@ -63,6 +63,8 @@ export interface LaneProjection {
   context: number;
   answer?: string;
   durationMs?: number;
+  /** In-memory/reduced start time used for live elapsed rendering; never exposed in tool DTOs. */
+  startedAtMs?: number;
   abandonReason?: string;
 }
 
@@ -76,6 +78,7 @@ export interface RunProjection {
   totalCost: number;
   totalTokensIn: number;
   totalTokensOut: number;
+  durationMs?: number;
 }
 
 export const DATA_DIR_ENV = "PIKIT_DATA_DIR";

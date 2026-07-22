@@ -347,6 +347,7 @@ function finiteSnapshot(): RunSnapshotDto {
   return {
     run: "run-test",
     state: "active",
+    durationMs: 1_000,
     totals: { cost: 0.25, tokensIn: 10, tokensOut: 2 },
     lanes: [{
       lane: solSpec.lane,

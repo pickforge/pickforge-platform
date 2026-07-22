@@ -17,6 +17,17 @@ interface Theme {
 const RAIL_WIDTH = 30;
 const POLL_MS = 500;
 
+function fmtDuration(ms: number): string {
+  const seconds = Math.floor((Number.isFinite(ms) ? Math.max(0, ms) : 0) / 1_000);
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, "0")}s`;
+}
+
+function laneDuration(lane: LaneProjection, nowMs = Date.now()): number | undefined {
+  return lane.durationMs ??
+    (lane.state === "running" && lane.startedAtMs !== undefined ? Math.max(0, nowMs - lane.startedAtMs) : undefined);
+}
+
 interface LaneFeed {
   transcript: LaneTranscript;
   bytesRead: number;
@@ -307,8 +318,9 @@ export class LanesTuiComponent implements Component {
       const glyph = t.fg(stateColor(lane.state), stateGlyph(lane.state));
       const name = truncateToWidth(lane.spec.lane, width - 4);
       lines.push(`${selected ? t.fg("accent", "›") : " "} ${glyph} ${selected ? t.fg("text", name) : t.fg("muted", name)}`);
+      const duration = laneDuration(lane);
       const meta = truncateToWidth(
-        `${lane.spec.model.slice(lane.spec.model.indexOf("/") + 1)}:${lane.spec.effort} $${lane.cost.toFixed(3)}`,
+        `${lane.spec.model.slice(lane.spec.model.indexOf("/") + 1)}:${lane.spec.effort} $${lane.cost.toFixed(3)}${duration === undefined ? "" : ` ${fmtDuration(duration)}`}`,
         width - 4,
       );
       lines.push(`    ${t.fg("dim", meta)}`);
@@ -324,8 +336,11 @@ export class LanesTuiComponent implements Component {
     const lanes = this.lanes();
     const running = lanes.filter((l) => l.state === "running").length;
 
+    const runDuration = view
+      ? view.projection.durationMs ?? Math.max(0, Date.now() - Date.parse(view.projection.createdAt))
+      : 0;
     const headerText = view
-      ? `lanes tui · ${view.runId} · ${lanes.length} lanes${running ? ` · ${running} running` : ""} · $${view.projection.totalCost.toFixed(4)}`
+      ? `lanes tui · ${view.runId} · ${fmtDuration(runDuration)} · ${lanes.length} lanes${running ? ` · ${running} running` : ""} · $${view.projection.totalCost.toFixed(4)}`
       : "lanes tui · no runs recorded yet";
     const header = truncateToWidth(t.fg("accent", headerText), width);
 

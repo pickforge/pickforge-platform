@@ -91,7 +91,10 @@ describe("btw extension", () => {
     expect(harness.sent).toEqual([]);
     expect(harness.messages).toEqual([]);
 
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    const deadline = Date.now() + 5_000;
+    while (harness.messages.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     expect(harness.sent).toEqual([]);
     expect(harness.messages).toHaveLength(1);
     expect(harness.notifications).toContainEqual({ message: "btw done — Hello from lane.", level: "info" });

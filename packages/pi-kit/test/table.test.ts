@@ -116,4 +116,8 @@ describe("estimateCost", () => {
   it("applies per-million input and output prices", () => {
     expect(estimateCost("openai-codex/gpt-5.6-sol", 1_000_000, 500_000)).toBe(8.75);
   });
+
+  it("uses Grok routing prices", () => {
+    expect(estimateCost("xai/grok-4.5", 1_000_000, 500_000)).toBe(5);
+  });
 });

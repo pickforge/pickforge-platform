@@ -95,6 +95,8 @@ export function createUpdateController(options: {
   let state: UpdateState = { status: "idle" };
   let update: UpdateInfo | undefined;
   let started = false;
+  let lastManual = false;
+  let generation = 0;
 
   const setState = (next: UpdateState): void => {
     state = next;
@@ -106,16 +108,18 @@ export function createUpdateController(options: {
     manual = false,
   }: { silent?: boolean; manual?: boolean } = {}): Promise<void> => {
     if (manual) {
-      if (state.status === "downloading" || state.status === "installing" || state.status === "restarting") {
-        return;
-      }
+      if (isBusy(state)) return;
     } else if (state.status === "dismissed" || (started && state.status !== "idle")) {
       return;
     }
     started = true;
+    lastManual = manual;
+    generation += 1;
+    const epoch = generation;
     setState({ status: "checking" });
     try {
       const found = manual ? await adapter.check() : await gate.run(() => adapter.check());
+      if (epoch !== generation) return;
       if (!manual && state.status === "dismissed") {
         if (found !== null) {
           update = found;
@@ -130,6 +134,8 @@ export function createUpdateController(options: {
       update = found;
       setState({ status: "available", update: found });
     } catch (error) {
+      if (epoch !== generation) return;
+      if (!manual && state.status === "dismissed") return;
       setState(
         !manual && silent
           ? { status: "idle" }
@@ -140,6 +146,7 @@ export function createUpdateController(options: {
 
   const install = async (): Promise<void> => {
     if (update === undefined) return;
+    if (isBusy(state)) return;
     const selected = update;
     let downloaded = 0;
     let contentLength: number | null = null;
@@ -211,7 +218,7 @@ export function createUpdateController(options: {
       return;
     }
     started = false;
-    await check();
+    await check({ manual: lastManual });
   };
 
   return {
@@ -224,9 +231,7 @@ export function createUpdateController(options: {
     install,
     retry,
     dismiss() {
-      if (state.status === "downloading" || state.status === "installing" || state.status === "restarting") {
-        return;
-      }
+      if (isBusy(state)) return;
       setState(
         update === undefined
           ? { status: "dismissed" }
@@ -238,6 +243,14 @@ export function createUpdateController(options: {
       return () => listeners.delete(listener);
     },
   };
+}
+
+function isBusy(current: UpdateState): boolean {
+  return (
+    current.status === "downloading" ||
+    current.status === "installing" ||
+    current.status === "restarting"
+  );
 }
 
 function progress(downloaded: number, contentLength: number | null): DownloadProgress {

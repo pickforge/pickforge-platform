@@ -243,6 +243,195 @@ describe("createUpdateController", () => {
     });
   });
 
+  it("keeps the dismissed state when an in-flight automatic check rejects after dismissal", async () => {
+    let rejectCheck!: (error: Error) => void;
+    const updateAdapter: UpdateAdapter = {
+      check: vi.fn(() => new Promise<{ version: string } | null>((_resolve, reject) => { rejectCheck = reject; })),
+      downloadAndInstall: vi.fn(async () => undefined),
+      relaunch: vi.fn(async () => undefined),
+    };
+    const controller = createUpdateController({
+      adapter: updateAdapter,
+      eligibility: eligible,
+      gate: { run: (check) => check() },
+    });
+
+    const starting = controller.start();
+    while (rejectCheck === undefined) {
+      await Promise.resolve();
+    }
+    expect(controller.getState().status).toBe("checking");
+    controller.dismiss();
+    expect(controller.getState()).toEqual({ status: "dismissed" });
+
+    rejectCheck(new Error("offline"));
+    await starting;
+
+    expect(controller.getState()).toEqual({ status: "dismissed" });
+  });
+
+  it("retries a failed manual check with fresh manual semantics instead of the cached gate result", async () => {
+    const updateAdapter = adapter({ update: null });
+    const gate = createProcessCheckGate();
+    const controller = createUpdateController({ adapter: updateAdapter, eligibility: eligible, gate });
+
+    await controller.start();
+    expect(controller.getState()).toEqual({ status: "idle" });
+    expect(updateAdapter.check).toHaveBeenCalledTimes(1);
+
+    vi.mocked(updateAdapter.check).mockRejectedValueOnce(new Error("offline"));
+    await controller.check({ manual: true });
+    expect(controller.getState()).toMatchObject({ status: "error", retry: "check" });
+    expect(updateAdapter.check).toHaveBeenCalledTimes(2);
+
+    vi.mocked(updateAdapter.check).mockResolvedValueOnce({ version: "5.0.0" });
+    await controller.retry();
+    expect(controller.getState()).toMatchObject({
+      status: "available",
+      update: { version: "5.0.0" },
+    });
+    expect(updateAdapter.check).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps the manual result when a late silent startup check resolves after it", async () => {
+    let resolveStartup!: (value: { version: string } | null) => void;
+    const updateAdapter: UpdateAdapter = {
+      check: vi
+        .fn()
+        .mockImplementationOnce(
+          () => new Promise<{ version: string } | null>((resolve) => { resolveStartup = resolve; }),
+        )
+        .mockResolvedValueOnce({ version: "3.0.0" }),
+      downloadAndInstall: vi.fn(async () => undefined),
+      relaunch: vi.fn(async () => undefined),
+    };
+    const controller = createUpdateController({
+      adapter: updateAdapter,
+      eligibility: eligible,
+      gate: { run: (check) => check() },
+    });
+
+    const starting = controller.start();
+    while (resolveStartup === undefined) {
+      await Promise.resolve();
+    }
+    expect(controller.getState().status).toBe("checking");
+
+    await controller.check({ manual: true });
+    expect(controller.getState()).toMatchObject({
+      status: "available",
+      update: { version: "3.0.0" },
+    });
+
+    resolveStartup(null);
+    await starting;
+
+    expect(controller.getState()).toMatchObject({
+      status: "available",
+      update: { version: "3.0.0" },
+    });
+  });
+
+  it("only applies the newest of two concurrent manual checks", async () => {
+    let resolveFirst!: (value: { version: string } | null) => void;
+    const updateAdapter: UpdateAdapter = {
+      check: vi
+        .fn()
+        .mockImplementationOnce(
+          () => new Promise<{ version: string } | null>((resolve) => { resolveFirst = resolve; }),
+        )
+        .mockResolvedValueOnce({ version: "4.0.0" }),
+      downloadAndInstall: vi.fn(async () => undefined),
+      relaunch: vi.fn(async () => undefined),
+    };
+    const controller = createUpdateController({
+      adapter: updateAdapter,
+      eligibility: eligible,
+      gate: createProcessCheckGate(),
+    });
+
+    const first = controller.check({ manual: true });
+    await Promise.resolve();
+    const second = controller.check({ manual: true });
+    await second;
+    expect(controller.getState()).toMatchObject({
+      status: "available",
+      update: { version: "4.0.0" },
+    });
+
+    resolveFirst({ version: "1.0.0" });
+    await first;
+
+    expect(controller.getState()).toMatchObject({
+      status: "available",
+      update: { version: "4.0.0" },
+    });
+  });
+
+  it("surfaces relaunch failures and retries them", async () => {
+    const updateAdapter = adapter();
+    vi.mocked(updateAdapter.relaunch).mockRejectedValueOnce(new Error("relaunch failed"));
+    const controller = createUpdateController({
+      adapter: updateAdapter,
+      eligibility: eligible,
+      gate: createProcessCheckGate(),
+    });
+
+    await controller.start();
+    await controller.install();
+    expect(controller.getState()).toMatchObject({
+      status: "error",
+      message: "relaunch failed",
+      retry: "relaunch",
+    });
+
+    await controller.retry();
+    expect(updateAdapter.relaunch).toHaveBeenCalledTimes(2);
+    expect(controller.getState()).toEqual({ status: "restarting" });
+  });
+
+  it("pins progress at 100 percent when downloaded chunks exceed content length", async () => {
+    const updateAdapter = adapter({
+      events: [
+        { type: "started", contentLength: 50 },
+        { type: "progress", chunkLength: 30 },
+        { type: "progress", chunkLength: 40 },
+      ],
+    });
+    const controller = createUpdateController({
+      adapter: updateAdapter,
+      eligibility: eligible,
+      gate: createProcessCheckGate(),
+    });
+    const progresses: Array<number | null> = [];
+    controller.subscribe((state) => {
+      if (state.status === "downloading") progresses.push(state.progress.percent);
+    });
+
+    await controller.start();
+    await controller.install();
+    expect(progresses).toEqual([null, 0, 60, 100]);
+  });
+
+  it("ignores a second install call while one is already in flight", async () => {
+    let release!: () => void;
+    const updateAdapter = adapter();
+    vi.mocked(updateAdapter.downloadAndInstall).mockImplementation(
+      () => new Promise<void>((resolve) => { release = resolve; }),
+    );
+    const controller = createUpdateController({
+      adapter: updateAdapter,
+      eligibility: eligible,
+      gate: createProcessCheckGate(),
+    });
+    await controller.start();
+    const first = controller.install();
+    const second = controller.install();
+    release();
+    await Promise.all([first, second]);
+    expect(updateAdapter.downloadAndInstall).toHaveBeenCalledTimes(1);
+  });
+
   it("reports determinate progress before installing and relaunching", async () => {
     const updateAdapter = adapter({
       events: [

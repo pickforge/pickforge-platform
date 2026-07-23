@@ -1,0 +1,25 @@
+{
+  "name": "@pickforge/tauri-updater",
+  "version": "0.12.0",
+  "description": "Framework-neutral Tauri update controller and Pickforge update dialog.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pickforge/pickforge-platform.git",
+    "directory": "packages/tauri-updater"
+  },
+  "type": "module",
+  "files": ["dist"],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --clean --splitting false --out-dir dist"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,4 @@
+[[IgnoredVulns]]
+id = "GHSA-g7r4-m6w7-qqqr"
+ignoreUntil = 2026-10-23
+reason = "Low-severity esbuild development-server advisory; v1 blocks high/critical. Tracked in #57."

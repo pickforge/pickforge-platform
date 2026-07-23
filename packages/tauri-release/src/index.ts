@@ -397,6 +397,7 @@ export function writeLatestJson(path: string, latest: LatestJson): void {
   writeFileSync(path, `${JSON.stringify(latest, null, 2)}\n`);
 }
 
+// eslint-disable-next-line complexity -- TODO(#57): split the legacy AppImage repair flow.
 export function fixAppImage(options: FixAppImageOptions): FixAppImageResult {
   const env = options.env ?? process.env;
   const signed = isSigningEnabled(env);
@@ -495,6 +496,7 @@ export function fixAppImage(options: FixAppImageOptions): FixAppImageResult {
   }
 }
 
+// eslint-disable-next-line complexity -- TODO(#57): split the legacy updater feed validator.
 export function verifyLatestJson(input: string | LatestJson): LatestJsonVerification {
   const errors: string[] = [];
   let parsed: unknown = null;
@@ -541,8 +543,10 @@ export function verifyLatestJson(input: string | LatestJson): LatestJsonVerifica
         if (!isNonEmptyString(platformRecord.url)) {
           errors.push(`${platform}.url must be a non-empty string`);
         } else {
+          // eslint-disable-next-line max-depth -- TODO(#57): flatten the legacy feed URL validation.
           try {
             const url = new URL(platformRecord.url);
+            // eslint-disable-next-line max-depth -- TODO(#57): flatten the legacy feed URL validation.
             if (url.protocol !== "https:" && url.protocol !== "http:") {
               errors.push(`${platform}.url must use http or https`);
             }
@@ -1182,6 +1186,7 @@ function formatToolOutput(output: string): string {
   return trimmed.length === 0 ? "" : `: ${trimmed}`;
 }
 
+// eslint-disable-next-line complexity -- TODO(#57): replace legacy asset precedence branches with data.
 function platformPriority(assetName: string, platform: PlatformKey): number {
   const lowered = assetName.toLowerCase();
   if (platform === "linux-x86_64" && lowered.endsWith(".appimage")) {

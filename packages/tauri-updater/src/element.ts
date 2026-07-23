@@ -125,6 +125,7 @@ export class PickforgeUpdateDialogElement extends HTMLElementBase {
     return dialog;
   }
 
+  // eslint-disable-next-line complexity -- TODO(#57): split the legacy updater element renderer.
   #render(): void {
     const state = this.#state;
     if (!isVisibleState(state)) {

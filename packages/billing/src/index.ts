@@ -472,6 +472,7 @@ async function processCheckoutSessionMoneyEvent({
   return { handled: true, duplicate: false };
 }
 
+// eslint-disable-next-line max-lines-per-function -- TODO(#57): split the legacy refund lifecycle flow.
 async function processRefundLifecycleEvent({
   supabase,
   stripe,
@@ -605,6 +606,7 @@ async function reconcileRefundLifecycleEvent(
   return data;
 }
 
+// eslint-disable-next-line complexity, max-lines-per-function -- TODO(#57): split the legacy deletion refund flow.
 async function performDeletionRefund({
   supabase,
   stripe,

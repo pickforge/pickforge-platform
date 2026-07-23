@@ -613,6 +613,7 @@ class MemorySupabase implements SupabaseClientLike {
     return null;
   }
 
+  // eslint-disable-next-line complexity -- TODO(#57): split the legacy lifecycle fake dispatcher.
   async rpc<T = unknown>(fn: string, args?: Record<string, unknown>): Promise<SupabaseQueryResult<T>> {
     if (fn === "checkout_lifecycle_reconcile_completion") {
       const sessionId = String(args?.checkout_session_id);

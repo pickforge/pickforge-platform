@@ -1788,6 +1788,7 @@ function accountAdmin(
     from<T = unknown>(table: string): AccountQuery<T> {
       return new AccountQuery<T>(rows[table] ?? [], errors[table] ?? null);
     },
+    // eslint-disable-next-line complexity -- TODO(#57): split the legacy lifecycle fake dispatcher.
     async rpc<T = unknown>(
       fn: string,
       args?: Record<string, unknown>,

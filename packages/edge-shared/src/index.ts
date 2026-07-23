@@ -651,6 +651,7 @@ export function assertRouteRequest(body: unknown): RouteRequest {
   return context === undefined ? { commandText } : { commandText, context };
 }
 
+// eslint-disable-next-line max-lines-per-function -- TODO(#57): split the legacy router handler factory.
 export function createOperatorRouterHandler({
   supabase,
   serviceSupabase,
@@ -669,6 +670,7 @@ export function createOperatorRouterHandler({
   const validBaseUrl = validateNonEmptyString(baseUrl, "baseUrl", "invalid_string");
   const validCreditCostCents = validatePositiveInteger(creditCostCents, "creditCostCents");
 
+  // eslint-disable-next-line max-lines-per-function -- TODO(#57): split the legacy router request flow.
   return async (req: Request): Promise<Response> => {
     try {
       const { userId } = await getUserFromRequest({ supabase, req });
@@ -884,6 +886,7 @@ export function createDeleteAccountHandler({
   stripe,
   resolveUserId,
 }: CreateDeleteAccountHandlerOptions): (req: Request) => Promise<Response> {
+  // eslint-disable-next-line complexity -- TODO(#57): split the legacy account deletion flow.
   return async (req: Request): Promise<Response> => {
     try {
       const userId = await resolveUserId(req);
@@ -1221,6 +1224,7 @@ function hasOnlyKeys(value: Record<string, unknown>, allowed: string[]): boolean
   return Object.keys(value).every((key) => allowed.includes(key));
 }
 
+// eslint-disable-next-line complexity -- TODO(#57): replace the legacy identifier matcher with data-driven checks.
 function containsForbiddenIdentifier(value: string): boolean {
   return (
     /\b[a-z][a-z0-9+.-]*:\/\//i.test(value) ||

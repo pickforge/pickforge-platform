@@ -53,7 +53,7 @@ export interface ProcessCheckGate {
 export interface UpdateController {
   getState(): UpdateState;
   start(): Promise<void>;
-  check(options?: { silent?: boolean }): Promise<void>;
+  check(options?: { silent?: boolean; manual?: boolean }): Promise<void>;
   install(): Promise<void>;
   retry(): Promise<void>;
   dismiss(): void;
@@ -101,12 +101,28 @@ export function createUpdateController(options: {
     for (const listener of listeners) listener(state);
   };
 
-  const check = async ({ silent = false }: { silent?: boolean } = {}): Promise<void> => {
-    if (state.status === "dismissed" || (started && state.status !== "idle")) return;
+  const check = async ({
+    silent = false,
+    manual = false,
+  }: { silent?: boolean; manual?: boolean } = {}): Promise<void> => {
+    if (manual) {
+      if (state.status === "downloading" || state.status === "installing" || state.status === "restarting") {
+        return;
+      }
+    } else if (state.status === "dismissed" || (started && state.status !== "idle")) {
+      return;
+    }
     started = true;
     setState({ status: "checking" });
     try {
-      const found = await gate.run(() => adapter.check());
+      const found = manual ? await adapter.check() : await gate.run(() => adapter.check());
+      if (!manual && state.status === "dismissed") {
+        if (found !== null) {
+          update = found;
+          setState({ status: "dismissed", update: found });
+        }
+        return;
+      }
       if (found === null) {
         setState({ status: "idle" });
         return;
@@ -115,7 +131,7 @@ export function createUpdateController(options: {
       setState({ status: "available", update: found });
     } catch (error) {
       setState(
-        silent
+        !manual && silent
           ? { status: "idle" }
           : { status: "error", message: errorMessage(error), retry: "check" },
       );

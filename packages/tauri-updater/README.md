@@ -26,6 +26,6 @@ dialog.controller = controller;
 void controller.start();
 ```
 
-`start()` silently ignores unavailable feeds and no-update responses. `check({ silent: false })` is available for a manual surface. The default process gate shares the first check across controllers; inject `createProcessCheckGate()` to isolate deterministic tests.
+`start()` silently ignores unavailable feeds and no-update responses, checking once per process through the shared gate. `check({ manual: true })` is for a Settings-style "check for updates" action: it clears a `dismissed` state, always performs a fresh `adapter.check()` bypassing the process gate's cached result, and reports failures as a retryable `error` state instead of staying silent. A `dismissed` state from `dismiss()` only blocks the automatic `start()`/`check()` path; a late-resolving automatic check that finds an update after the user has since dismissed keeps the `dismissed` status (retaining the update for bookkeeping) rather than reopening the dialog. The default process gate shares the first check across controllers; inject `createProcessCheckGate()` to isolate deterministic tests.
 
 Build the package and serve `fixture/` from the repository root to inspect the standalone states.

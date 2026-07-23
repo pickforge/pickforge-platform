@@ -143,6 +143,106 @@ describe("createUpdateController", () => {
     expect(updateAdapter.check).toHaveBeenCalledTimes(1);
   });
 
+  it("surfaces the update again when a manual check follows dismissal", async () => {
+    const updateAdapter = adapter();
+    const controller = createUpdateController({
+      adapter: updateAdapter,
+      eligibility: eligible,
+      gate: createProcessCheckGate(),
+    });
+
+    await controller.start();
+    controller.dismiss();
+    expect(controller.getState().status).toBe("dismissed");
+
+    await controller.check({ manual: true });
+    expect(controller.getState()).toMatchObject({
+      status: "available",
+      update: { version: "2.0.0" },
+    });
+    expect(updateAdapter.check).toHaveBeenCalledTimes(2);
+  });
+
+  it("calls the adapter again on a manual check after a cached no-update result", async () => {
+    const updateAdapter = adapter({ update: null });
+    const controller = createUpdateController({
+      adapter: updateAdapter,
+      eligibility: eligible,
+      gate: createProcessCheckGate(),
+    });
+
+    await controller.start();
+    expect(controller.getState()).toEqual({ status: "idle" });
+    expect(updateAdapter.check).toHaveBeenCalledTimes(1);
+
+    vi.mocked(updateAdapter.check).mockResolvedValueOnce({ version: "2.0.0" });
+    await controller.check({ manual: true });
+    expect(controller.getState()).toMatchObject({
+      status: "available",
+      update: { version: "2.0.0" },
+    });
+    expect(updateAdapter.check).toHaveBeenCalledTimes(2);
+  });
+
+  it("still results in a single adapter call when start is invoked twice", async () => {
+    const updateAdapter = adapter();
+    const controller = createUpdateController({
+      adapter: updateAdapter,
+      eligibility: eligible,
+      gate: createProcessCheckGate(),
+    });
+
+    await Promise.all([controller.start(), controller.start()]);
+    expect(updateAdapter.check).toHaveBeenCalledTimes(1);
+    expect(controller.getState()).toMatchObject({ status: "available" });
+  });
+
+  it("keeps the dismissed state when an in-flight automatic check resolves after dismissal", async () => {
+    let resolveCheck: ((value: { version: string } | null) => void) | undefined;
+    const updateAdapter: UpdateAdapter = {
+      check: vi.fn(() => new Promise<{ version: string } | null>((resolve) => { resolveCheck = resolve; })),
+      downloadAndInstall: vi.fn(async () => undefined),
+      relaunch: vi.fn(async () => undefined),
+    };
+    const controller = createUpdateController({
+      adapter: updateAdapter,
+      eligibility: eligible,
+      gate: { run: (check) => check() },
+    });
+
+    const starting = controller.start();
+    while (resolveCheck === undefined) {
+      await Promise.resolve();
+    }
+    expect(controller.getState().status).toBe("checking");
+    controller.dismiss();
+    expect(controller.getState()).toEqual({ status: "dismissed" });
+
+    resolveCheck({ version: "2.0.0" });
+    await starting;
+
+    expect(controller.getState()).toEqual({
+      status: "dismissed",
+      update: { version: "2.0.0" },
+    });
+  });
+
+  it("reports a manual check failure even when silent is requested", async () => {
+    const updateAdapter = adapter({ checkError: new Error("offline") });
+    const controller = createUpdateController({
+      adapter: updateAdapter,
+      eligibility: eligible,
+      gate: createProcessCheckGate(),
+    });
+
+    await controller.check({ manual: true, silent: true });
+    expect(controller.getState()).toMatchObject({
+      status: "error",
+      message: "offline",
+      retry: "check",
+    });
+  });
+
   it("reports determinate progress before installing and relaunching", async () => {
     const updateAdapter = adapter({
       events: [

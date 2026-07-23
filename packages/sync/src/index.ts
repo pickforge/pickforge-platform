@@ -328,6 +328,7 @@ function walkPayload(group: SyncFieldGroup, value: Json, path: string[]): void {
   }
 }
 
+// eslint-disable-next-line complexity -- TODO(#57): split the legacy sync boundary validator.
 function assertAllowedString(group: SyncFieldGroup, value: string, key: string | undefined): void {
   const text = value.trim();
   const skipPathCheck = group === "remoteBindings" && key === "remoteRoot";

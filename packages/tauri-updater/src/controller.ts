@@ -84,6 +84,7 @@ export function createEligibility(value: StaticEligibility): UpdateEligibility {
   };
 }
 
+// eslint-disable-next-line max-lines-per-function -- TODO(#57): split the legacy update controller factory.
 export function createUpdateController(options: {
   adapter: UpdateAdapter;
   eligibility: UpdateEligibility;
@@ -106,6 +107,7 @@ export function createUpdateController(options: {
   const check = async ({
     silent = false,
     manual = false,
+  // eslint-disable-next-line complexity -- TODO(#57): split the legacy update check flow.
   }: { silent?: boolean; manual?: boolean } = {}): Promise<void> => {
     if (manual) {
       if (isBusy(state)) return;

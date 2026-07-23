@@ -83,6 +83,7 @@ interface EntitlementCache {
 
 const DEFAULT_ENTITLEMENT_CACHE_TTL_MS = 5 * 60 * 1000;
 
+// eslint-disable-next-line max-lines-per-function -- TODO(#57): split the legacy client factory.
 export function createPickforgeAuthClient(config: PickforgeAuthConfig): PickforgeAuthClient {
   validateConfig(config);
 

@@ -9,6 +9,35 @@ permissions:
   contents: read
 
 jobs:
+  gitleaks:
+    name: Gitleaks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Scan repository history
+        run: >-
+          docker run --rm
+          -v "$PWD:/repo"
+          ghcr.io/gitleaks/gitleaks:v8.30.1
+          detect --source /repo --config /repo/.gitleaks.toml
+          --no-banner --redact --verbose
+
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
+        with:
+          scan-args: |-
+            --config=osv-scanner.toml
+            --recursive
+            ./
+
   check:
     runs-on: ubuntu-24.04
     steps:
@@ -23,6 +52,9 @@ jobs:
 
       - name: Typecheck
         run: bun run typecheck
+
+      - name: Lint
+        run: bun run lint
 
       - name: Test
         run: bun run test

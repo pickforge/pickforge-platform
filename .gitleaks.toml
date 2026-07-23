@@ -1,0 +1,7 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic AWS key used by the sanitizer regression test"
+paths = ['''packages/sync/test/sanitizer\.test\.ts''']
+regexes = ['''AKIA1234567890ABCDEF''']

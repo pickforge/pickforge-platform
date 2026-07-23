@@ -21,6 +21,21 @@ export class PickforgeUpdateDialogElement extends HTMLElementBase {
   #unsubscribe: (() => void) | undefined;
   #state: UpdateState = { status: "idle" };
   #restoreFocus: HTMLElement | null = null;
+  #dialog: HTMLDialogElement | undefined;
+  #markEl: HTMLElement | undefined;
+  #titleEl: HTMLElement | undefined;
+  #descriptionEl: HTMLElement | undefined;
+  #currentVersionEl: HTMLElement | undefined;
+  #newVersionEl: HTMLElement | undefined;
+  #statusEl: HTMLElement | undefined;
+  #footerEl: HTMLElement | undefined;
+
+  constructor() {
+    super();
+    const style = document.createElement("style");
+    style.textContent = STYLES;
+    this.#root.append(style);
+  }
 
   set controller(value: UpdateController | undefined) {
     if (this.#controller === value) return;
@@ -65,17 +80,61 @@ export class PickforgeUpdateDialogElement extends HTMLElementBase {
     this.#close();
   }
 
+  #ensureDialog(): HTMLDialogElement {
+    if (this.#dialog !== undefined) return this.#dialog;
+    const dialog = document.createElement("dialog");
+    dialog.setAttribute("aria-labelledby", "pf-updater-title");
+    dialog.setAttribute("aria-describedby", "pf-updater-description");
+    dialog.innerHTML = `
+      <section class="card">
+        <header>
+          <span class="mark" aria-hidden="true"></span>
+          <span class="eyebrow">UPDATE AVAILABLE</span>
+        </header>
+        <h2 id="pf-updater-title"></h2>
+        <p id="pf-updater-description" class="description"></p>
+        <div class="version-rail" aria-label="Version change">
+          <span><small>Current</small><b class="current-version"></b></span>
+          <span class="tick" aria-hidden="true">→</span>
+          <span><small>New</small><b class="new-version"></b></span>
+        </div>
+        <div class="status" aria-live="polite"></div>
+        <footer></footer>
+      </section>`;
+
+    this.#markEl = dialog.querySelector<HTMLElement>(".mark") ?? undefined;
+    this.#titleEl = dialog.querySelector<HTMLElement>("#pf-updater-title") ?? undefined;
+    this.#descriptionEl = dialog.querySelector<HTMLElement>("#pf-updater-description") ?? undefined;
+    this.#currentVersionEl = dialog.querySelector<HTMLElement>(".current-version") ?? undefined;
+    this.#newVersionEl = dialog.querySelector<HTMLElement>(".new-version") ?? undefined;
+    this.#statusEl = dialog.querySelector<HTMLElement>(".status") ?? undefined;
+    this.#footerEl = dialog.querySelector<HTMLElement>("footer") ?? undefined;
+
+    dialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      if (
+        this.#state.status === "available" ||
+        (this.#state.status === "error" && this.#state.retry === "check")
+      ) {
+        this.#controller?.dismiss();
+      }
+    });
+
+    this.#root.append(dialog);
+    this.#dialog = dialog;
+    return dialog;
+  }
+
   #render(): void {
-    const previousDialog = this.#root.querySelector("dialog");
-    const wasOpen = previousDialog?.hasAttribute("open") === true;
-    if (!isVisibleState(this.#state)) {
-      this.#root.innerHTML = `<style>${STYLES}</style>`;
-      if (wasOpen) this.#restoreFocus?.focus();
-      this.#restoreFocus = null;
+    const state = this.#state;
+    if (!isVisibleState(state)) {
+      this.#close();
       return;
     }
 
-    const state = this.#state;
+    const dialog = this.#ensureDialog();
+    const wasOpen = dialog.hasAttribute("open");
+
     const update = "update" in state ? state.update : undefined;
     const notes = update?.notes?.trim();
     const isAvailable = state.status === "available";
@@ -94,97 +153,60 @@ export class PickforgeUpdateDialogElement extends HTMLElementBase {
       ? "The app remains available. Retry when you’re ready."
       : isRestarting
         ? "Restarting to finish the update."
-        : notes ?? "Download the latest Pickforge Studio release.";
+        : "A new version is ready to install.";
 
-    this.#root.innerHTML = `
-      <style>${STYLES}</style>
-      <dialog aria-labelledby="pf-updater-title" aria-describedby="pf-updater-description">
-        <section class="card">
-          <header>
-            <span class="mark" aria-hidden="true"></span>
-            <span class="eyebrow">UPDATE AVAILABLE</span>
-          </header>
-          <h2 id="pf-updater-title"></h2>
-          <p id="pf-updater-description" class="description"></p>
-          <div class="version-rail" aria-label="Version change">
-            <span><small>Current</small><b class="current-version"></b></span>
-            <span class="tick" aria-hidden="true">→</span>
-            <span><small>New</small><b class="new-version"></b></span>
-          </div>
-          <div class="status" aria-live="polite"></div>
-          <footer></footer>
-        </section>
-      </dialog>`;
+    if (this.#markEl !== undefined) this.#markEl.textContent = this.#metadata.productMark ?? "PF";
+    if (this.#titleEl !== undefined) this.#titleEl.textContent = title;
+    if (this.#descriptionEl !== undefined) this.#descriptionEl.textContent = description;
+    if (this.#currentVersionEl !== undefined) this.#currentVersionEl.textContent = this.#metadata.currentVersion;
+    if (this.#newVersionEl !== undefined) this.#newVersionEl.textContent = update?.version ?? "Installed";
 
-    setText(this.#root, ".mark", this.#metadata.productMark ?? "PF");
-    setText(this.#root, "#pf-updater-title", title);
-    setText(this.#root, "#pf-updater-description", description);
-    setText(this.#root, ".current-version", this.#metadata.currentVersion);
-    setText(this.#root, ".new-version", update?.version ?? "Installed");
-
-    const status = this.#root.querySelector<HTMLElement>(".status");
-    const footer = this.#root.querySelector<HTMLElement>("footer");
-    if (status === null || footer === null) return;
-
-    if (notes !== undefined && (isAvailable || isError)) {
-      const notesElement = document.createElement("pre");
-      notesElement.className = "notes";
-      notesElement.textContent = notes;
-      status.append(notesElement);
-    }
-    if (isDownloading) {
-      status.append(createProgress(state.progress.percent));
-    } else if (isInstalling) {
-      status.textContent = "Installing update…";
-    } else if (isRestarting) {
-      status.textContent = "Installation complete. Restarting…";
-    } else if (isError) {
-      const error = document.createElement("p");
-      error.className = "error";
-      error.setAttribute("role", "alert");
-      error.textContent = state.message;
-      status.prepend(error);
-    }
-
-    if (isAvailable) {
-      footer.append(
-        actionButton("Later", "later", "secondary"),
-        actionButton("Update & restart", "install", "primary"),
-      );
-    } else if (isError) {
-      footer.append(
-        actionButton("Later", "later", "secondary"),
-        actionButton("Retry", "retry", "primary"),
-      );
-    }
-
-    this.#wireActions();
-    const dialog = this.#root.querySelector<HTMLDialogElement>("dialog");
-    if (dialog === null) return;
-    dialog.addEventListener("cancel", (event) => {
-      event.preventDefault();
-      if (
-        this.#state.status === "available" ||
-        (this.#state.status === "error" && this.#state.retry === "check")
-      ) {
-        this.#controller?.dismiss();
+    const status = this.#statusEl;
+    if (status !== undefined) {
+      status.replaceChildren();
+      if (notes !== undefined && (isAvailable || isError)) {
+        const notesElement = document.createElement("pre");
+        notesElement.className = "notes";
+        notesElement.textContent = notes;
+        status.append(notesElement);
       }
-    });
+      if (isDownloading) {
+        status.append(createProgress(state.progress.percent));
+      } else if (isInstalling) {
+        status.textContent = "Installing update…";
+      } else if (isRestarting) {
+        status.textContent = "Installation complete. Restarting…";
+      } else if (isError) {
+        const error = document.createElement("p");
+        error.className = "error";
+        error.setAttribute("role", "alert");
+        error.textContent = state.message;
+        status.prepend(error);
+      }
+    }
+
+    this.#renderFooter(isAvailable, isError);
+
     if (!wasOpen) this.#restoreFocus = activeElement();
     this.#open(dialog);
     if (!wasOpen) this.#root.querySelector<HTMLElement>(".primary")?.focus();
   }
 
-  #wireActions(): void {
-    this.#root.querySelector('[data-action="later"]')?.addEventListener("click", () => {
-      this.#controller?.dismiss();
-    });
-    this.#root.querySelector('[data-action="install"]')?.addEventListener("click", () => {
-      void this.#controller?.install();
-    });
-    this.#root.querySelector('[data-action="retry"]')?.addEventListener("click", () => {
-      void this.#controller?.retry();
-    });
+  #renderFooter(isAvailable: boolean, isError: boolean): void {
+    const footer = this.#footerEl;
+    if (footer === undefined) return;
+    footer.replaceChildren();
+    if (isAvailable) {
+      footer.append(
+        actionButton("Later", "later", "secondary", () => this.#controller?.dismiss()),
+        actionButton("Update & restart", "install", "primary", () => void this.#controller?.install()),
+      );
+    } else if (isError) {
+      footer.append(
+        actionButton("Later", "later", "secondary", () => this.#controller?.dismiss()),
+        actionButton("Retry", "retry", "primary", () => void this.#controller?.retry()),
+      );
+    }
   }
 
   #open(dialog: HTMLDialogElement): void {
@@ -194,8 +216,8 @@ export class PickforgeUpdateDialogElement extends HTMLElementBase {
   }
 
   #close(): void {
-    const dialog = this.#root.querySelector<HTMLDialogElement>("dialog");
-    if (dialog?.hasAttribute("open")) {
+    const dialog = this.#dialog;
+    if (dialog?.hasAttribute("open") === true) {
       if (typeof dialog.close === "function") dialog.close();
       else dialog.removeAttribute("open");
     }
@@ -215,17 +237,18 @@ function isVisibleState(state: UpdateState): boolean {
   return ["available", "downloading", "installing", "restarting", "error"].includes(state.status);
 }
 
-function setText(root: ShadowRoot, selector: string, value: string): void {
-  const element = root.querySelector(selector);
-  if (element !== null) element.textContent = value;
-}
-
-function actionButton(label: string, action: string, className: string): HTMLButtonElement {
+function actionButton(
+  label: string,
+  action: string,
+  className: string,
+  onClick: () => void,
+): HTMLButtonElement {
   const button = document.createElement("button");
   button.type = "button";
   button.className = className;
   button.dataset.action = action;
   button.textContent = label;
+  button.addEventListener("click", onClick);
   return button;
 }
 
@@ -251,7 +274,7 @@ const STYLES = `
   :host { color: var(--pf-text-hi, #f2f2f3); font-family: var(--pf-font-sans, "Geist Sans", system-ui, sans-serif); }
   dialog { background: transparent; border: 0; color: inherit; margin: auto; max-height: calc(100vh - 32px); max-width: min(560px, calc(100vw - 32px)); padding: 0; width: 100%; }
   dialog::backdrop { background: color-mix(in srgb, var(--pf-surface, #0a0a0b) 62%, transparent); }
-  .card { animation: pf-updater-enter var(--pf-dur-fast, 180ms) var(--pf-ease-forge, ease-out) both; backdrop-filter: blur(20px) saturate(160%); background: color-mix(in srgb, var(--pf-surface-1, #0f0f11) 85%, transparent); border: 1px solid var(--pf-hairline-strong, rgba(255,255,255,.14)); border-radius: var(--pf-radius-lg, 14px); box-shadow: var(--pf-shadow-overlay, 0 16px 48px -10px rgba(0,0,0,.6)); box-sizing: border-box; max-height: calc(100vh - 32px); overflow: auto; padding: var(--pf-space-xl, 24px); }
+  .card { animation: pf-updater-enter var(--pf-dur-fast, 180ms) var(--pf-ease-forge, ease-out) both; backdrop-filter: blur(20px) saturate(160%); -webkit-backdrop-filter: blur(20px) saturate(160%); background: color-mix(in srgb, var(--pf-surface-1, #0f0f11) 85%, transparent); border: 1px solid var(--pf-hairline-strong, rgba(255,255,255,.14)); border-radius: var(--pf-radius-lg, 14px); box-shadow: var(--pf-shadow-overlay, 0 16px 48px -10px rgba(0,0,0,.6)); box-sizing: border-box; max-height: calc(100vh - 32px); overflow: auto; padding: var(--pf-space-xl, 24px); }
   header { align-items: center; display: flex; gap: var(--pf-space-sm, 8px); }
   .mark { align-items: center; background: var(--pf-item-fill, rgba(255,255,255,.03)); border: 1px solid var(--pf-hairline-strong, rgba(255,255,255,.14)); border-radius: var(--pf-radius-sm, 6px); color: var(--pf-ember, #ff7a1a); display: inline-flex; font-family: var(--pf-font-mono, monospace); font-size: 10px; font-weight: 700; height: 26px; justify-content: center; width: 26px; }
   .eyebrow, small { color: var(--pf-text-low, #6e6e75); font-family: var(--pf-font-mono, monospace); font-size: var(--pf-size-eyebrow, 10px); font-weight: 500; letter-spacing: var(--pf-tracking-eyebrow, 1.8px); text-transform: uppercase; }

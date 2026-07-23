@@ -107,6 +107,46 @@ describe("pickforge-update-dialog", () => {
     release();
   });
 
+  it("keeps release notes out of the description and uses a fixed sentence instead", async () => {
+    const { controller, root } = setup({ notes: "Fixes a startup crash" });
+    await controller.start();
+    await flush();
+
+    const description = root.querySelector("#pf-updater-description");
+    expect(description?.textContent).toBe("A new version is ready to install.");
+    expect(description?.textContent).not.toContain("Fixes a startup crash");
+    expect(root.querySelector(".notes")?.textContent).toBe("Fixes a startup crash");
+  });
+
+  it("keeps the dialog and live-region nodes stable across progress ticks", async () => {
+    const { adapter, controller, root } = setup();
+    let release!: () => void;
+    vi.mocked(adapter.downloadAndInstall).mockImplementation(
+      (onEvent) =>
+        new Promise<void>((resolve) => {
+          onEvent({ type: "started", contentLength: 100 });
+          release = () => {
+            onEvent({ type: "progress", chunkLength: 50 });
+            resolve();
+          };
+        }),
+    );
+    await controller.start();
+    await flush();
+    (root.querySelector('[data-action="install"]') as HTMLButtonElement).click();
+    await flush();
+
+    const dialog = root.querySelector("dialog");
+    const status = root.querySelector('[aria-live="polite"]');
+    expect(dialog).not.toBeNull();
+
+    release();
+    await flush();
+
+    expect(root.querySelector("dialog")).toBe(dialog);
+    expect(root.querySelector('[aria-live="polite"]')).toBe(status);
+  });
+
   it("renders progress and retryable errors", async () => {
     const { adapter, controller, root } = setup();
     vi.mocked(adapter.downloadAndInstall).mockImplementation(async (onEvent) => {

@@ -9,10 +9,23 @@
     <style>
       body { background: var(--pf-surface); color: var(--pf-text-hi); font-family: var(--pf-font-sans); margin: 0; min-height: 100vh; }
       main { padding: 32px; }
+      nav { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+      nav a { color: var(--pf-text-med); font-family: var(--pf-font-mono); font-size: 12px; }
+      nav a[aria-current="page"] { color: var(--pf-ember); }
     </style>
   </head>
   <body>
-    <main><h1>Updater fixture</h1><p>The app remains usable behind the modal.</p></main>
+    <main>
+      <h1>Updater fixture</h1>
+      <p id="note">The app remains usable behind the modal.</p>
+      <nav>
+        <a href="?scenario=available">Available</a>
+        <a href="?scenario=indeterminate">Indeterminate download</a>
+        <a href="?scenario=check-error">Check fails</a>
+        <a href="?scenario=install-error">Install fails</a>
+        <a href="?scenario=no-update">No update</a>
+      </nav>
+    </main>
     <pickforge-update-dialog></pickforge-update-dialog>
     <script type="module">
       import {
@@ -22,19 +35,42 @@
         definePickforgeUpdaterElement,
       } from "../dist/index.js";
 
+      const scenario = new URLSearchParams(location.search).get("scenario") ?? "available";
+      for (const link of document.querySelectorAll("nav a")) {
+        if (new URL(link.href).searchParams.get("scenario") === scenario) {
+          link.setAttribute("aria-current", "page");
+        }
+      }
+
+      const notes = {
+        available: "Click “Update & restart” to run the determinate download.",
+        indeterminate: "Click “Update & restart” to run a download with no content length.",
+        "check-error": "The startup check stays silent; a manual check surfaces the retryable error.",
+        "install-error": "Click “Update & restart”; the install fails after some progress.",
+        "no-update": "The startup check found nothing, so no dialog opens.",
+      };
+      document.querySelector("#note").textContent = notes[scenario] ?? notes.available;
+
       const adapter = {
         async check() {
+          if (scenario === "check-error") throw new Error("Could not reach the update feed.");
+          if (scenario === "no-update") return null;
           return {
             version: "1.4.0",
             notes: "Faster startup\nMore reliable signed updates\nImproved keyboard navigation",
           };
         },
         async downloadAndInstall(onEvent) {
-          onEvent({ type: "started", contentLength: 100 });
+          onEvent(
+            scenario === "indeterminate"
+              ? { type: "started" }
+              : { type: "started", contentLength: 100 },
+          );
           for (const downloaded of [18, 24, 31, 27]) {
             await new Promise((resolve) => setTimeout(resolve, 300));
             onEvent({ type: "progress", chunkLength: downloaded });
           }
+          if (scenario === "install-error") throw new Error("Signature verification failed.");
           onEvent({ type: "finished" });
         },
         async relaunch() {},
@@ -49,6 +85,9 @@
       element.metadata = { productName: "PickForge", currentVersion: "1.3.2", productMark: "PF" };
       element.controller = controller;
       await controller.start();
+      if (scenario === "check-error") {
+        await controller.check({ manual: true });
+      }
     </script>
   </body>
 </html>

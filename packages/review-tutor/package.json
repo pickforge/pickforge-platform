@@ -1,0 +1,22 @@
+{
+  "name": "@pickforge/review-tutor",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["extensions/review-tutor.ts"],
+    "skills": ["skills/review-tutor"]
+  },
+  "scripts": {
+    "test": "cd ../.. && vitest run packages/review-tutor/test",
+    "typecheck": "tsc -p ../../tsconfig.json --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.2"
+  }
+}

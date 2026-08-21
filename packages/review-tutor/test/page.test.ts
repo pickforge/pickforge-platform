@@ -134,6 +134,8 @@ describe("Review Tutor composed page", () => {
     }
     expect(pageHtml).toContain("[hidden]");
     expect(pageHtml).toContain("@media(max-width:1040px)");
+    expect(pageHtml).toContain(".diff-pane {\nmin-width:0;min-height:0;");
+    expect(pageHtml).toContain(".rail {\nmin-height:0;overflow-y:auto;");
     expect(pageHtml).toContain('role="region" aria-labelledby="tutor-title"');
   });
 

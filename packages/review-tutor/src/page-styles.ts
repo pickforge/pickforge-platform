@@ -45,7 +45,7 @@ background:transparent}
 .workbench {
 height:calc(100vh - 48px);display:grid;grid-template-columns:minmax(640px,1fr) 400px}
 .diff-pane {
-min-width:0;display:flex;flex-direction:column;border-right:1px solid var(--line)}
+min-width:0;min-height:0;display:flex;flex-direction:column;border-right:1px solid var(--line)}
 .source-setup {
 margin:20px;border:1px solid var(--line2);border-radius:14px;background:var(--panel);padding:20px}
 .source-setup[hidden] {
@@ -121,7 +121,7 @@ text-align:center;color:var(--subtle)}
 .code {
 white-space:pre;padding:0 14px}
 .rail {
-overflow-y:auto;background:var(--panel)}
+min-height:0;overflow-y:auto;background:var(--panel)}
 .tutor {
 padding:18px 18px 22px;border-bottom:1px solid var(--line)}
 .dialog-head {

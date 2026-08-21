@@ -68,6 +68,7 @@ async function boot(options: {
   source?: typeof source;
   storedQuizIds?: string;
   stateResponses?: unknown[];
+  failHeartbeat?: boolean;
 } = {}) {
   FakeEventSource.instances = [];
   const window = new Window({ url: "http://127.0.0.1:43123/?session=secret-token" });
@@ -91,6 +92,7 @@ async function boot(options: {
       return json(response);
     }
     if (path === "/api/log?limit=100") return json(options.entries ?? []);
+    if (path === "/api/heartbeat" && options.failHeartbeat) return Promise.reject(new Error("heartbeat down"));
     if (path === "/api/ask") return options.askResponse ?? json({ id: "q-1", state: "queued", answer: "", createdAt: new Date().toISOString() });
     if (path.startsWith("/api/log/")) return json({});
     if (path.includes("/cancel")) return json({ id: "q-1", state: "cancelled", answer: "partial" });
@@ -248,13 +250,6 @@ describe("Review Tutor composed page", () => {
     expect(JSON.parse(window.sessionStorage.getItem("reviewTutorQuizEntryIds") ?? "[]")).toEqual(["quiz-entry"]);
   });
 
-  it.each(["{bad", "{}", "42"])("recovers from corrupt quiz storage %s", async (storedQuizIds) => {
-    const { document, window } = await boot({ storedQuizIds });
-    expect(document.querySelectorAll(".file")).toHaveLength(2);
-    expect(byId(document, "connection").textContent).toBe("starting");
-    expect(window.sessionStorage.getItem("reviewTutorQuizEntryIds")).toBeNull();
-  });
-
   it("parses only real unified diffs and preserves ++/-- code inside hunks", async () => {
     const special = { ...source, content: "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -7,2 +7,2 @@\n---i\n+++i\n context" };
     const parsed = await boot({ source: special });
@@ -264,6 +259,32 @@ describe("Review Tutor composed page", () => {
     const plain = await boot({ source: { ...source, label: "paste.ts", content: "@@decorator\n++value;\n--value;" } });
     expect(plain.document.querySelectorAll(".file.plain .diff-row[role=button]")).toHaveLength(3);
     expect(plain.document.querySelectorAll(".file.plain .line-no")).toHaveLength(3);
+  });
+
+  it.each(["{bad", "{}", "42"])("recovers from corrupt quiz storage %s", async (storedQuizIds) => {
+    const { document, window } = await boot({ storedQuizIds });
+    expect(document.querySelectorAll(".file")).toHaveLength(2);
+    expect(byId(document, "connection").textContent).toBe("starting");
+    expect(window.sessionStorage.getItem("reviewTutorQuizEntryIds")).toBeNull();
+  });
+
+  it.each([
+    ["plain", ["diff --git a/src/my file.ts b/src/my file.ts", "@@ -1 +1 @@", "+export const spaced = true;"]],
+    ["quoted", ['diff --git "a/src/my file.ts" "b/src/my file.ts"', "@@ -1 +1 @@", "+export const spaced = true;"]],
+  ])("parses diff headers with spaces in file paths (%s)", async (_variant, contentLines) => {
+    const spaced = { ...source, content: contentLines.join("\n") };
+    const { document } = await boot({ source: spaced });
+    expect(document.querySelector(".file-path")?.textContent).toBe("src/my file.ts");
+  });
+
+  it("keeps heartbeat failures out of the persistent error banner", async () => {
+    const { window, document } = await boot({ failHeartbeat: true });
+    const tick = (window.setInterval as unknown as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as (() => void) | undefined;
+    if (!tick) throw new Error("Heartbeat interval was not registered");
+    tick();
+    await flush();
+    expect(byId(document, "error").textContent).toBe("");
+    expect(byId(document, "lifecycle").textContent).toBe("Heartbeat failed.");
   });
 
   it("omits fabricated coordinates for mixed old/new selection and reports count", async () => {
@@ -290,6 +311,9 @@ describe("Review Tutor composed page", () => {
     expect(byId(document, "selection-preview").textContent).toBe("ok");
     rows[1].dispatchEvent(new window.MouseEvent("pointerdown", { bubbles: true, shiftKey: true }));
     expect(byId(document, "error").textContent).toContain("16 KiB");
+    expect(byId(document, "selection-preview").textContent).toBe("ok");
+    rows[0].dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+    expect(byId(document, "error").textContent).toBe("");
     expect(byId(document, "selection-preview").textContent).toBe("ok");
   });
 
@@ -354,6 +378,25 @@ describe("Review Tutor composed page", () => {
     await flush();
     events?.emit("log_update", { ...entry, id: "old-identical", createdAt: new Date(Date.now() - 1000).toISOString() });
     expect(window.sessionStorage.getItem("reviewTutorQuizEntryIds")).toBeNull();
+  });
+
+  it("renders deferred log entries after a note save blurs", async () => {
+    const entry = { id: "entry-1", inputId: source.id, source, selection: { text: "" }, question: "First", answer: "A", modelId: "model-1", preferences: {}, note: "", reviewLater: false, createdAt: new Date().toISOString() };
+    const entries = [entry];
+    const { window, document, events, requests } = await boot({ entries });
+    const note = document.querySelector(".log-entry textarea") as any;
+    note.focus();
+    note.value = "draft in progress";
+    note.dispatchEvent(new window.Event("input", { bubbles: true }));
+    entries.push({ ...entry, id: "entry-2", question: "Arrived while editing" });
+    events?.emit("log_update", { ...entry, id: "entry-2", question: "Arrived while editing" });
+    await flush();
+    expect(document.querySelectorAll(".log-entry")).toHaveLength(1);
+    note.blur();
+    await flush();
+    expect(requests.some((request) => request.path === "/api/log/entry-1" && JSON.parse(request.init?.body as string).note === "draft in progress")).toBe(true);
+    expect(document.querySelectorAll(".log-entry")).toHaveLength(2);
+    expect(Array.from(document.querySelectorAll(".log-entry h3")).map((node) => node.textContent)).toEqual(["Arrived while editing", "First"]);
   });
 
   it("renders terminal answers and sends exact note, review-later, and quiz PATCH payloads", async () => {

@@ -43,6 +43,7 @@ export const pageScript = String.raw`
     currentQuestionId,
     currentQuestionState,
     files = [],
+    preambleText = "",
     selection = null,
     selectionAnchor = null,
     activeRow = null,
@@ -141,15 +142,19 @@ export const pageScript = String.raw`
     const lines = content.split("\n");
     const unified = lines.some((line) => line.startsWith("diff --git ")) &&
       lines.some((line) => /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/.test(line));
-    if (!unified) return [{
-      path: label,
-      kind: "plain",
-      lines: lines.map((text, index) => ({ kind: "context", text, old: index + 1, new: null, selectLine: index + 1, block: 0 })),
-      additions: 0,
-      deletions: 0,
-    }];
+    if (!unified) return {
+      preamble: "",
+      files: [{
+        path: label,
+        kind: "plain",
+        lines: lines.map((text, index) => ({ kind: "context", text, old: index + 1, new: null, selectLine: index + 1, block: 0 })),
+        additions: 0,
+        deletions: 0,
+      }],
+    };
     const result = [];
-    let file = null, oldLine = 0, newLine = 0, inHunk = false, block = -1;
+    const preamble = [];
+    let file = null, oldLine = 0, newLine = 0, inHunk = false, block = -1, started = false;
     function ensure() {
       if (!file) {
         file = { path: label, kind: "diff", lines: [], additions: 0, deletions: 0 };
@@ -159,10 +164,17 @@ export const pageScript = String.raw`
     }
     for (const line of lines) {
       if (line.startsWith("diff --git ")) {
-        const parts = line.split(" ");
-        file = { path: (parts[3] || parts[2] || label).replace(/^b\//, ""), kind: "diff", lines: [], additions: 0, deletions: 0 };
+        started = true;
+        const body = line.slice(11).replaceAll('"', "");
+        const marker = body.indexOf(" b/");
+        const headerPath = (marker >= 0 ? body.slice(marker + 3) : body.split(" ")[1] || body.split(" ")[0] || "").replace(/^b\//, "");
+        file = { path: headerPath || label, kind: "diff", lines: [], additions: 0, deletions: 0 };
         result.push(file);
         inHunk = false;
+        continue;
+      }
+      if (!started) {
+        preamble.push(line);
         continue;
       }
       if (!inHunk && (line.startsWith("--- ") || line.startsWith("+++ "))) {
@@ -191,7 +203,7 @@ export const pageScript = String.raw`
         target.lines.push({ kind: "context", text: line.slice(1), old: oldLine++, new: newLine++, selectLine: newLine - 1, block });
       } else target.lines.push({ kind: "meta", text: line });
     }
-    return result;
+    return { preamble: preamble.join("\n").trim(), files: result };
   }
   function makeSpan(className, text) {
     const node = document.createElement("span");
@@ -213,6 +225,7 @@ export const pageScript = String.raw`
   function chooseRow(fileIndex, rowIndex, extend, confirm) {
     const file = files[fileIndex], row = file.lines[rowIndex];
     if (!rowSelectable(row)) return;
+    clearError();
     const previousAnchor = selectionAnchor;
     if (!extend || !selectionAnchor || selectionAnchor.fileIndex !== fileIndex || file.lines[selectionAnchor.rowIndex].block !== row.block)
       selectionAnchor = { fileIndex, rowIndex };
@@ -314,7 +327,14 @@ export const pageScript = String.raw`
     if (next) next.focus();
   }
   function renderDiff() {
-    element("diff").replaceChildren();
+    const container = element("diff");
+    container.replaceChildren();
+    if (preambleText) {
+      const preambleNode = document.createElement("div");
+      preambleNode.className = "diff-preamble";
+      preambleNode.textContent = preambleText;
+      container.append(preambleNode);
+    }
     const fileSelect = element("files");
     fileSelect.replaceChildren();
     let additions = 0,
@@ -403,7 +423,7 @@ export const pageScript = String.raw`
         rows.hidden = expanded;
       });
       article.append(head, rows);
-      element("diff").append(article);
+      container.append(article);
     });
     fileSelect.disabled = !files.length;
     element("previous-file").disabled = files.length < 2;
@@ -655,8 +675,12 @@ export const pageScript = String.raw`
           noteDrafts.delete(entry.id);
           saved.textContent = "saved";
           if (deferredLogEntries) {
-            logEntries = deferredLogEntries;
-            deferredLogEntries = null;
+            const active = document.activeElement;
+            if (!active?.matches(".log-entry textarea") && !active?.closest(".entry-actions")) {
+              logEntries = deferredLogEntries;
+              deferredLogEntries = null;
+              renderLog();
+            }
           }
         } catch (error) {
           showError(error, "Note save");
@@ -796,10 +820,12 @@ export const pageScript = String.raw`
     );
     events.onopen = () => {
       element("connection").textContent = "connected";
+      element("connection").dataset.state = "connected";
       reconcileQuestion().catch((error) => showError(error, "State reconciliation"));
     };
     events.onerror = () => {
       element("connection").textContent = "reconnecting";
+      element("connection").dataset.state = "reconnecting";
     };
     function parseEvent(event, action) {
       try {
@@ -851,8 +877,8 @@ export const pageScript = String.raw`
       refreshLog().catch((error) => showError(error, "Log refresh"));
     });
     setInterval(() => {
-      api("/api/heartbeat", { method: "POST", body: "{}" }).catch((error) =>
-        showError(error, "Heartbeat"),
+      api("/api/heartbeat", { method: "POST", body: "{}" }).catch(() =>
+        announce("Heartbeat failed."),
       );
     }, 10000);
   }
@@ -874,7 +900,9 @@ export const pageScript = String.raw`
   }
   function acceptSource(source) {
     currentSource = source;
-    files = parseUnifiedDiff(source.content, source.label);
+    const parsed = parseUnifiedDiff(source.content, source.label);
+    files = parsed.files;
+    preambleText = parsed.preamble;
     selection = null;
     selectionAnchor = null;
     activeRow = null;
@@ -1005,6 +1033,7 @@ export const pageScript = String.raw`
   updateSourceFields();
   initialize().catch((error) => {
     element("connection").textContent = "failed";
+    element("connection").dataset.state = "failed";
     showError(error, "Startup");
   });
 })();

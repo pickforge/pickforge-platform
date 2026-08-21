@@ -141,12 +141,27 @@ describe("Review Tutor composed page", () => {
     expect(pageHtml).toContain('role="region" aria-labelledby="tutor-title"');
   });
 
+  it("composes the Pickforge mark and token system instead of fake window dots", () => {
+    const mark = pageHtml.match(/<svg class="mark"[\s\S]*?<\/svg>/)?.[0];
+    expect(mark).toBeDefined();
+    expect(mark).toContain('stroke="#F2F2F3"');
+    expect(mark).toContain('fill="#FF7A1A"');
+    expect(pageHtml).not.toContain('class="dots"');
+    expect(pageHtml).toContain('--control-h:36px');
+    expect(pageHtml).toContain('--control-h-touch:44px');
+    expect(pageHtml).toContain('class="connection" data-state="starting"');
+    expect(pageHtml).toContain('.connection[data-state="connected"]');
+  });
+
   it("bootstraps the token, cleans the URL, connects, and renders an initial multi-file diff", async () => {
     const { window, document, events } = await boot();
     expect(window.sessionStorage.getItem("reviewTutorSession")).toBe("secret-token");
     expect(window.location.search).toBe("");
     events?.onopen?.();
     expect(document.getElementById("connection")?.textContent).toBe("connected");
+    expect(byId(document, "connection").dataset.state).toBe("connected");
+    events?.onerror?.();
+    expect(byId(document, "connection").dataset.state).toBe("reconnecting");
     expect(document.querySelectorAll(".file")).toHaveLength(2);
     expect(document.querySelectorAll("#files option")).toHaveLength(2);
     expect(document.getElementById("top-source")?.textContent).toBe("Working tree");
@@ -285,6 +300,21 @@ describe("Review Tutor composed page", () => {
     await flush();
     expect(byId(document, "error").textContent).toBe("");
     expect(byId(document, "lifecycle").textContent).toBe("Heartbeat failed.");
+  });
+
+  it("renders non-file diff preamble once without creating a phantom file", async () => {
+    const withPreamble = {
+      ...source,
+      content: "#61 feat(review-tutor): redesign guided review interface\nold mode 100644\nnew mode 100644\n" + source.content,
+    };
+    const { document } = await boot({ source: withPreamble });
+    const preamble = document.querySelector(".diff-preamble");
+    expect(preamble?.textContent).toContain("#61 feat(review-tutor): redesign");
+    expect(preamble?.textContent).toContain("old mode 100644");
+    expect(document.querySelectorAll(".diff-preamble")).toHaveLength(1);
+    expect(document.querySelectorAll(".file")).toHaveLength(2);
+    expect(document.querySelectorAll("#files option")).toHaveLength(2);
+    expect(byId(document, "totals").textContent).toBe("+2 −1");
   });
 
   it("omits fabricated coordinates for mixed old/new selection and reports count", async () => {

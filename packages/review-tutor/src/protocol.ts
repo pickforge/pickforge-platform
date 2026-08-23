@@ -54,6 +54,7 @@ export interface Selection {
 export interface AskRequest {
   protocol: "rt/1";
   inputId: string;
+  ownerPageId?: string;
   selection: Selection;
   question: string;
   modelId: string;
@@ -66,6 +67,7 @@ export type QuestionState = "queued" | "running" | "answered" | "failed" | "canc
 export interface TypedError { code: string; message: string }
 export interface QuestionView {
   id: string;
+  ownerPageId?: string;
   state: QuestionState;
   answer: string;
   createdAt: string;
@@ -155,9 +157,10 @@ export function validateSourceRequest(value: unknown): SourceRequest {
 
 export function validateAskRequest(value: unknown): AskRequest {
   const request = object(value, "ask request");
-  closed(request, ["protocol", "inputId", "selection", "question", "modelId", "thinkingLevel", "preferences", "mode"], "ask request");
+  closed(request, ["protocol", "inputId", "ownerPageId", "selection", "question", "modelId", "thinkingLevel", "preferences", "mode"], "ask request");
   protocol(request.protocol);
   boundedString(request.inputId, "input id", 128);
+  if (request.ownerPageId !== undefined) boundedString(request.ownerPageId, "owner page id", 64);
   boundedString(request.question, "question", LIMITS.question);
   boundedString(request.modelId, "model id", 256);
   boundedString(request.thinkingLevel, "thinking level", 32);

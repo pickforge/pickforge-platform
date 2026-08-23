@@ -73,6 +73,7 @@ async function boot(options: {
   entries?: unknown[];
   logResponses?: Array<Promise<Response> | Response | unknown[]>;
   source?: typeof source;
+  storedPageId?: string;
   storedQuizIds?: string;
   stateResponses?: unknown[];
   failHeartbeat?: boolean;
@@ -81,6 +82,7 @@ async function boot(options: {
   FakeEventSource.instances = [];
   const window = new Window({ url: "http://127.0.0.1:43123/?session=secret-token" });
   Object.defineProperty(window, "innerWidth", { value: options.width ?? 1440, writable: true, configurable: true });
+  if (options.storedPageId !== undefined) window.sessionStorage.setItem("reviewTutorPageId", options.storedPageId);
   if (options.storedQuizIds !== undefined) window.sessionStorage.setItem("reviewTutorQuizEntryIds", options.storedQuizIds);
   if (options.railCollapsed) window.sessionStorage.setItem("reviewTutorRailCollapsed", "1");
   const script = pageHtml.match(/<script>([\s\S]*?)<\/script>/)?.[1];
@@ -108,17 +110,33 @@ async function boot(options: {
     if (path.includes("/cancel")) return options.cancelResponse ?? json({ id: "q-1", state: "cancelled", answer: "partial" });
     return json({});
   });
+  let nextFrameId = 1;
+  const pendingFrames = new Map<number, FrameRequestCallback>();
+  const frames = {
+    flush() {
+      const callbacks = [...pendingFrames.values()];
+      pendingFrames.clear();
+      callbacks.forEach((callback) => callback(0));
+    },
+    get pending() { return pendingFrames.size; },
+  };
   Object.assign(window, {
     fetch,
     EventSource: FakeEventSource,
     Response,
     URL,
+    requestAnimationFrame: (callback: FrameRequestCallback) => {
+      const id = nextFrameId++;
+      pendingFrames.set(id, callback);
+      return id;
+    },
+    cancelAnimationFrame: (id: number) => pendingFrames.delete(id),
   });
   window.setInterval = vi.fn(() => 1) as never;
   window.HTMLElement.prototype.scrollIntoView = vi.fn();
   window.eval(script);
   await flush();
-  return { window, document: window.document, requests, events: FakeEventSource.instances[0] };
+  return { window, document: window.document, requests, events: FakeEventSource.instances[0], frames };
 }
 
 type TestDocument = InstanceType<typeof Window>["document"];
@@ -516,6 +534,8 @@ describe("Review Tutor composed page", () => {
     await flush();
     const payload = JSON.parse(requests.find((request) => request.path === "/api/ask")?.init?.body as string);
     expect(payload.selection).toMatchObject({ file: "src/a.ts", startLine: 1, endLine: 2, text: "const newValue = 2;\ncontext();" });
+    expect(payload.ownerPageId).toBe(window.sessionStorage.getItem("reviewTutorPageId"));
+    expect(payload.ownerPageId).toHaveLength(36);
     expect(payload).not.toHaveProperty("harness");
     expect(ask.getAttribute("aria-busy")).toBe("false");
     expect(ask.textContent).toBe("Queued");
@@ -849,14 +869,88 @@ describe("Review Tutor composed page", () => {
     expect(document.activeElement).toBe(first);
   });
 
+  it("recovers its owned question after reload with the persisted page id", async () => {
+    const { document, events, window } = await boot({ storedPageId: "same-page" });
+    events?.emit("state", { input: source, questions: [{ id: "q-own", ownerPageId: "same-page", state: "running", answer: "Owned answer" }] });
+    expect(window.sessionStorage.getItem("reviewTutorPageId")).toBe("same-page");
+    expect(byId(document, "question-state").textContent).toBe("running");
+    expect(byId(document, "answer-text").textContent).toBe("Owned answer");
+  });
+
+  it("does not adopt another tab's question but keeps Ask disabled while it runs", async () => {
+    const { document, events } = await boot({ storedPageId: "second-page" });
+    input(document, "question", "Can I ask?");
+    expect(byId(document, "ask").disabled).toBe(false);
+    events?.emit("state", { input: source, questions: [{ id: "q-foreign", ownerPageId: "first-page", state: "running", answer: "Foreign answer" }] });
+    expect(byId(document, "question-state").textContent).toBe("");
+    expect(byId(document, "answer-text").textContent).toBe("");
+    expect(byId(document, "ask").disabled).toBe(true);
+    expect(byId(document, "ask-helper").textContent).toBe("Another tab is asking. Wait for it to finish.");
+    expect(byId(document, "mobile-ask").textContent).toBe("Ask the tutor");
+    expect(byId(document, "cancel").disabled).toBe(true);
+    events?.emit("question", { id: "q-foreign", ownerPageId: "first-page", state: "answered", answer: "Foreign answer" });
+    expect(byId(document, "ask").disabled).toBe(false);
+  });
+
+  it("keeps Ask disabled until every foreign active question finishes", async () => {
+    const { document, events } = await boot({ storedPageId: "third-page" });
+    input(document, "question", "Can I ask now?");
+    events?.emit("state", {
+      input: source,
+      questions: [
+        { id: "q-foreign-1", ownerPageId: "first-page", state: "queued", answer: "" },
+        { id: "q-foreign-2", ownerPageId: "second-page", state: "running", answer: "" },
+      ],
+    });
+    expect(byId(document, "ask").disabled).toBe(true);
+    events?.emit("question", { id: "q-foreign-1", ownerPageId: "first-page", state: "answered", answer: "Done" });
+    expect(byId(document, "ask").disabled).toBe(true);
+    events?.emit("question", { id: "q-foreign-2", ownerPageId: "second-page", state: "failed", answer: "" });
+    expect(byId(document, "ask").disabled).toBe(false);
+  });
+
+  it("keeps foreign activity out of composer reset and saved-answer ownership", async () => {
+    const entry = {
+      id: "entry-foreign", inputId: source.id, source,
+      selection: { file: "src/a.ts", startLine: 1, endLine: 2, text: "const newValue = 2;\ncontext();", context: "" },
+      question: "Saved question", answer: "Saved answer", modelId: "model-1", preferences: {}, note: "", reviewLater: false,
+      createdAt: "2026-08-21T10:00:00.000Z",
+    };
+    const { window, document, events } = await boot({ storedPageId: "second-page", entries: [entry] });
+    const otherRow = selectableRows(document).find((row: any) => row.dataset.file === "1") as any;
+    otherRow.querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+    otherRow.querySelector(".line-action").click();
+    input(document, "question", "Draft for another range");
+
+    events?.emit("state", { input: source, questions: [{ id: "q-foreign", ownerPageId: "first-page", state: "running", answer: "Foreign answer" }] });
+    const firstRow = selectableRows(document).find((row: any) => row.dataset.file === "0") as any;
+    firstRow.querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+    firstRow.querySelector(".line-action").click();
+    expect(byId(document, "question").value).toBe("");
+
+    const badge = document.querySelector(".tutored-badge") as any;
+    badge.click();
+    expect(byId(document, "question").value).toBe("Saved question");
+    expect(byId(document, "answer-text").textContent).toBe("Saved answer");
+    expect(byId(document, "error").textContent).toBe("");
+  });
+
+  it("adopts a legacy question without page ownership", async () => {
+    const { document, events } = await boot({ storedPageId: "new-page" });
+    events?.emit("state", { input: source, questions: [{ id: "q-legacy", state: "running", answer: "Legacy answer" }] });
+    expect(byId(document, "question-state").textContent).toBe("running");
+    expect(byId(document, "answer-text").textContent).toBe("Legacy answer");
+  });
+
   it("renders streamed tutor Markdown as safe semantic content", async () => {
-    const { document, events } = await boot();
+    const { document, events, frames } = await boot();
     expect(byId(document, "answer").hidden).toBe(true);
     events?.emit("state", { input: source, questions: [{ id: "q-md", state: "running", answer: "## What it" }] });
     events?.emit("answer_delta", {
       id: "q-md",
       text: " means\n\n`HUMAN_LANGUAGES` contains **ten** names.\n\n```js\nfill(language, HUMAN_LANGUAGES);\n```\n\n- English\n- Portuguese\n\n[Docs](https://example.com/docs) <img src=x onerror=alert(1)>",
     });
+    frames.flush();
 
     const answer = byId(document, "answer-text");
     expect(byId(document, "answer").hidden).toBe(false);
@@ -886,16 +980,43 @@ describe("Review Tutor composed page", () => {
     expect(document.querySelector(".log-answer code")?.textContent).toBe("const");
   });
 
+  it("coalesces a large stream by frame and synchronously renders the exact terminal answer", async () => {
+    const { document, events, frames } = await boot();
+    events?.emit("state", { input: source, questions: [{ id: "q-stream", state: "running", answer: "" }] });
+    const answer = byId(document, "answer-text");
+    const renders = vi.spyOn(answer, "replaceChildren");
+    let canonical = "";
+    for (let frame = 0; frame < 3; frame++) {
+      for (let index = 0; index < 100; index++) {
+        const delta = String((frame * 100 + index) % 10);
+        canonical += delta;
+        events?.emit("answer_delta", { id: "q-stream", text: delta });
+      }
+      expect(frames.pending).toBe(1);
+      frames.flush();
+    }
+    canonical += " final";
+    events?.emit("answer_delta", { id: "q-stream", text: " final" });
+    expect(frames.pending).toBe(1);
+    events?.emit("question", { id: "q-stream", state: "answered", answer: canonical });
+    expect(frames.pending).toBe(0);
+    expect(renders).toHaveBeenCalledTimes(4);
+    expect(answer.textContent).toBe(canonical);
+    frames.flush();
+    expect(renders).toHaveBeenCalledTimes(4);
+  });
+
   it("buffers pre-response question events when state reconciliation fails", async () => {
     let resolveAsk!: (response: Response) => void;
     const pending = new Promise<Response>((resolve) => { resolveAsk = resolve; });
-    const { document, events } = await boot({ askResponse: pending, stateResponses: [state, new Error("state unavailable")] });
+    const { document, events, frames } = await boot({ askResponse: pending, stateResponses: [state, new Error("state unavailable")] });
     input(document, "question", "Race");
     byId(document, "ask").click();
     events?.emit("question", { id: "q-early", state: "running", answer: "early " });
     for (let index = 0; index < 300; index++) events?.emit("answer_delta", { id: "q-early", text: "x" });
     resolveAsk(json({ id: "q-early", state: "queued", answer: "" }));
     await flush();
+    frames.flush();
     expect(byId(document, "question-state").textContent).toBe("running");
     expect(byId(document, "answer-text").textContent).toBe("early " + "x".repeat(300));
     expect(byId(document, "error").textContent).toContain("state unavailable");
@@ -914,7 +1035,7 @@ describe("Review Tutor composed page", () => {
 
   it("reconciles a pre-response ask race to canonical running answer and keeps later deltas", async () => {
     const canonical = { id: "q-race", state: "running", answer: "canonical " };
-    const { document, events } = await boot({
+    const { document, events, frames } = await boot({
       askResponse: json({ id: "q-race", state: "queued", answer: "" }),
       stateResponses: [state, { ...state, questions: [canonical] }],
     });
@@ -923,6 +1044,7 @@ describe("Review Tutor composed page", () => {
     await flush();
     expect(byId(document, "answer-text").textContent).toBe("canonical ");
     events?.emit("answer_delta", { id: "q-race", text: "continued" });
+    frames.flush();
     expect(byId(document, "answer-text").textContent).toBe("canonical continued");
     expect(byId(document, "lifecycle").textContent).toBe("Tutor is answering.");
   });

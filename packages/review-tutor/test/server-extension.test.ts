@@ -142,10 +142,11 @@ async function loadSource(port: number, token: string) {
   return response.json() as Promise<{ id: string; content: string }>;
 }
 
-function askBody(inputId: string): AskRequest {
+function askBody(inputId: string, ownerPageId?: string): AskRequest {
   return {
     protocol: "rt/1",
     inputId,
+    ...(ownerPageId ? { ownerPageId } : {}),
     selection: { text: "selected" },
     question: "Why?",
     modelId: "provider/model",
@@ -274,6 +275,26 @@ describe("local server security", () => {
 });
 
 describe("local server question lifecycle", () => {
+  it("stores and echoes question page ownership", async () => {
+    const { server } = await start();
+    try {
+      const loaded = await loadSource(server.port, server.token);
+      const response = await call(server.port, server.token, "/api/ask", {
+        method: "POST",
+        body: JSON.stringify(askBody(loaded.id, "page-1")),
+      });
+      expect(response.status).toBe(202);
+      const question = await response.json() as { id: string; ownerPageId?: string };
+      expect(question.ownerPageId).toBe("page-1");
+      const snapshot = await (await call(server.port, server.token, "/api/state")).json() as {
+        questions: Array<{ id: string; ownerPageId?: string }>;
+      };
+      expect(snapshot.questions.find((item) => item.id === question.id)?.ownerPageId).toBe("page-1");
+    } finally {
+      await server.close();
+    }
+  });
+
   it("uses a queued question's accepted snapshot after another source loads", async () => {
     const { server, runner } = await start();
     try {

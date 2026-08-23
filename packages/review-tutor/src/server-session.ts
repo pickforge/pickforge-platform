@@ -218,7 +218,13 @@ export class ReviewTutorSession {
       error: "model selection failed: expected an available model and thinking level; refresh state and retry" } };
     if (this.queue.length >= LIMITS.queue) return { status: 429, value: {
       error: `question queue failed: expected depth at most ${LIMITS.queue}, received ${this.queue.length + 1}; wait for a question to finish` } };
-    const view: QuestionView = { id: randomUUID(), state: "queued", answer: "", createdAt: new Date().toISOString() };
+    const view: QuestionView = {
+      id: randomUUID(),
+      ...(ask.ownerPageId !== undefined ? { ownerPageId: ask.ownerPageId } : {}),
+      state: "queued",
+      answer: "",
+      createdAt: new Date().toISOString(),
+    };
     this.questions.set(view.id, view);
     this.requests.set(view.id, ask);
     this.queue.push(view.id);

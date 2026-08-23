@@ -61,11 +61,17 @@ async function flush() {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+function logResponse(value: Promise<Response> | Response | unknown[] | undefined, fallback: unknown[]) {
+  if (value instanceof Promise || value instanceof Response) return value;
+  return json(value ?? fallback);
+}
+
 async function boot(options: {
   width?: number;
   askResponse?: Promise<Response> | Response;
   cancelResponse?: Promise<Response> | Response;
   entries?: unknown[];
+  logResponses?: Array<Promise<Response> | Response | unknown[]>;
   source?: typeof source;
   storedQuizIds?: string;
   stateResponses?: unknown[];
@@ -86,6 +92,7 @@ async function boot(options: {
 
   const requests: Array<{ path: string; init?: RequestInit }> = [];
   const stateResponses = [...(options.stateResponses ?? [])];
+  const logResponses = [...(options.logResponses ?? [])];
   const bootState = { ...state, input: options.source ?? source };
   const fetch = vi.fn(async (path: string, init?: RequestInit) => {
     requests.push({ path, init });
@@ -94,7 +101,7 @@ async function boot(options: {
       if (response instanceof Error) throw response;
       return json(response);
     }
-    if (path === "/api/log?limit=100") return json(options.entries ?? []);
+    if (path === "/api/log?limit=100") return logResponse(logResponses.shift(), options.entries ?? []);
     if (path === "/api/heartbeat" && options.failHeartbeat) return Promise.reject(new Error("heartbeat down"));
     if (path === "/api/ask") return options.askResponse ?? json({ id: "q-1", state: "queued", answer: "", createdAt: new Date().toISOString() });
     if (path.startsWith("/api/log/")) return json({});
@@ -122,6 +129,16 @@ function byId(document: TestDocument, id: string): any {
   return node;
 }
 
+function selectableRows(document: TestDocument) {
+  return Array.from(document.querySelectorAll(".diff-row[data-row]")) as any[];
+}
+
+function lineControl(row: any) {
+  const control = row.querySelector(".line-select");
+  if (!control) throw new Error("Missing selectable line control");
+  return control;
+}
+
 function input(document: TestDocument, id: string, value: string) {
   const node = byId(document, id);
   node.value = value;
@@ -143,6 +160,12 @@ describe("Review Tutor composed page", () => {
     expect(pageHtml).toContain(".toolbar select {\nwidth:auto;flex:1 1 120px;min-width:120px;max-width:280px}");
     expect(pageHtml).toContain(".rail {\nmin-height:0;overflow-y:auto;");
     expect(pageHtml).toContain('role="region" aria-labelledby="tutor-title"');
+    expect(pageHtml).toContain(".diff-pane>.tutor.open");
+    expect(pageHtml).toContain("max-height:100%;overflow:auto");
+    expect(pageHtml).toContain(".source-setup {\nmin-height:0;max-height:100%;overflow:auto");
+    expect(pageHtml).toContain("--muted:#8b8b93");
+    expect(pageHtml).toContain('id="open-config" class="ghost open-config" aria-haspopup="dialog" aria-controls="config-dialog"');
+    expect(pageHtml).toContain('<aside id="config-dialog" class="rail"');
   });
 
   it("wraps long diff lines instead of creating a horizontal scroll track", () => {
@@ -263,19 +286,19 @@ describe("Review Tutor composed page", () => {
 
   it("selects a clicked line while keeping the composer closed and docked", async () => {
     const { window, document } = await boot();
-    const rows = Array.from(document.querySelectorAll('.diff-row[role="button"]')) as any[];
+    const rows = selectableRows(document);
     const tutor = byId(document, "tutor");
-    rows[1].querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
-    expect(rows[1].getAttribute("aria-pressed")).toBe("true");
+    lineControl(rows[1]).dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+    expect(lineControl(rows[1]).getAttribute("aria-pressed")).toBe("true");
     expect(tutor.classList.contains("open")).toBe(false);
     expect(tutor.parentElement).toBe(byId(document, "diff-pane"));
     expect(tutor.nextElementSibling).toBe(byId(document, "diff-scroll"));
-    expect(document.activeElement).toBe(rows[1]);
+    expect(document.activeElement).toBe(lineControl(rows[1]));
   });
 
   it("preserves the composer's actual open state across responsive normalization", async () => {
     const { window, document } = await boot();
-    const row = document.querySelector('.diff-row[role="button"]') as any;
+    const row = selectableRows(document)[0];
     const tutor = byId(document, "tutor");
     row.querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
     window.innerWidth = 800;
@@ -299,7 +322,7 @@ describe("Review Tutor composed page", () => {
 
   it("keeps question focus and caret through a desktop-only resize", async () => {
     const { window, document } = await boot();
-    const row = document.querySelector('.diff-row[role="button"]') as any;
+    const row = selectableRows(document)[0];
     row.querySelector(".line-action").click();
     const question = byId(document, "question");
     input(document, "question", "Half-written question");
@@ -313,20 +336,20 @@ describe("Review Tutor composed page", () => {
 
   it("extends a gutter range before any composer insertion", async () => {
     const { window, document } = await boot();
-    const rows = Array.from(document.querySelectorAll('.diff-row[role="button"]')) as any[];
+    const rows = selectableRows(document);
     const tutor = byId(document, "tutor");
     rows[1].querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
     rows[2].querySelector(".marker").dispatchEvent(new window.MouseEvent("pointerdown", { bubbles: true, shiftKey: true }));
     expect(byId(document, "selection-summary").textContent).toBe("src/a.ts · lines 1-2");
-    expect(document.querySelectorAll('.diff-row[aria-pressed="true"]')).toHaveLength(2);
+    expect(document.querySelectorAll('.line-select[aria-pressed="true"]')).toHaveLength(2);
     expect(tutor.classList.contains("open")).toBe(false);
     expect(tutor.nextElementSibling).toBe(byId(document, "diff-scroll"));
   });
 
   it("creates real line actions that preserve a selected range and open after its end", async () => {
     const { window, document } = await boot();
-    const rows = Array.from(document.querySelectorAll('.diff-row[role="button"]')) as any[];
-    rows[1].querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+    const rows = selectableRows(document);
+    lineControl(rows[1]).dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
     rows[2].querySelector(".marker").dispatchEvent(new window.MouseEvent("pointerdown", { bubbles: true, shiftKey: true }));
     const actions = Array.from(document.querySelectorAll(".line-action")) as any[];
     expect(actions).toHaveLength(rows.length);
@@ -377,7 +400,7 @@ describe("Review Tutor composed page", () => {
     expect(byId(document, "history-position").textContent).toBe("2 of 2");
 
     byId(document, "close-tutor").click();
-    const otherRow = Array.from(document.querySelectorAll('.diff-row[role="button"]')).find((row: any) => row.dataset.file === "1") as any;
+    const otherRow = selectableRows(document).find((row: any) => row.dataset.file === "1") as any;
     otherRow.querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
     otherRow.querySelector(".line-action").click();
     expect(byId(document, "question").value).toBe("");
@@ -442,16 +465,38 @@ describe("Review Tutor composed page", () => {
     expect(byId(document, "question-state").hidden).toBe(true);
   });
 
+  it("matches saved additions without rescanning a colliding large deletion hunk", async () => {
+    const count = 2000;
+    const content = [
+      "diff --git a/large.ts b/large.ts",
+      "--- a/large.ts",
+      "+++ b/large.ts",
+      "@@ -1," + count + " +1," + count + " @@",
+      ...Array.from({ length: count }, (_, index) => "-old " + index),
+      ...Array.from({ length: count }, (_, index) => "+new " + index),
+    ].join("\n");
+    const largeSource = { ...source, label: "Large", digest: "large", content };
+    const entry = {
+      id: "large-entry", inputId: "older", source: { kind: source.kind, label: "Large", digest: "large" },
+      selection: { file: "large.ts", startLine: 1, endLine: 1, text: "new 0", context: "" },
+      question: "Explain", answer: "Answer", modelId: "model-1", preferences: {}, note: "", reviewLater: false,
+      createdAt: new Date().toISOString(),
+    };
+    const entries = Array.from({ length: 20 }, (_, index) => ({ ...entry, id: "large-" + index }));
+    const { document } = await boot({ source: largeSource, entries });
+    expect(document.querySelector(".tutored-badge")?.textContent).toBe("20");
+  });
+
   it("submits contiguous selection and applies a synchronous duplicate Ask lock", async () => {
     let resolveAsk!: (response: Response) => void;
     const pending = new Promise<Response>((resolve) => { resolveAsk = resolve; });
     const { window, document, requests } = await boot({ askResponse: pending });
-    const rows = Array.from(document.querySelectorAll('.diff-row[role="button"]')) as any[];
-    const reachable = rows.find((row) => row.tabIndex === 0);
+    const rows = selectableRows(document);
+    const reachable = lineControl(rows.find((row) => lineControl(row).tabIndex === 0));
     reachable.focus();
     reachable.dispatchEvent(new window.KeyboardEvent("keydown", { key: " ", bubbles: true }));
     reachable.dispatchEvent(new window.KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
-    const addition = rows.find((row) => row.tabIndex === 0);
+    const addition = lineControl(rows.find((row) => lineControl(row).tabIndex === 0));
     addition.dispatchEvent(new window.KeyboardEvent("keydown", { key: " ", bubbles: true }));
     addition.dispatchEvent(new window.KeyboardEvent("keydown", { key: "ArrowDown", shiftKey: true, bubbles: true }));
     input(document, "question", "Explain this");
@@ -475,28 +520,28 @@ describe("Review Tutor composed page", () => {
   it("keeps Space and Shift+Arrow selection-only, then opens and focuses on Enter", async () => {
     const { window, document } = await boot();
     expect(document.querySelector('[role="group"]')?.getAttribute("aria-label")).toContain("selectable lines");
-    const rows = Array.from(document.querySelectorAll('.diff-row[role="button"]')) as any[];
+    const rows = selectableRows(document);
     const tutor = byId(document, "tutor");
-    expect(rows.filter((row) => row.tabIndex === 0)).toHaveLength(1);
-    const reachable = rows.find((row) => row.tabIndex === 0);
+    expect(rows.filter((row) => lineControl(row).tabIndex === 0)).toHaveLength(1);
+    const reachable = lineControl(rows.find((row) => lineControl(row).tabIndex === 0));
     reachable.focus();
     reachable.dispatchEvent(new window.KeyboardEvent("keydown", { key: " ", bubbles: true }));
     expect(reachable.getAttribute("aria-pressed")).toBe("true");
     expect(tutor.classList.contains("open")).toBe(false);
     reachable.dispatchEvent(new window.KeyboardEvent("keydown", { key: "ArrowDown", shiftKey: true, bubbles: true }));
-    expect(rows.filter((row) => row.tabIndex === 0)).toHaveLength(1);
+    expect(rows.filter((row) => lineControl(row).tabIndex === 0)).toHaveLength(1);
     expect(tutor.classList.contains("open")).toBe(false);
-    const rangeEnd = rows.find((row) => row.tabIndex === 0);
+    const rangeEnd = lineControl(rows.find((row) => lineControl(row).tabIndex === 0));
     rangeEnd.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
     expect(tutor.classList.contains("open")).toBe(true);
-    expect(tutor.previousElementSibling).toBe(rangeEnd);
+    expect(tutor.previousElementSibling).toBe(rangeEnd.closest(".diff-row"));
     expect(document.activeElement).toBe(byId(document, "question"));
     const clear = byId(document, "clear-selection");
     clear.focus();
     clear.click();
-    expect(rows.filter((row) => row.getAttribute("aria-pressed") === "true")).toHaveLength(0);
+    expect(rows.filter((row) => lineControl(row).getAttribute("aria-pressed") === "true")).toHaveLength(0);
     expect(byId(document, "selection-summary").textContent).toBe("No code selected");
-    expect(document.activeElement?.classList.contains("diff-row")).toBe(true);
+    expect(document.activeElement?.classList.contains("line-select")).toBe(true);
     const disclosure = document.querySelector(".file-head button") as any;
     disclosure.click();
     expect(disclosure.getAttribute("aria-expanded")).toBe("false");
@@ -505,7 +550,7 @@ describe("Review Tutor composed page", () => {
 
   it("re-docks an open composer for gutter adjustment without clearing its draft", async () => {
     const { window, document } = await boot();
-    const rows = Array.from(document.querySelectorAll('.diff-row[role="button"]')) as any[];
+    const rows = selectableRows(document);
     rows[1].querySelector(".line-action").click();
     input(document, "question", "Keep this draft");
     rows[2].querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
@@ -513,12 +558,12 @@ describe("Review Tutor composed page", () => {
     expect(tutor.classList.contains("open")).toBe(false);
     expect(tutor.nextElementSibling).toBe(byId(document, "diff-scroll"));
     expect(byId(document, "question").value).toBe("Keep this draft");
-    expect(rows[2].getAttribute("aria-pressed")).toBe("true");
+    expect(lineControl(rows[2]).getAttribute("aria-pressed")).toBe("true");
   });
 
   it("scrolls the stable composer nearest only when opening at a changed anchor", async () => {
     const { document } = await boot();
-    const rows = Array.from(document.querySelectorAll('.diff-row[role="button"]')) as any[];
+    const rows = selectableRows(document);
     const tutor = byId(document, "tutor");
     rows[1].querySelector(".line-action").click();
     expect(tutor.scrollIntoView).toHaveBeenCalledTimes(1);
@@ -532,13 +577,13 @@ describe("Review Tutor composed page", () => {
 
   it("leaves app selection and native code pointer behavior untouched", async () => {
     const { window, document } = await boot();
-    const rows = Array.from(document.querySelectorAll('.diff-row[role="button"]')) as any[];
+    const rows = selectableRows(document);
     rows[1].querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
     const summary = byId(document, "selection-summary").textContent;
     rows[2].querySelector(".code").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
     expect(byId(document, "selection-summary").textContent).toBe(summary);
-    expect(rows[1].getAttribute("aria-pressed")).toBe("true");
-    expect(rows[2].getAttribute("aria-pressed")).toBe("false");
+    expect(lineControl(rows[1]).getAttribute("aria-pressed")).toBe("true");
+    expect(lineControl(rows[2]).getAttribute("aria-pressed")).toBe("false");
     const codeDown = new window.MouseEvent("mousedown", { bubbles: true, cancelable: true });
     rows[2].querySelector(".code").dispatchEvent(codeDown);
     expect(codeDown.defaultPrevented).toBe(false);
@@ -547,15 +592,35 @@ describe("Review Tutor composed page", () => {
     expect(gutterDown.defaultPrevented).toBe(true);
   });
 
+  it("keeps code readable while exposing line selection and saved history as sibling controls", async () => {
+    const entry = {
+      id: "entry-accessible", inputId: source.id, source,
+      selection: { file: "src/a.ts", startLine: 1, endLine: 1, text: "const newValue = 2;", context: "" },
+      question: "Saved", answer: "Answer", modelId: "model-1", preferences: {}, note: "", reviewLater: false,
+      createdAt: new Date().toISOString(),
+    };
+    const { document } = await boot({ entries: [entry] });
+    const row = selectableRows(document)[1];
+    const control = lineControl(row);
+    const badge = row.querySelector(".tutored-badge");
+    expect(row.hasAttribute("role")).toBe(false);
+    expect(row.textContent).toContain("const newValue = 2;");
+    expect(control.tagName).toBe("BUTTON");
+    expect(control.getAttribute("aria-label")).toContain("src/a.ts line 1");
+    expect(control.getAttribute("aria-pressed")).toBe("false");
+    expect(badge?.parentElement).toBe(row);
+    expect(control.contains(badge)).toBe(false);
+  });
+
   it("keeps touch selection gated behind the Select lines toggle with whole-row targets", async () => {
     const { window, document } = await boot({ width: 390 });
-    const rows = Array.from(document.querySelectorAll('.diff-row[role="button"]')) as any[];
+    const rows = selectableRows(document);
     const touchDown = () => new window.PointerEvent("pointerdown", { bubbles: true, pointerType: "touch" });
     rows[0].dispatchEvent(touchDown());
     expect(byId(document, "selection-summary").textContent).toBe("No code selected");
     byId(document, "select-lines").click();
     rows[1].querySelector(".code").dispatchEvent(touchDown());
-    expect(rows[1].getAttribute("aria-pressed")).toBe("true");
+    expect(lineControl(rows[1]).getAttribute("aria-pressed")).toBe("true");
     rows[2].querySelector(".code").dispatchEvent(touchDown());
     expect(byId(document, "selection-summary").textContent).toBe("src/a.ts · lines 1-2");
     expect(byId(document, "tutor").classList.contains("open")).toBe(true);
@@ -660,8 +725,24 @@ describe("Review Tutor composed page", () => {
     expect(parsed.document.querySelector(".addition .code")?.textContent).toBe("++i");
     expect(parsed.document.querySelector(".context .line-no")?.lastChild?.textContent).toBe("8");
     const plain = await boot({ source: { ...source, label: "paste.ts", content: "@@decorator\n++value;\n--value;" } });
-    expect(plain.document.querySelectorAll(".file.plain .diff-row[role=button]")).toHaveLength(3);
+    expect(plain.document.querySelectorAll(".file.plain .line-select")).toHaveLength(3);
     expect(plain.document.querySelectorAll(".file.plain .line-no")).toHaveLength(3);
+  });
+
+  it("restores a saved range across a no-newline marker", async () => {
+    const marked = {
+      ...source,
+      digest: "marked",
+      content: "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1,2 +1,2 @@\n-old\n+new\n\\ No newline at end of file\n context",
+    };
+    const entry = {
+      id: "entry-marked", inputId: "older", source: { kind: source.kind, label: source.label, digest: "marked" },
+      selection: { file: "a.ts", startLine: 1, endLine: 2, text: "new\ncontext", context: "" },
+      question: "Explain", answer: "Answer", modelId: "model-1", preferences: {}, note: "", reviewLater: false,
+      createdAt: new Date().toISOString(),
+    };
+    const { document } = await boot({ source: marked, entries: [entry] });
+    expect(document.querySelector(".tutored-badge")?.getAttribute("aria-label")).toContain("lines 1–2");
   });
 
   it.each(["{bad", "{}", "42"])("recovers from corrupt quiz storage %s", async (storedQuizIds) => {
@@ -707,10 +788,10 @@ describe("Review Tutor composed page", () => {
 
   it("omits fabricated coordinates for mixed old/new selection and reports count", async () => {
     const { window, document, requests } = await boot();
-    const row = document.querySelector('.diff-row[role="button"][tabindex="0"]') as any;
-    row.focus();
-    row.dispatchEvent(new window.KeyboardEvent("keydown", { key: " ", bubbles: true }));
-    row.dispatchEvent(new window.KeyboardEvent("keydown", { key: "ArrowDown", shiftKey: true, bubbles: true }));
+    const control = document.querySelector('.line-select[tabindex="0"]') as any;
+    control.focus();
+    control.dispatchEvent(new window.KeyboardEvent("keydown", { key: " ", bubbles: true }));
+    control.dispatchEvent(new window.KeyboardEvent("keydown", { key: "ArrowDown", shiftKey: true, bubbles: true }));
     expect(byId(document, "selection-summary").textContent).toBe("src/a.ts · 2 selected lines");
     input(document, "question", "Mixed?");
     byId(document, "ask").click();
@@ -724,21 +805,21 @@ describe("Review Tutor composed page", () => {
   it("refuses UTF-8 oversized selection and preserves the prior valid selection", async () => {
     const huge = { ...source, content: "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1,2 +1,2 @@\n+ok\n+" + "é".repeat(9000) };
     const { window, document } = await boot({ source: huge });
-    const rows = Array.from(document.querySelectorAll('.diff-row[role="button"]')) as any[];
-    rows[0].querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+    const rows = selectableRows(document);
+    lineControl(rows[0]).dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
     expect(byId(document, "selection-preview").textContent).toBe("ok");
     rows[1].querySelector(".line-no").dispatchEvent(new window.MouseEvent("pointerdown", { bubbles: true, shiftKey: true }));
     expect(byId(document, "error").textContent).toContain("16 KiB");
     expect(byId(document, "selection-preview").textContent).toBe("ok");
-    rows[0].querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+    lineControl(rows[0]).dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
     expect(byId(document, "error").textContent).toBe("");
     expect(byId(document, "selection-preview").textContent).toBe("ok");
   });
 
   it("tears down an open mobile dialog on resize and ignores same-source replay", async () => {
     const { window, document, events } = await boot({ width: 390 });
-    const row = document.querySelector('.diff-row[role="button"][tabindex="0"]') as any;
-    row.querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+    const row = document.querySelector('.line-select[tabindex="0"]')?.closest(".diff-row") as any;
+    lineControl(row).dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
     events?.emit("source", source);
     expect(byId(document, "selection-summary").textContent).not.toBe("No code selected");
     byId(document, "mobile-ask").click();
@@ -749,6 +830,18 @@ describe("Review Tutor composed page", () => {
     expect(byId(document, "diff-scroll").hasAttribute("inert")).toBe(false);
     expect(byId(document, "tutor").previousElementSibling).toBe(row);
     expect(document.activeElement).toBe(byId(document, "tutor"));
+  });
+
+  it("keeps mobile answer links inside the dialog tab order", async () => {
+    const { window, document, events } = await boot({ width: 390 });
+    events?.emit("state", { input: source, questions: [{ id: "q-links", state: "running", answer: "[First](https://example.com/1) [Second](https://example.com/2)" }] });
+    byId(document, "mobile-ask").click();
+    const first = byId(document, "answer-text").querySelector("a") as any;
+    first.focus();
+    const tab = new window.KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+    byId(document, "tutor").dispatchEvent(tab);
+    expect(tab.defaultPrevented).toBe(false);
+    expect(document.activeElement).toBe(first);
   });
 
   it("renders streamed tutor Markdown as safe semantic content", async () => {
@@ -773,11 +866,45 @@ describe("Review Tutor composed page", () => {
     expect(answer.textContent).toContain("<img src=x onerror=alert(1)>");
   });
 
+  it("bounds nested blockquotes from persisted untrusted answers", async () => {
+    const entry = { id: "entry-depth", inputId: source.id, source, selection: { text: "" }, question: "Explain", answer: ">".repeat(5000) + " boom", modelId: "model-1", preferences: {}, note: "", reviewLater: false, createdAt: new Date().toISOString() };
+    const { document, events } = await boot({ entries: [entry] });
+    expect(events).toBeDefined();
+    expect(document.querySelectorAll(".log-entry")).toHaveLength(1);
+    expect(document.querySelector(".log-answer")?.textContent).toContain("boom");
+  });
+
   it("renders persisted learning-log answers with the same Markdown semantics", async () => {
     const entry = { id: "entry-md", inputId: source.id, source, selection: { text: "" }, question: "Explain", answer: "### Result\n\nUse `const`.", modelId: "model-1", preferences: {}, note: "", reviewLater: false, createdAt: new Date().toISOString() };
     const { document } = await boot({ entries: [entry] });
     expect(document.querySelector(".log-answer h3")?.textContent).toBe("Result");
     expect(document.querySelector(".log-answer code")?.textContent).toBe("const");
+  });
+
+  it("buffers pre-response question events when state reconciliation fails", async () => {
+    let resolveAsk!: (response: Response) => void;
+    const pending = new Promise<Response>((resolve) => { resolveAsk = resolve; });
+    const { document, events } = await boot({ askResponse: pending, stateResponses: [state, new Error("state unavailable")] });
+    input(document, "question", "Race");
+    byId(document, "ask").click();
+    events?.emit("question", { id: "q-early", state: "running", answer: "early " });
+    events?.emit("answer_delta", { id: "q-early", text: "continued" });
+    resolveAsk(json({ id: "q-early", state: "queued", answer: "" }));
+    await flush();
+    expect(byId(document, "question-state").textContent).toBe("running");
+    expect(byId(document, "answer-text").textContent).toBe("early continued");
+    expect(byId(document, "error").textContent).toContain("state unavailable");
+  });
+
+  it("blocks Ctrl+Enter while an accepted question remains queued", async () => {
+    const { window, document, requests } = await boot();
+    input(document, "question", "Only once");
+    byId(document, "ask").click();
+    await flush();
+    byId(document, "question").dispatchEvent(new window.KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true }));
+    await flush();
+    expect(requests.filter((request) => request.path === "/api/ask")).toHaveLength(1);
+    expect(byId(document, "question-state").textContent).toBe("queued");
   });
 
   it("reconciles a pre-response ask race to canonical running answer and keeps later deltas", async () => {
@@ -834,6 +961,35 @@ describe("Review Tutor composed page", () => {
     expect(byId(document, "ask").textContent).toBe("Queued");
     expect(byId(document, "error").textContent).toContain("State reconciliation failed:");
     expect(byId(document, "error").textContent).toContain("state unavailable");
+  });
+
+  it("keeps the newest concurrent log refresh result", async () => {
+    let resolveOlder!: (response: Response) => void;
+    let resolveNewer!: (response: Response) => void;
+    const older = new Promise<Response>((resolve) => { resolveOlder = resolve; });
+    const newer = new Promise<Response>((resolve) => { resolveNewer = resolve; });
+    const first = { id: "entry-old", inputId: source.id, source, selection: { text: "" }, question: "Older", answer: "A", modelId: "model-1", preferences: {}, note: "", reviewLater: false, createdAt: new Date().toISOString() };
+    const latest = { ...first, id: "entry-new", question: "Newest" };
+    const { document, events } = await boot({ logResponses: [[], older, newer] });
+    events?.emit("log_update", first);
+    events?.emit("log_update", latest);
+    resolveNewer(json([latest]));
+    await flush();
+    resolveOlder(json([first]));
+    await flush();
+    expect(Array.from(document.querySelectorAll(".log-entry h3")).map((node) => node.textContent)).toEqual(["Newest"]);
+  });
+
+  it("shows a failed current question and restores Ask actions", async () => {
+    const { document, events } = await boot();
+    input(document, "question", "Fail");
+    byId(document, "ask").click();
+    await flush();
+    events?.emit("question", { id: "q-1", state: "failed", answer: "", error: { message: "provider stopped" } });
+    expect(byId(document, "error").textContent).toContain("provider stopped");
+    expect(byId(document, "ask").disabled).toBe(false);
+    expect(byId(document, "cancel").disabled).toBe(true);
+    expect(byId(document, "lifecycle").textContent).toBe("Question failed.");
   });
 
   it("rejects an older identical quiz PATCH echo and preserves focused drafts during log updates", async () => {

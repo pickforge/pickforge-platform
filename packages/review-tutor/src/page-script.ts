@@ -83,6 +83,8 @@ export const pageScript = String.raw`
   const noteDrafts = new Map();
   let deferredLogEntries = null;
   let logRevision = 0;
+  let logRefreshSequence = 0;
+  const pendingAskEvents = [];
   const matchSelects = [
     element("match-1"),
     element("match-2"),
@@ -237,7 +239,7 @@ export const pageScript = String.raw`
       /^ {0,3}((\*[ \t]*){3,}|(-[ \t]*){3,}|(_[ \t]*){3,})$/.test(line),
     );
   }
-  function renderMarkdown(container, markdown) {
+  function renderMarkdown(container, markdown, depth = 0) {
     container.replaceChildren();
     const lines = String(markdown || "").replace(/\r\n?/g, "\n").split("\n");
     for (let index = 0; index < lines.length;) {
@@ -281,14 +283,14 @@ export const pageScript = String.raw`
         index++;
         continue;
       }
-      if (/^ {0,3}>[ \t]?/.test(line)) {
+      if (depth < 8 && /^ {0,3}>[ \t]?/.test(line)) {
         const quoted = [];
         while (index < lines.length && /^ {0,3}>[ \t]?/.test(lines[index])) {
           quoted.push(lines[index].replace(/^ {0,3}>[ \t]?/, ""));
           index++;
         }
         const blockquote = document.createElement("blockquote");
-        renderMarkdown(blockquote, quoted.join("\n"));
+        renderMarkdown(blockquote, quoted.join("\n"), depth + 1);
         container.append(blockquote);
         continue;
       }
@@ -454,7 +456,7 @@ export const pageScript = String.raw`
         target.deletions++;
       } else if (line.startsWith(" ")) {
         target.lines.push({ kind: "context", text: line.slice(1), old: oldLine++, new: newLine++, selectLine: newLine - 1, block });
-      } else target.lines.push({ kind: "meta", text: line });
+      } else target.lines.push({ kind: "meta", text: line, block });
     }
     return { preamble: preamble.join("\n").trim(), files: result };
   }
@@ -474,6 +476,9 @@ export const pageScript = String.raw`
   }
   function rowNode(position) {
     return position && document.querySelector('[data-file="' + position.fileIndex + '"][data-row="' + position.rowIndex + '"]');
+  }
+  function rowControl(position) {
+    return rowNode(position)?.querySelector(".line-select") || null;
   }
   function chooseRow(fileIndex, rowIndex, extend, confirm) {
     const file = files[fileIndex], row = file.lines[rowIndex];
@@ -505,7 +510,7 @@ export const pageScript = String.raw`
     activeRow = { fileIndex, rowIndex };
     updateSelection(previousSelection, previousActive);
     if (confirm) {
-      const origin = rowNode(activeRow);
+      const origin = rowControl(activeRow);
       touchSelection = false;
       selectionAnchor = null;
       element("select-lines").setAttribute("aria-pressed", "false");
@@ -521,14 +526,18 @@ export const pageScript = String.raw`
       const [fileIndex, rowIndex] = key.split(":").map(Number), node = rowNode({ fileIndex, rowIndex });
       if (!node) continue;
       const selected = !!selection && fileIndex === selection.fileIndex && rowIndex >= selection.start && rowIndex <= selection.end;
-      node.setAttribute("aria-pressed", String(selected));
+      node.classList.toggle("selected", selected);
+      rowControl({ fileIndex, rowIndex })?.setAttribute("aria-pressed", String(selected));
     }
-    const oldActiveNode = rowNode(previousActive), activeNode = rowNode(activeRow);
-    if (oldActiveNode && oldActiveNode !== activeNode) oldActiveNode.tabIndex = -1;
-    if (activeNode) activeNode.tabIndex = 0;
+    const oldActiveControl = rowControl(previousActive), activeControl = rowControl(activeRow);
+    if (oldActiveControl && oldActiveControl !== activeControl) oldActiveControl.tabIndex = -1;
+    if (activeControl) activeControl.tabIndex = 0;
     if (!activeRow) {
       const first = document.querySelector('.diff-row[data-row]');
-      if (first) { first.tabIndex = 0; activeRow = { fileIndex: Number(first.dataset.file), rowIndex: Number(first.dataset.row) }; }
+      if (first) {
+        activeRow = { fileIndex: Number(first.dataset.file), rowIndex: Number(first.dataset.row) };
+        rowControl(activeRow).tabIndex = 0;
+      }
     }
     if (!selection) {
       element("selection-summary").textContent = "No code selected";
@@ -620,9 +629,14 @@ export const pageScript = String.raw`
     for (let start = 0; start < file.lines.length; start++) {
       const first = file.lines[start];
       if (!rowSelectable(first) || first.selectLine !== entry.selection.startLine) continue;
+      const chosen = [];
+      let candidateText = "";
       for (let end = start; end < file.lines.length && file.lines[end].block === first.block; end++) {
-        const chosen = file.lines.slice(start, end + 1).filter(rowSelectable);
-        if (!chosen.length || chosen.map((item) => item.text).join("\n") !== expectedText) continue;
+        if (!rowSelectable(file.lines[end])) continue;
+        chosen.push(file.lines[end]);
+        candidateText = candidateText ? candidateText + "\n" + file.lines[end].text : file.lines[end].text;
+        if (candidateText.length > expectedText.length) break;
+        if (candidateText !== expectedText) continue;
         const commonNew = chosen.every((item) => item.new != null);
         const commonOld = chosen.every((item) => item.old != null);
         const side = commonNew ? "new" : commonOld ? "old" : null;
@@ -734,7 +748,7 @@ export const pageScript = String.raw`
         return;
       case "Enter": {
         if (!selectionContains(fileIndex, rowIndex)) chooseRow(fileIndex, rowIndex, false, false);
-        const origin = rowNode({ fileIndex, rowIndex });
+        const origin = rowControl({ fileIndex, rowIndex });
         openTutor(origin);
         element("question").focus();
         event.preventDefault();
@@ -755,11 +769,11 @@ export const pageScript = String.raw`
     hideInlineComposer();
     chooseRow(fileIndex, target, event.shiftKey, false);
     event.preventDefault();
-    const next = rowNode({ fileIndex, rowIndex: target });
+    const next = rowControl({ fileIndex, rowIndex: target });
     if (next) next.focus();
   }
   function renderDiff() {
-    if (element("tutor").parentElement !== element("diff-pane")) element("diff-scroll").before(element("tutor"));
+    anchorComposer();
     const container = element("diff");
     container.replaceChildren();
     if (preambleText) {
@@ -813,15 +827,17 @@ export const pageScript = String.raw`
         }
         row.dataset.file = String(fileIndex);
         row.dataset.row = String(rowIndex);
-        row.setAttribute("role", "button");
-        row.setAttribute("aria-pressed", "false");
-        row.setAttribute("aria-label", file.path + " line " + data.selectLine);
-        row.tabIndex = activeRow
+        const firstLineNumber = document.createElement("button");
+        firstLineNumber.type = "button";
+        firstLineNumber.className = "line-no line-select";
+        firstLineNumber.textContent = data.old == null ? "" : String(data.old);
+        firstLineNumber.setAttribute("aria-pressed", "false");
+        firstLineNumber.setAttribute("aria-label", file.path + " line " + data.selectLine);
+        firstLineNumber.tabIndex = activeRow
           ? -1
           : fileIndex === 0 && rowIndex === file.lines.findIndex(rowSelectable)
             ? 0
             : -1;
-        const firstLineNumber = makeSpan("line-no", data.old == null ? "" : String(data.old));
         const lineAction = makeSpan("line-action", "+");
         lineAction.setAttribute("aria-hidden", "true");
         firstLineNumber.prepend(lineAction);
@@ -853,7 +869,7 @@ export const pageScript = String.raw`
         if (touchSelection && selectionAnchor) chooseRow(fileIndex, rowIndex, true, true);
         else {
           chooseRow(fileIndex, rowIndex, event.shiftKey, false);
-          if (!touch) row.focus({ preventScroll: true });
+          if (!touch) rowControl({ fileIndex, rowIndex })?.focus({ preventScroll: true });
         }
       });
       rows.addEventListener("click", (event) => {
@@ -869,7 +885,7 @@ export const pageScript = String.raw`
         if (!row || !rows.contains(row)) return;
         const fileIndex = Number(row.dataset.file), rowIndex = Number(row.dataset.row);
         if (!selectionContains(fileIndex, rowIndex)) chooseRow(fileIndex, rowIndex, false, false);
-        openTutor(row);
+        openTutor(rowControl({ fileIndex, rowIndex }));
         element("question").focus();
       });
       rows.addEventListener("mousedown", (event) => {
@@ -877,7 +893,8 @@ export const pageScript = String.raw`
       });
       rows.addEventListener("keydown", (event) => {
         if (event.target.closest(".tutored-badge")) return;
-        const row = event.target.closest(".diff-row[data-row]");
+        const control = event.target.closest(".line-select");
+        const row = control?.closest(".diff-row[data-row]");
         if (row && rows.contains(row)) handleRowKey(event, Number(row.dataset.file), Number(row.dataset.row));
       });
       disclosure.addEventListener("click", () => {
@@ -921,11 +938,14 @@ export const pageScript = String.raw`
     }
     element("ask").append(document.createTextNode(text));
   }
+  function canAsk(questionState = currentQuestionState) {
+    return !!currentSource && !asking && !["queued", "running"].includes(questionState) && !!element("question").value.trim();
+  }
   function updateActions(questionState = currentQuestionState) {
     element("load").disabled = loading;
     const hasQuestion = element("question").value.trim().length > 0;
     const active = asking || ["queued", "running"].includes(questionState);
-    element("ask").disabled = !currentSource || !hasQuestion || active;
+    element("ask").disabled = !canAsk(questionState);
     element("ask").classList.toggle("busy-neutral", active);
     element("cancel").disabled =
       questionState !== "queued" && questionState !== "running";
@@ -949,21 +969,11 @@ export const pageScript = String.raw`
   function updateQuestion(question) {
     currentQuestionState = question.state;
     if (typeof question.answer === "string") setAnswer(question.answer);
-    element("question-state").replaceChildren();
+    element("question-state").textContent = question.state;
     if (question.state === "running") {
-      const pulse = document.createElement("span");
-      pulse.className = "pulse";
-      pulse.setAttribute("aria-hidden", "true");
-      element("question-state").append(
-        pulse,
-        document.createTextNode("running"),
-      );
       element("answer").classList.add("streaming");
       announce("Tutor is answering.");
-    } else {
-      element("question-state").textContent = question.state;
-      element("answer").classList.remove("streaming");
-    }
+    } else element("answer").classList.remove("streaming");
     if (question.state === "queued") {
       announce("Question queued.");
       setAskLabel("Queued");
@@ -996,9 +1006,27 @@ export const pageScript = String.raw`
     if (question) updateQuestion(question);
     return question || null;
   }
+  function bufferAskEvent(type, payload) {
+    pendingAskEvents.push({ type, payload });
+    if (pendingAskEvents.length > 256) pendingAskEvents.shift();
+  }
+  function replayAskEvents(questionId) {
+    const events = pendingAskEvents.filter((event) => event.payload.id === questionId);
+    pendingAskEvents.length = 0;
+    for (const event of events) {
+      if (event.type === "question") updateQuestion(event.payload);
+      else {
+        appendAnswer(event.payload.text);
+        element("answer").classList.add("streaming");
+      }
+    }
+  }
   async function submitQuestion() {
-    if (asking || !currentSource || !element("question").value.trim()) return;
+    if (!canAsk()) return;
     asking = true;
+    pendingAskEvents.length = 0;
+    currentQuestionId = undefined;
+    currentQuestionState = undefined;
     clearError();
     clearHistoryState();
     composerSelectionKey = selectionIdentity();
@@ -1053,6 +1081,7 @@ export const pageScript = String.raw`
       });
       currentQuestionId = result.id;
       updateQuestion(result);
+      replayAskEvents(result.id);
       try {
         await reconcileQuestion();
       } catch (error) {
@@ -1060,6 +1089,7 @@ export const pageScript = String.raw`
       }
     } catch (error) {
       pendingQuiz = null;
+      pendingAskEvents.length = 0;
       showError(error, "Question");
       announce("Question failed.");
       setAskLabel("Ask");
@@ -1209,8 +1239,9 @@ export const pageScript = String.raw`
   }
   async function refreshLog() {
     const revision = logRevision;
+    const sequence = ++logRefreshSequence;
     const next = await api("/api/log?limit=100");
-    if (revision !== logRevision) return;
+    if (revision !== logRevision || sequence !== logRefreshSequence) return;
     const active = document.activeElement;
     if (active?.matches('.log-entry textarea') || active?.closest('.entry-actions')) {
       deferredLogEntries = next;
@@ -1304,12 +1335,12 @@ export const pageScript = String.raw`
     if (dialog) setBackgroundIsolated(false, "tutor");
     anchorComposer();
     updateModalLock();
-    const fallback = dialog ? lastTutorOpener : (selection ? rowNode(activeRow) : lastTutorOpener) || rowNode(activeRow) || element("open-composer");
+    const fallback = dialog ? lastTutorOpener : (selection ? rowControl(activeRow) : lastTutorOpener) || rowControl(activeRow) || element("open-composer");
     if (restore && fallback) fallback.focus();
   }
   function trapFocus(event, container) {
     if (event.key !== "Tab" || container.getAttribute("role") !== "dialog") return;
-    const focusable = [...container.querySelectorAll("button:not([disabled]),select:not([disabled]),textarea:not([disabled]),input:not([disabled])")]
+    const focusable = [...container.querySelectorAll("button:not([disabled]),select:not([disabled]),textarea:not([disabled]),input:not([disabled]),a[href]")]
       .filter((node) => !node.closest("[hidden]"));
     const first = focusable[0], last = focusable.at(-1), active = document.activeElement;
     if (!first || !last || !container.contains(active)) return;
@@ -1360,15 +1391,18 @@ export const pageScript = String.raw`
     }
     events.addEventListener("answer_delta", (event) => {
       const delta = parseEvent(event, "Live answer");
-      if (delta && delta.id === currentQuestionId) {
+      if (!delta) return;
+      if (asking && !currentQuestionId) bufferAskEvent("answer_delta", delta);
+      else if (delta.id === currentQuestionId) {
         appendAnswer(delta.text);
         element("answer").classList.add("streaming");
       }
     });
     events.addEventListener("question", (event) => {
       const question = parseEvent(event, "Question update");
-      if (question && question.id === currentQuestionId)
-        updateQuestion(question);
+      if (!question) return;
+      if (asking && !currentQuestionId) bufferAskEvent("question", question);
+      else if (question.id === currentQuestionId) updateQuestion(question);
     });
     events.addEventListener("state", (event) => {
       const snapshot = parseEvent(event, "State update");
@@ -1382,9 +1416,10 @@ export const pageScript = String.raw`
         question = snapshot.questions
           .filter((item) => ["queued", "running"].includes(item.state))
           .at(-1);
-        currentQuestionId = question?.id;
+        if (asking && question) bufferAskEvent("question", question);
+        else currentQuestionId = question?.id;
       }
-      if (question) updateQuestion(question);
+      if (question && question.id === currentQuestionId) updateQuestion(question);
     });
     events.addEventListener("source", (event) => {
       const source = parseEvent(event, "Source update");
@@ -1511,7 +1546,7 @@ export const pageScript = String.raw`
     selectionAnchor = null;
     updateSelection(previousSelection, activeRow);
     reanchorOpenComposer();
-    rowNode(activeRow)?.focus();
+    rowControl(activeRow)?.focus();
   });
   element("mobile-ask").addEventListener("click", (event) => openTutor(event.currentTarget));
   element("open-composer").addEventListener("click", (event) => { openTutor(event.currentTarget); element("question").focus(); });
@@ -1539,7 +1574,7 @@ export const pageScript = String.raw`
         restoreComposerOnDesktop = true;
         tutor.classList.remove("open");
         anchorComposer();
-        if (focusedInside) (rowNode(activeRow) || element("change-source")).focus();
+        if (focusedInside) (rowControl(activeRow) || element("change-source")).focus();
       }
     } else {
       if (tutor.getAttribute("role") === "dialog") {
@@ -1556,7 +1591,7 @@ export const pageScript = String.raw`
         tutor.classList.remove("open");
         anchorComposer();
       }
-      const fallback = rowNode(activeRow) || element("change-source");
+      const fallback = rowControl(activeRow) || element("change-source");
       if (focusedInside && !tutor.classList.contains("open") && fallback && !fallback.hidden) fallback.focus();
     }
     applyRail();
@@ -1565,7 +1600,7 @@ export const pageScript = String.raw`
     clearError();
     try {
       updateQuestion(
-        await api("/api/questions/" + currentQuestionId + "/cancel", {
+        await api("/api/questions/" + encodeURIComponent(currentQuestionId) + "/cancel", {
           method: "POST",
           body: "{}",
         }),

@@ -521,7 +521,7 @@ describe("placeholder page and extension boundaries", () => {
     expect(pageHtml).toContain('role="status"');
     expect(pageHtml).toContain('role="alert"');
     expect(pageHtml).toContain("node.textContent = label");
-    expect(pageHtml).toContain("function renderMarkdown(container, markdown)");
+    expect(pageHtml).toContain("function renderMarkdown(container, markdown, depth = 0)");
     expect(pageHtml).toContain("if (typeof question.answer === \"string\") setAnswer(question.answer)");
     expect(pageHtml).toContain("function updateActions(questionState = currentQuestionState)");
     expect(pageHtml).toContain('events.addEventListener("state"');

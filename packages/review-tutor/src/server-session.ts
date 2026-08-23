@@ -4,9 +4,10 @@ import { exportLearningHtml } from "./export-html.ts";
 import { loadInput, type ExecFile } from "./inputs.ts";
 import { appendEntry, foldLog, persistInput, updateEntry } from "./log.ts";
 import { buildTutorPrompt } from "./prompt.ts";
-import { LIMITS, validateAskRequest, validateLogPatch, validateSourceRequest, type AskRequest, type InputSnapshot, type LearningEntry, type ModelChoice, type QuestionView } from "./protocol.ts";
+import { LIMITS, validateAskRequest, validateLogPatch, validateSourceRequest, type AskRequest, type InputSnapshot, type LearningEntry, type ModelChoice, type QuestionView, type StructureSnapshot } from "./protocol.ts";
 import type { StatePaths } from "./paths.ts";
 import type { SseHub } from "./sse.ts";
+import { structureSnapshotFor } from "./structure.ts";
 
 export interface RunnerLike {
   run(request: { provider: string; model: string; thinking: string; cwd: string; prompt: string }, delta: (text: string) => void): Promise<{ answer: string; usage?: Record<string, number> }>;
@@ -64,6 +65,7 @@ export class ReviewTutorSession {
   private readonly queue: string[] = [];
   private readonly threadHistory: LearningEntry[] = [];
   private currentInput?: InputSnapshot;
+  private structureCache?: { inputId: string; snapshot: StructureSnapshot };
   private running?: string;
   private lastHeartbeat = 0;
   private closing = false;
@@ -278,6 +280,16 @@ export class ReviewTutorSession {
       clean();
       if (!response.destroyed && !response.writableEnded) response.end();
     }
+  }
+
+  structure(): SessionReply {
+    const input = this.currentInput;
+    if (!input) return { status: 409, value: {
+      error: "structure failed: expected a loaded input snapshot, received none; load a source and retry" } };
+    if (this.structureCache?.inputId !== input.id) {
+      this.structureCache = { inputId: input.id, snapshot: structureSnapshotFor(input) };
+    }
+    return { status: 200, value: this.structureCache.snapshot };
   }
 
   async log(url: URL): Promise<SessionReply> {

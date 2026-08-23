@@ -12,6 +12,18 @@ export const LIMITS = {
   stderr: 32 * 1024,
 } as const;
 
+export const STRUCTURE_LIMITS = {
+  maxFiles: 200,
+  maxEdges: 2000,
+  maxEvidencePerEdge: 4,
+  evidenceText: 200,
+  lineLength: 4000,
+  diffLines: 200_000,
+  omittedRows: 200,
+  statementsPerFile: 2000,
+  externalNames: 8,
+} as const;
+
 export type QuizOutcome = "got_it" | "almost" | "review_again";
 
 export type SourceRequest =
@@ -91,6 +103,63 @@ export interface LearningEntry {
   quizOutcome?: QuizOutcome;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface StructureComparison {
+  kind: InputSnapshot["kind"];
+  label: string;
+  from: string;
+  to: string;
+  partial: boolean;
+  reasons: string[];
+}
+
+export interface StructureFile {
+  path: string;
+  status: "added" | "removed" | "modified" | "renamed";
+  renamedFrom?: string;
+  additions: number;
+  deletions: number;
+  analyzed: boolean;
+  reason?: string;
+}
+
+export interface StructureEvidence {
+  path: string;
+  line: number;
+  text: string;
+}
+
+export interface StructureEdge {
+  from: string;
+  to: string;
+  kind: "import" | "reexport" | "require" | "dynamic-import";
+  typeOnly: boolean;
+  status: "added" | "removed" | "modified" | "unchanged";
+  specifier: string;
+  evidence: StructureEvidence[];
+}
+
+export interface StructureOmission {
+  path?: string;
+  reason: string;
+}
+
+export interface StructureLimits {
+  maxFiles: typeof STRUCTURE_LIMITS.maxFiles;
+  maxEdges: typeof STRUCTURE_LIMITS.maxEdges;
+  maxEvidencePerEdge: typeof STRUCTURE_LIMITS.maxEvidencePerEdge;
+  truncated: boolean;
+  omitted: StructureOmission[];
+}
+
+export interface StructureSnapshot {
+  protocol: "rt/1";
+  inputId: string;
+  comparison: StructureComparison;
+  files: StructureFile[];
+  edges: StructureEdge[];
+  limits: StructureLimits;
 }
 
 export type SseEventType = "hello" | "state" | "question" | "answer_delta" | "source" | "log_update" | "error" | "bye";

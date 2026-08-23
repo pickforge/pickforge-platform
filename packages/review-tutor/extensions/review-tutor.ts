@@ -166,14 +166,27 @@ function sourceFromArgument(argument: string): SourceRequest | undefined {
   return { protocol: "rt/1", kind: "commit", revision: value };
 }
 
-function choices(ctx: ExtensionCommandContext): ModelChoice[] {
-  return ctx.modelRegistry.getAvailable().map((model) => ({
-    id: `${model.provider}/${model.id}`,
-    label: model.name || `${model.provider}/${model.id}`,
-    thinkingLevels: model.reasoning
-      ? ["off", "minimal", "low", "medium", "high", "xhigh"]
-      : ["off"],
-  }));
+function modelChoice(
+  model: { provider: string; id: string; name?: string; reasoning?: boolean },
+  pinnedThinkingLevel?: string,
+): ModelChoice {
+  const id = `${model.provider}/${model.id}`;
+  return {
+    id,
+    label: model.name || id,
+    thinkingLevels: pinnedThinkingLevel
+      ? [pinnedThinkingLevel]
+      : model.reasoning
+        ? ["off", "minimal", "low", "medium", "high", "xhigh"]
+        : ["off"],
+  };
+}
+
+export function modelChoices(ctx: ExtensionCommandContext): ModelChoice[] {
+  if (ctx.scopedModels.length) {
+    return ctx.scopedModels.map((scoped) => modelChoice(scoped.model, scoped.thinkingLevel));
+  }
+  return ctx.modelRegistry.getAvailable().map((model) => modelChoice(model));
 }
 
 async function repositoryRoot(pi: ExtensionAPI, cwd: string): Promise<string> {
@@ -239,7 +252,7 @@ export default function reviewTutorExtension(pi: ExtensionAPI): void {
         const server = await lifecycle.start(async (startupSignal) => {
           const cwd = await realpath(ctx.cwd);
           const canonicalRepo = await repositoryRoot(pi, cwd);
-          const models = choices(ctx);
+          const models = modelChoices(ctx);
           if (!models.length) {
             throw new Error(
               "model snapshot failed: expected at least one available model; configure a Pi model and retry",

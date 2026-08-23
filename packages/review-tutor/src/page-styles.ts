@@ -139,9 +139,9 @@ grid-template-columns:52px 24px minmax(0,1fr)}
 .file.plain .line-no:nth-child(2) {
 display:none}
 .line-no {
-position:relative;color:#85858e;text-align:right;padding-right:12px;border-right:1px solid var(--hairline);user-select:none;cursor:pointer;font-variant-numeric:tabular-nums}
+display:flex;align-items:flex-start;justify-content:flex-end;position:relative;color:#85858e;text-align:right;padding-right:12px;border-right:1px solid var(--hairline);user-select:none;cursor:pointer;font-variant-numeric:tabular-nums}
 button.line-select {
-min-height:25px;padding:0 12px 0 0;border:0;border-radius:0;background:transparent;font:inherit;line-height:25px}
+display:flex;align-items:flex-start;justify-content:flex-end;min-height:25px;padding:0 12px 0 0;border:0;border-right:1px solid var(--hairline);border-radius:0;background:transparent;font:inherit;line-height:25px}
 .diff-row[data-row]:hover:after {
 content:"";position:absolute;inset:0;background:rgba(255,255,255,.035);pointer-events:none}
 .line-action {

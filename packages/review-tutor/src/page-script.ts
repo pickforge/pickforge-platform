@@ -554,10 +554,10 @@ export const pageScript = String.raw`
     element("selection-helper").hidden = !selection;
     updateActions();
   }
-  function anchorComposer() {
+  function anchorComposer(forceDock = false) {
     const tutor = element("tutor");
     const endRow = selection && rowNode({ fileIndex: selection.fileIndex, rowIndex: selection.end });
-    const inline = tutor.classList.contains("open") && endRow && innerWidth > MOBILE_BREAKPOINT && !endRow.closest(".rows")?.hidden;
+    const inline = !forceDock && tutor.classList.contains("open") && endRow && innerWidth > MOBILE_BREAKPOINT && !endRow.closest(".rows")?.hidden;
     const active = tutor.contains(document.activeElement) ? document.activeElement : null;
     const caret = active?.tagName === "TEXTAREA" ? [active.selectionStart, active.selectionEnd] : null;
     let moved = false;
@@ -773,7 +773,7 @@ export const pageScript = String.raw`
     if (next) next.focus();
   }
   function renderDiff() {
-    anchorComposer();
+    anchorComposer(true);
     const container = element("diff");
     container.replaceChildren();
     if (preambleText) {
@@ -1007,6 +1007,16 @@ export const pageScript = String.raw`
     return question || null;
   }
   function bufferAskEvent(type, payload) {
+    if (type === "question") {
+      for (let index = pendingAskEvents.length - 1; index >= 0; index--)
+        if (pendingAskEvents[index].payload.id === payload.id) pendingAskEvents.splice(index, 1);
+    } else {
+      const previous = pendingAskEvents.at(-1);
+      if (previous?.type === type && previous.payload.id === payload.id) {
+        previous.payload = { ...payload, text: previous.payload.text + payload.text };
+        return;
+      }
+    }
     pendingAskEvents.push({ type, payload });
     if (pendingAskEvents.length > 256) pendingAskEvents.shift();
   }

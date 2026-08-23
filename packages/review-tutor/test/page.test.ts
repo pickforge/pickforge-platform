@@ -164,6 +164,11 @@ describe("Review Tutor composed page", () => {
     expect(pageHtml).toContain("max-height:100%;overflow:auto");
     expect(pageHtml).toContain(".source-setup {\nmin-height:0;max-height:100%;overflow:auto");
     expect(pageHtml).toContain("--muted:#8b8b93");
+    expect(pageHtml).toContain(".line-no {\ndisplay:flex;align-items:flex-start;justify-content:flex-end");
+    expect(pageHtml).toContain("button.line-select {\ndisplay:flex;align-items:flex-start;justify-content:flex-end");
+    expect(pageHtml).toContain("border:0;border-right:1px solid var(--hairline)");
+    expect(pageHtml).toContain("function anchorComposer(forceDock = false)");
+    expect(pageHtml).toContain("function renderDiff() {\n    anchorComposer(true)");
     expect(pageHtml).toContain('id="open-config" class="ghost open-config" aria-haspopup="dialog" aria-controls="config-dialog"');
     expect(pageHtml).toContain('<aside id="config-dialog" class="rail"');
   });
@@ -888,11 +893,11 @@ describe("Review Tutor composed page", () => {
     input(document, "question", "Race");
     byId(document, "ask").click();
     events?.emit("question", { id: "q-early", state: "running", answer: "early " });
-    events?.emit("answer_delta", { id: "q-early", text: "continued" });
+    for (let index = 0; index < 300; index++) events?.emit("answer_delta", { id: "q-early", text: "x" });
     resolveAsk(json({ id: "q-early", state: "queued", answer: "" }));
     await flush();
     expect(byId(document, "question-state").textContent).toBe("running");
-    expect(byId(document, "answer-text").textContent).toBe("early continued");
+    expect(byId(document, "answer-text").textContent).toBe("early " + "x".repeat(300));
     expect(byId(document, "error").textContent).toContain("state unavailable");
   });
 

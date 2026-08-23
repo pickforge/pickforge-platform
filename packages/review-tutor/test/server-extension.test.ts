@@ -8,6 +8,7 @@ import {
   createExecFileAdapter,
   createServerLifecycle,
 } from "../extensions/review-tutor.ts";
+import { pageHtml } from "../src/page.ts";
 import { resolveStatePaths } from "../src/paths.ts";
 import type { AskRequest } from "../src/protocol.ts";
 import { startReviewTutorServer, type ReviewTutorServer } from "../src/server.ts";
@@ -515,19 +516,18 @@ describe("extension lifecycle and command execution", () => {
 });
 
 describe("placeholder page and extension boundaries", () => {
-  it("uses safe DOM insertion and accessible status regions", async () => {
-    const source = await readFile(new URL("../src/page.ts", import.meta.url), "utf8");
-    expect(source).not.toContain(".innerHTML");
-    expect(source).toContain('role="status"');
-    expect(source).toContain('role="alert"');
-    expect(source).toContain("option.textContent = labelOf(value)");
-    expect(source).toContain('element("answer").textContent = result.answer');
-    expect(source).toContain('element("answer").textContent = question.answer');
-    expect(source).toContain("function updateActions(questionState = currentQuestionState)");
-    expect(source).toContain('events.addEventListener("state"');
-    expect(source).toContain('showError(error, action)');
-    expect(source).toContain('currentQuestionState === "failed" && question.error');
-    expect(source).toContain("setTimeout(() => URL.revokeObjectURL(objectUrl), 100)");
+  it("uses safe DOM insertion and accessible status regions", () => {
+    expect(pageHtml).not.toContain(".innerHTML");
+    expect(pageHtml).toContain('role="status"');
+    expect(pageHtml).toContain('role="alert"');
+    expect(pageHtml).toContain("node.textContent = label");
+    expect(pageHtml).toContain("function renderMarkdown(container, markdown, depth = 0)");
+    expect(pageHtml).toContain("if (typeof question.answer === \"string\") setAnswer(question.answer)");
+    expect(pageHtml).toContain("function updateActions(questionState = currentQuestionState)");
+    expect(pageHtml).toContain('events.addEventListener("state"');
+    expect(pageHtml).toContain("showError(error, action");
+    expect(pageHtml).toContain('question.state === "failed"');
+    expect(pageHtml).toContain("setTimeout(() => URL.revokeObjectURL(objectUrl), 100)");
   });
 
   it("avoids forbidden APIs and keeps successful notifications token-free", async () => {

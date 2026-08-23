@@ -64,16 +64,19 @@ async function flush() {
 async function boot(options: {
   width?: number;
   askResponse?: Promise<Response> | Response;
+  cancelResponse?: Promise<Response> | Response;
   entries?: unknown[];
   source?: typeof source;
   storedQuizIds?: string;
   stateResponses?: unknown[];
   failHeartbeat?: boolean;
+  railCollapsed?: boolean;
 } = {}) {
   FakeEventSource.instances = [];
   const window = new Window({ url: "http://127.0.0.1:43123/?session=secret-token" });
   Object.defineProperty(window, "innerWidth", { value: options.width ?? 1440, writable: true, configurable: true });
   if (options.storedQuizIds !== undefined) window.sessionStorage.setItem("reviewTutorQuizEntryIds", options.storedQuizIds);
+  if (options.railCollapsed) window.sessionStorage.setItem("reviewTutorRailCollapsed", "1");
   const script = pageHtml.match(/<script>([\s\S]*?)<\/script>/)?.[1];
   if (!script) throw new Error("Inline page script was not composed");
   window.document.documentElement.innerHTML = pageHtml
@@ -95,7 +98,7 @@ async function boot(options: {
     if (path === "/api/heartbeat" && options.failHeartbeat) return Promise.reject(new Error("heartbeat down"));
     if (path === "/api/ask") return options.askResponse ?? json({ id: "q-1", state: "queued", answer: "", createdAt: new Date().toISOString() });
     if (path.startsWith("/api/log/")) return json({});
-    if (path.includes("/cancel")) return json({ id: "q-1", state: "cancelled", answer: "partial" });
+    if (path.includes("/cancel")) return options.cancelResponse ?? json({ id: "q-1", state: "cancelled", answer: "partial" });
     return json({});
   });
   Object.assign(window, {
@@ -135,10 +138,71 @@ describe("Review Tutor composed page", () => {
       expect(pageHtml).not.toContain(forbidden);
     }
     expect(pageHtml).toContain("[hidden]");
-    expect(pageHtml).toContain("@media(max-width:1040px)");
+    expect(pageHtml).toContain("@media(max-width:860px)");
     expect(pageHtml).toContain(".diff-pane {\nmin-width:0;min-height:0;");
+    expect(pageHtml).toContain(".toolbar select {\nwidth:auto;flex:1 1 120px;min-width:120px;max-width:280px}");
     expect(pageHtml).toContain(".rail {\nmin-height:0;overflow-y:auto;");
     expect(pageHtml).toContain('role="region" aria-labelledby="tutor-title"');
+  });
+
+  it("wraps long diff lines instead of creating a horizontal scroll track", () => {
+    expect(pageHtml).toContain(".rows {\nmin-width:0");
+    expect(pageHtml).toContain("grid-template-columns:52px 52px 24px minmax(0,1fr)");
+    expect(pageHtml).toContain("grid-template-columns:52px 24px minmax(0,1fr)");
+    expect(pageHtml).toContain(".code {\nwhite-space:pre-wrap;overflow-wrap:anywhere");
+    expect(pageHtml).not.toContain("min-width:max-content");
+    expect(pageHtml).not.toContain("minmax(500px,1fr)");
+  });
+
+  it("keeps the CSS and JS stacked breakpoints in lockstep at 860", () => {
+    expect(pageHtml.match(/MOBILE_BREAKPOINT = (\d+)/)?.[1]).toBe("860");
+    expect(pageHtml.match(/@media\(max-width:(\d+)px\)/)?.[1]).toBe("860");
+  });
+
+  it("keeps a fluid tutor rail on the desktop grid without clipping the log header", () => {
+    expect(pageHtml).toContain("grid-template-columns:minmax(0,1fr) clamp(320px,30vw,400px)");
+    expect(pageHtml).toMatch(/\.log-head \{\n[^}]*flex-wrap:wrap/);
+  });
+
+  it("uses compact composer rhythm and a right-aligned selection action", () => {
+    expect(pageHtml).toContain('class="selection-head"');
+    expect(pageHtml).toMatch(/\.selection-head \{\n[^}]*display:flex[^}]*gap:10px/);
+    expect(pageHtml).toMatch(/\.selection-head \.selection-meta \{\n[^}]*min-width:0[^}]*text-overflow:ellipsis/);
+    expect(pageHtml).toContain(".ask-helper:empty");
+    expect(pageHtml).toContain("margin-top:12px;padding-top:10px");
+    expect(pageHtml).toContain(".tutored-badge::before");
+    expect(pageHtml).toContain("inset:-2px");
+    expect(pageHtml).toContain(".log-entry + .log-entry");
+    expect(pageHtml).toContain("border-top:1px solid var(--hairline-strong);margin-top:20px;padding-top:20px");
+  });
+
+  it("scrolls stacked mode on a full-height body so pinned bars never unstick", () => {
+    const media = pageHtml.slice(pageHtml.indexOf("@media(max-width:"));
+    expect(media).toContain("body {\nheight:auto;min-height:100%");
+    expect(media).toContain(".diff-scroll {\noverflow:visible}");
+    expect(media).toContain(".file-head {\ntop:var(--filehead-top)");
+    expect(pageHtml).toContain(".log-section {\ncontain:layout");
+    expect(pageHtml).toContain("--filehead-top:calc(var(--topbar-h) + 50px)");
+    expect(media).toContain("--filehead-top:calc(var(--topbar-h) + 105px)");
+    expect(media).toContain("--filehead-top:calc(var(--topbar-h) + 153px)");
+  });
+
+  it("keeps the stacked toolbar unclipped with a full-width Change source button", () => {
+    const media = pageHtml.slice(pageHtml.indexOf("@media(max-width:"));
+    const toolbar = media.match(/\.toolbar \{\n([^}]*)\}/)?.[1] ?? "";
+    expect(toolbar).toContain("flex-wrap:wrap");
+    expect(toolbar).not.toContain("overflow:hidden");
+    expect(media).toContain(".select-toggle,.source-change {\ndisplay:block;width:auto!important;padding:0 8px!important}");
+    expect(media).toContain(".toolbar select {\nflex:1 1 100%}");
+    expect(media).toContain(".toolbar {\ncolumn-gap:2px}");
+    expect(media).toContain(".toolbar .totals {\nmargin-left:0}");
+  });
+
+  it("keeps native diff selection and the real line action affordance separate", () => {
+    expect(pageHtml).toMatch(/\.marker \{\n[^}]*user-select:none/);
+    expect(pageHtml).toMatch(/\.line-action \{\n[^}]*pointer-events:auto/);
+    expect(pageHtml).not.toContain(".line-no:first-child:before");
+    expect(pageHtml).toContain("Shift-click line numbers to extend the selection. Select + to ask.");
   });
 
   it("composes the Pickforge mark and token system instead of fake window dots", () => {
@@ -151,6 +215,197 @@ describe("Review Tutor composed page", () => {
     expect(pageHtml).toContain('--control-h-touch:44px');
     expect(pageHtml).toContain('class="connection" data-state="starting"');
     expect(pageHtml).toContain('.connection[data-state="connected"]');
+  });
+
+  it("splits stable composer, configuration, live regions, and learning log ownership", async () => {
+    const { document } = await boot();
+    const tutor = byId(document, "tutor");
+    const config = byId(document, "config-section");
+    for (const id of ["mode", "question", "ask", "cancel", "answer", "selection-summary"])
+      expect(tutor.contains(byId(document, id))).toBe(true);
+    for (const id of ["harness", "model", "thinking", "language", "match-1", "match-2", "match-3"])
+      expect(config.contains(byId(document, id))).toBe(true);
+    expect(byId(document, "error").parentElement).toBe(document.body);
+    expect(byId(document, "lifecycle").parentElement).toBe(document.body);
+    expect(byId(document, "log-section").parentElement).toBe(byId(document, "diff-scroll"));
+    expect(byId(document, "log-section").previousElementSibling).toBe(byId(document, "diff"));
+    expect(byId(document, "diff").getAttribute("role")).toBe("tabpanel");
+    expect(byId(document, "log-section").getAttribute("role")).toBe("tabpanel");
+    expect(byId(document, "log-section").hidden).toBe(true);
+    expect(byId(document, "view-diff").getAttribute("aria-selected")).toBe("true");
+    expect(byId(document, "view-log").getAttribute("aria-selected")).toBe("false");
+    expect(Array.from(byId(document, "harness").options).map((item: any) => [item.value, item.textContent])).toEqual([["pi", "Pi"]]);
+  });
+
+  it("switches Diff and Learning log as stable peer views", async () => {
+    const entry = { id: "entry-view", inputId: source.id, source, selection: { text: "" }, question: "Saved", answer: "Answer", modelId: "model-1", preferences: {}, note: "", reviewLater: false, createdAt: new Date().toISOString() };
+    const { window, document } = await boot({ entries: [entry] });
+    const note = document.querySelector(".log-entry textarea") as any;
+    input(document, "question", "draft survives view switch");
+
+    byId(document, "view-log").click();
+    expect(byId(document, "diff").hidden).toBe(true);
+    expect(byId(document, "log-section").hidden).toBe(false);
+    expect(byId(document, "files").hidden).toBe(true);
+    expect(byId(document, "mobile-ask").hidden).toBe(true);
+    expect(byId(document, "change-source").hidden).toBe(false);
+    expect(byId(document, "view-log").getAttribute("aria-selected")).toBe("true");
+    expect(document.querySelector(".log-entry textarea")).toBe(note);
+
+    byId(document, "view-log").dispatchEvent(new window.KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true }));
+    expect(document.activeElement).toBe(byId(document, "view-diff"));
+    expect(byId(document, "diff").hidden).toBe(true);
+    byId(document, "view-diff").dispatchEvent(new window.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    expect(byId(document, "diff").hidden).toBe(false);
+    expect(byId(document, "log-section").hidden).toBe(true);
+    expect(byId(document, "question").value).toBe("draft survives view switch");
+  });
+
+  it("selects a clicked line while keeping the composer closed and docked", async () => {
+    const { window, document } = await boot();
+    const rows = Array.from(document.querySelectorAll('.diff-row[role="button"]')) as any[];
+    const tutor = byId(document, "tutor");
+    rows[1].querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+    expect(rows[1].getAttribute("aria-pressed")).toBe("true");
+    expect(tutor.classList.contains("open")).toBe(false);
+    expect(tutor.parentElement).toBe(byId(document, "diff-pane"));
+    expect(tutor.nextElementSibling).toBe(byId(document, "diff-scroll"));
+    expect(document.activeElement).toBe(rows[1]);
+  });
+
+  it("preserves the composer's actual open state across responsive normalization", async () => {
+    const { window, document } = await boot();
+    const row = document.querySelector('.diff-row[role="button"]') as any;
+    const tutor = byId(document, "tutor");
+    row.querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+    window.innerWidth = 800;
+    window.dispatchEvent(new window.Event("resize"));
+    window.innerWidth = 1200;
+    window.dispatchEvent(new window.Event("resize"));
+    expect(tutor.classList.contains("open")).toBe(false);
+    expect(tutor.nextElementSibling).toBe(byId(document, "diff-scroll"));
+
+    byId(document, "open-composer").click();
+    input(document, "question", "Keep this general draft");
+    window.innerWidth = 800;
+    window.dispatchEvent(new window.Event("resize"));
+    expect(tutor.classList.contains("open")).toBe(false);
+    window.innerWidth = 1200;
+    window.dispatchEvent(new window.Event("resize"));
+    expect(tutor.classList.contains("open")).toBe(true);
+    expect(tutor.previousElementSibling).toBe(row);
+    expect(byId(document, "question").value).toBe("Keep this general draft");
+  });
+
+  it("keeps question focus and caret through a desktop-only resize", async () => {
+    const { window, document } = await boot();
+    const row = document.querySelector('.diff-row[role="button"]') as any;
+    row.querySelector(".line-action").click();
+    const question = byId(document, "question");
+    input(document, "question", "Half-written question");
+    question.setSelectionRange(5, 12);
+    window.innerWidth = 1380;
+    window.dispatchEvent(new window.Event("resize"));
+    expect(byId(document, "tutor").classList.contains("open")).toBe(true);
+    expect(document.activeElement).toBe(question);
+    expect([question.selectionStart, question.selectionEnd]).toEqual([5, 12]);
+  });
+
+  it("extends a gutter range before any composer insertion", async () => {
+    const { window, document } = await boot();
+    const rows = Array.from(document.querySelectorAll('.diff-row[role="button"]')) as any[];
+    const tutor = byId(document, "tutor");
+    rows[1].querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+    rows[2].querySelector(".marker").dispatchEvent(new window.MouseEvent("pointerdown", { bubbles: true, shiftKey: true }));
+    expect(byId(document, "selection-summary").textContent).toBe("src/a.ts · lines 1-2");
+    expect(document.querySelectorAll('.diff-row[aria-pressed="true"]')).toHaveLength(2);
+    expect(tutor.classList.contains("open")).toBe(false);
+    expect(tutor.nextElementSibling).toBe(byId(document, "diff-scroll"));
+  });
+
+  it("creates real line actions that preserve a selected range and open after its end", async () => {
+    const { window, document } = await boot();
+    const rows = Array.from(document.querySelectorAll('.diff-row[role="button"]')) as any[];
+    rows[1].querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+    rows[2].querySelector(".marker").dispatchEvent(new window.MouseEvent("pointerdown", { bubbles: true, shiftKey: true }));
+    const actions = Array.from(document.querySelectorAll(".line-action")) as any[];
+    expect(actions).toHaveLength(rows.length);
+    expect(actions.every((action) => action.textContent === "+" && action.getAttribute("aria-hidden") === "true")).toBe(true);
+    expect(actions.every((action) => action.parentElement === action.closest(".line-no") && !action.hasAttribute("role"))).toBe(true);
+    rows[1].querySelector(".line-action").click();
+    expect(byId(document, "selection-summary").textContent).toBe("src/a.ts · lines 1-2");
+    expect(byId(document, "tutor").previousElementSibling).toBe(rows[2]);
+    expect(byId(document, "tutor").classList.contains("open")).toBe(true);
+    const question = byId(document, "question");
+    expect(document.activeElement).toBe(question);
+    question.value = "caret survives";
+    question.setSelectionRange(3, 8);
+    rows[1].querySelector(".line-action").click();
+    expect(document.activeElement).toBe(question);
+    expect([question.selectionStart, question.selectionEnd]).toEqual([3, 8]);
+  });
+
+  it("marks tutored ranges, reopens saved answers, and clears state for a different range", async () => {
+    const older = {
+      id: "entry-old", inputId: "old-input", source: { kind: source.kind, label: source.label, digest: source.digest },
+      selection: { file: "src/a.ts", startLine: 1, endLine: 2, text: "const newValue = 2;\ncontext();", context: "" },
+      question: "Older question", answer: "Older answer", modelId: "model-1", preferences: {}, note: "", reviewLater: false,
+      createdAt: "2026-08-20T10:00:00.000Z",
+    };
+    const newer = { ...older, id: "entry-new", inputId: "another-input", question: "Newest question", answer: "## Newest answer", createdAt: "2026-08-21T10:00:00.000Z" };
+    const { window, document } = await boot({ entries: [older, newer] });
+    const badge = document.querySelector(".tutored-badge") as any;
+    expect(badge?.textContent).toBe("2");
+    expect(badge?.getAttribute("aria-label")).toContain("2 saved answers");
+
+    badge.click();
+    expect(byId(document, "selection-summary").textContent).toBe("src/a.ts · lines 1-2");
+    expect(byId(document, "tutor").classList.contains("open")).toBe(true);
+    expect(byId(document, "question").value).toBe("Newest question");
+    expect(byId(document, "answer-text").querySelector("h2")?.textContent).toBe("Newest answer");
+    expect(byId(document, "answer").hidden).toBe(false);
+    expect(byId(document, "history-pager").hidden).toBe(false);
+    expect(byId(document, "history-position").textContent).toBe("1 of 2");
+    byId(document, "refresh").click();
+    await flush();
+    expect(document.querySelector(".tutored-badge")).toBe(badge);
+    expect(badge.getAttribute("aria-expanded")).toBe("true");
+
+    byId(document, "history-next").click();
+    expect(byId(document, "question").value).toBe("Older question");
+    expect(byId(document, "answer-text").textContent).toBe("Older answer");
+    expect(byId(document, "history-position").textContent).toBe("2 of 2");
+
+    byId(document, "close-tutor").click();
+    const otherRow = Array.from(document.querySelectorAll('.diff-row[role="button"]')).find((row: any) => row.dataset.file === "1") as any;
+    otherRow.querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+    otherRow.querySelector(".line-action").click();
+    expect(byId(document, "question").value).toBe("");
+    expect(byId(document, "answer-text").textContent).toBe("");
+    expect(byId(document, "answer").hidden).toBe(true);
+    expect(byId(document, "history-pager").hidden).toBe(true);
+  });
+
+  it("opens mobile configuration as the sole dialog and restores the desktop collapse preference", async () => {
+    const { window, document } = await boot({ width: 390, railCollapsed: true });
+    byId(document, "open-config").click();
+    const rail = document.querySelector(".rail") as any;
+    expect(rail.classList.contains("config-open")).toBe(true);
+    expect(rail.getAttribute("role")).toBe("dialog");
+    expect(rail.getAttribute("aria-modal")).toBe("true");
+    expect(byId(document, "toggle-rail").hasAttribute("aria-expanded")).toBe(false);
+    expect(byId(document, "toggle-rail").hasAttribute("aria-controls")).toBe(false);
+    expect(byId(document, "config-section").hidden).toBe(false);
+    expect(byId(document, "diff-pane").hasAttribute("inert")).toBe(true);
+    expect(rail.hasAttribute("inert")).toBe(false);
+    window.innerWidth = 1200;
+    window.dispatchEvent(new window.Event("resize"));
+    expect(rail.classList.contains("config-open")).toBe(false);
+    expect(rail.hasAttribute("role")).toBe(false);
+    expect(document.querySelector(".workbench")?.classList.contains("rail-collapsed")).toBe(true);
+    expect(byId(document, "config-section").hidden).toBe(true);
+    expect(byId(document, "toggle-rail").getAttribute("aria-expanded")).toBe("false");
+    expect(byId(document, "toggle-rail").getAttribute("aria-controls")).toBe("config-section");
   });
 
   it("bootstraps the token, cleans the URL, connects, and renders an initial multi-file diff", async () => {
@@ -180,6 +435,13 @@ describe("Review Tutor composed page", () => {
     expect(duplicate?.disabled).toBe(true);
   });
 
+  it("hides redundant ready and duplicate question-state labels", async () => {
+    const { document } = await boot();
+    input(document, "question", "Explain this");
+    expect(byId(document, "ask-helper").textContent).toBe("");
+    expect(byId(document, "question-state").hidden).toBe(true);
+  });
+
   it("submits contiguous selection and applies a synchronous duplicate Ask lock", async () => {
     let resolveAsk!: (response: Response) => void;
     const pending = new Promise<Response>((resolve) => { resolveAsk = resolve; });
@@ -204,22 +466,31 @@ describe("Review Tutor composed page", () => {
     await flush();
     const payload = JSON.parse(requests.find((request) => request.path === "/api/ask")?.init?.body as string);
     expect(payload.selection).toMatchObject({ file: "src/a.ts", startLine: 1, endLine: 2, text: "const newValue = 2;\ncontext();" });
+    expect(payload).not.toHaveProperty("harness");
     expect(ask.getAttribute("aria-busy")).toBe("false");
     expect(ask.textContent).toBe("Queued");
     expect(ask.classList.contains("busy-neutral")).toBe(true);
   });
 
-  it("provides one reachable roving button and keyboard selection", async () => {
+  it("keeps Space and Shift+Arrow selection-only, then opens and focuses on Enter", async () => {
     const { window, document } = await boot();
     expect(document.querySelector('[role="group"]')?.getAttribute("aria-label")).toContain("selectable lines");
     const rows = Array.from(document.querySelectorAll('.diff-row[role="button"]')) as any[];
+    const tutor = byId(document, "tutor");
     expect(rows.filter((row) => row.tabIndex === 0)).toHaveLength(1);
     const reachable = rows.find((row) => row.tabIndex === 0);
     reachable.focus();
     reachable.dispatchEvent(new window.KeyboardEvent("keydown", { key: " ", bubbles: true }));
     expect(reachable.getAttribute("aria-pressed")).toBe("true");
+    expect(tutor.classList.contains("open")).toBe(false);
     reachable.dispatchEvent(new window.KeyboardEvent("keydown", { key: "ArrowDown", shiftKey: true, bubbles: true }));
     expect(rows.filter((row) => row.tabIndex === 0)).toHaveLength(1);
+    expect(tutor.classList.contains("open")).toBe(false);
+    const rangeEnd = rows.find((row) => row.tabIndex === 0);
+    rangeEnd.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    expect(tutor.classList.contains("open")).toBe(true);
+    expect(tutor.previousElementSibling).toBe(rangeEnd);
+    expect(document.activeElement).toBe(byId(document, "question"));
     const clear = byId(document, "clear-selection");
     clear.focus();
     clear.click();
@@ -232,6 +503,120 @@ describe("Review Tutor composed page", () => {
     expect(disclosure.getAttribute("aria-label")).toBe("Expand src/a.ts");
   });
 
+  it("re-docks an open composer for gutter adjustment without clearing its draft", async () => {
+    const { window, document } = await boot();
+    const rows = Array.from(document.querySelectorAll('.diff-row[role="button"]')) as any[];
+    rows[1].querySelector(".line-action").click();
+    input(document, "question", "Keep this draft");
+    rows[2].querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+    const tutor = byId(document, "tutor");
+    expect(tutor.classList.contains("open")).toBe(false);
+    expect(tutor.nextElementSibling).toBe(byId(document, "diff-scroll"));
+    expect(byId(document, "question").value).toBe("Keep this draft");
+    expect(rows[2].getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("scrolls the stable composer nearest only when opening at a changed anchor", async () => {
+    const { document } = await boot();
+    const rows = Array.from(document.querySelectorAll('.diff-row[role="button"]')) as any[];
+    const tutor = byId(document, "tutor");
+    rows[1].querySelector(".line-action").click();
+    expect(tutor.scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(tutor.scrollIntoView).toHaveBeenLastCalledWith({ block: "nearest" });
+    rows[1].querySelector(".line-action").click();
+    expect(tutor.scrollIntoView).toHaveBeenCalledTimes(1);
+    byId(document, "close-tutor").click();
+    rows[1].querySelector(".line-action").click();
+    expect(tutor.scrollIntoView).toHaveBeenCalledTimes(2);
+  });
+
+  it("leaves app selection and native code pointer behavior untouched", async () => {
+    const { window, document } = await boot();
+    const rows = Array.from(document.querySelectorAll('.diff-row[role="button"]')) as any[];
+    rows[1].querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+    const summary = byId(document, "selection-summary").textContent;
+    rows[2].querySelector(".code").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+    expect(byId(document, "selection-summary").textContent).toBe(summary);
+    expect(rows[1].getAttribute("aria-pressed")).toBe("true");
+    expect(rows[2].getAttribute("aria-pressed")).toBe("false");
+    const codeDown = new window.MouseEvent("mousedown", { bubbles: true, cancelable: true });
+    rows[2].querySelector(".code").dispatchEvent(codeDown);
+    expect(codeDown.defaultPrevented).toBe(false);
+    const gutterDown = new window.MouseEvent("mousedown", { bubbles: true, cancelable: true });
+    rows[1].querySelector(".line-no").dispatchEvent(gutterDown);
+    expect(gutterDown.defaultPrevented).toBe(true);
+  });
+
+  it("keeps touch selection gated behind the Select lines toggle with whole-row targets", async () => {
+    const { window, document } = await boot({ width: 390 });
+    const rows = Array.from(document.querySelectorAll('.diff-row[role="button"]')) as any[];
+    const touchDown = () => new window.PointerEvent("pointerdown", { bubbles: true, pointerType: "touch" });
+    rows[0].dispatchEvent(touchDown());
+    expect(byId(document, "selection-summary").textContent).toBe("No code selected");
+    byId(document, "select-lines").click();
+    rows[1].querySelector(".code").dispatchEvent(touchDown());
+    expect(rows[1].getAttribute("aria-pressed")).toBe("true");
+    rows[2].querySelector(".code").dispatchEvent(touchDown());
+    expect(byId(document, "selection-summary").textContent).toBe("src/a.ts · lines 1-2");
+    expect(byId(document, "tutor").classList.contains("open")).toBe(true);
+  });
+
+  it("contains Tab and Shift-Tab when either dialog container has focus", async () => {
+    const { window, document } = await boot({ width: 390 });
+    const tutor = byId(document, "tutor");
+    byId(document, "mobile-ask").click();
+    const tutorTab = new window.KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+    tutor.dispatchEvent(tutorTab);
+    expect(tutorTab.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(byId(document, "close-tutor"));
+    tutor.focus();
+    const tutorBackTab = new window.KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true });
+    tutor.dispatchEvent(tutorBackTab);
+    expect(tutorBackTab.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(byId(document, "question"));
+    byId(document, "open-config").click();
+    const rail = document.querySelector(".rail") as any;
+    const configTab = new window.KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+    rail.dispatchEvent(configTab);
+    expect(configTab.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(byId(document, "toggle-rail"));
+    rail.focus();
+    const configBackTab = new window.KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true });
+    rail.dispatchEvent(configBackTab);
+    expect(configBackTab.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(byId(document, "jump-log"));
+  });
+
+  it("locks body scroll for one mutually exclusive mobile dialog and cleans up every exit", async () => {
+    const { window, document } = await boot({ width: 390 });
+    const tutor = byId(document, "tutor");
+    const rail = document.querySelector(".rail") as any;
+    byId(document, "open-config").click();
+    expect(document.body.classList.contains("modal-open")).toBe(true);
+    expect(rail.classList.contains("config-open")).toBe(true);
+    byId(document, "mobile-ask").click();
+    expect(rail.classList.contains("config-open")).toBe(false);
+    expect(rail.hasAttribute("role")).toBe(false);
+    expect(tutor.getAttribute("role")).toBe("dialog");
+    expect(document.body.classList.contains("modal-open")).toBe(true);
+    byId(document, "close-tutor").click();
+    expect(document.body.classList.contains("modal-open")).toBe(false);
+    expect(document.querySelectorAll("[inert]")).toHaveLength(0);
+    byId(document, "open-config").click();
+    byId(document, "jump-log").click();
+    expect(document.body.classList.contains("modal-open")).toBe(false);
+    expect(rail.classList.contains("config-open")).toBe(false);
+    byId(document, "mobile-ask").click();
+    window.innerWidth = 861;
+    window.dispatchEvent(new window.Event("resize"));
+    expect(document.body.classList.contains("modal-open")).toBe(false);
+    expect(tutor.getAttribute("role")).toBe("region");
+    expect(tutor.hasAttribute("aria-modal")).toBe(false);
+    expect(rail.classList.contains("config-open")).toBe(false);
+    expect(document.querySelectorAll("[inert]")).toHaveLength(0);
+    expect(pageHtml).toContain("body.modal-open {\noverflow:hidden");
+  });
+
   it("switches stable tutor semantics only for mobile, permits close while queued, and restores focus", async () => {
     const { document } = await boot({ width: 390 });
     const tutor = byId(document, "tutor");
@@ -241,7 +626,10 @@ describe("Review Tutor composed page", () => {
     opener.click();
     expect(tutor.getAttribute("role")).toBe("dialog");
     expect(tutor.getAttribute("aria-modal")).toBe("true");
-    expect(document.getElementById("diff-pane")?.hasAttribute("inert")).toBe(true);
+    expect(byId(document, "diff-scroll").hasAttribute("inert")).toBe(true);
+    expect(document.querySelector(".toolbar")?.hasAttribute("inert")).toBe(true);
+    expect(document.querySelector(".rail")?.hasAttribute("inert")).toBe(true);
+    expect(tutor.hasAttribute("inert")).toBe(false);
     input(document, "question", "Continue in background");
     (byId(document, "ask")).click();
     await flush();
@@ -270,7 +658,7 @@ describe("Review Tutor composed page", () => {
     const parsed = await boot({ source: special });
     expect(parsed.document.querySelector(".deletion .code")?.textContent).toBe("--i");
     expect(parsed.document.querySelector(".addition .code")?.textContent).toBe("++i");
-    expect(parsed.document.querySelector(".context .line-no")?.textContent).toBe("8");
+    expect(parsed.document.querySelector(".context .line-no")?.lastChild?.textContent).toBe("8");
     const plain = await boot({ source: { ...source, label: "paste.ts", content: "@@decorator\n++value;\n--value;" } });
     expect(plain.document.querySelectorAll(".file.plain .diff-row[role=button]")).toHaveLength(3);
     expect(plain.document.querySelectorAll(".file.plain .line-no")).toHaveLength(3);
@@ -337,12 +725,12 @@ describe("Review Tutor composed page", () => {
     const huge = { ...source, content: "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1,2 +1,2 @@\n+ok\n+" + "é".repeat(9000) };
     const { window, document } = await boot({ source: huge });
     const rows = Array.from(document.querySelectorAll('.diff-row[role="button"]')) as any[];
-    rows[0].dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+    rows[0].querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
     expect(byId(document, "selection-preview").textContent).toBe("ok");
-    rows[1].dispatchEvent(new window.MouseEvent("pointerdown", { bubbles: true, shiftKey: true }));
+    rows[1].querySelector(".line-no").dispatchEvent(new window.MouseEvent("pointerdown", { bubbles: true, shiftKey: true }));
     expect(byId(document, "error").textContent).toContain("16 KiB");
     expect(byId(document, "selection-preview").textContent).toBe("ok");
-    rows[0].dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+    rows[0].querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
     expect(byId(document, "error").textContent).toBe("");
     expect(byId(document, "selection-preview").textContent).toBe("ok");
   });
@@ -350,16 +738,46 @@ describe("Review Tutor composed page", () => {
   it("tears down an open mobile dialog on resize and ignores same-source replay", async () => {
     const { window, document, events } = await boot({ width: 390 });
     const row = document.querySelector('.diff-row[role="button"][tabindex="0"]') as any;
-    row.dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+    row.querySelector(".line-no").dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
     events?.emit("source", source);
     expect(byId(document, "selection-summary").textContent).not.toBe("No code selected");
     byId(document, "mobile-ask").click();
     window.innerWidth = 1200;
     window.dispatchEvent(new window.Event("resize"));
-    expect(byId(document, "tutor").classList.contains("open")).toBe(false);
+    expect(byId(document, "tutor").classList.contains("open")).toBe(true);
     expect(byId(document, "tutor").getAttribute("role")).toBe("region");
-    expect(byId(document, "diff-pane").hasAttribute("inert")).toBe(false);
-    expect(document.activeElement).toBe(row);
+    expect(byId(document, "diff-scroll").hasAttribute("inert")).toBe(false);
+    expect(byId(document, "tutor").previousElementSibling).toBe(row);
+    expect(document.activeElement).toBe(byId(document, "tutor"));
+  });
+
+  it("renders streamed tutor Markdown as safe semantic content", async () => {
+    const { document, events } = await boot();
+    expect(byId(document, "answer").hidden).toBe(true);
+    events?.emit("state", { input: source, questions: [{ id: "q-md", state: "running", answer: "## What it" }] });
+    events?.emit("answer_delta", {
+      id: "q-md",
+      text: " means\n\n`HUMAN_LANGUAGES` contains **ten** names.\n\n```js\nfill(language, HUMAN_LANGUAGES);\n```\n\n- English\n- Portuguese\n\n[Docs](https://example.com/docs) <img src=x onerror=alert(1)>",
+    });
+
+    const answer = byId(document, "answer-text");
+    expect(byId(document, "answer").hidden).toBe(false);
+    expect(answer.querySelector("h2")?.textContent).toBe("What it means");
+    expect(answer.querySelector("p code")?.textContent).toBe("HUMAN_LANGUAGES");
+    expect(answer.querySelector("strong")?.textContent).toBe("ten");
+    expect(answer.querySelector("pre code")?.textContent).toBe("fill(language, HUMAN_LANGUAGES);");
+    expect(Array.from(answer.querySelectorAll("li")).map((node: any) => node.textContent)).toEqual(["English", "Portuguese"]);
+    expect(answer.querySelector("a")?.getAttribute("href")).toBe("https://example.com/docs");
+    expect(answer.querySelector("a")?.getAttribute("rel")).toBe("noopener noreferrer");
+    expect(answer.querySelector("img")).toBeNull();
+    expect(answer.textContent).toContain("<img src=x onerror=alert(1)>");
+  });
+
+  it("renders persisted learning-log answers with the same Markdown semantics", async () => {
+    const entry = { id: "entry-md", inputId: source.id, source, selection: { text: "" }, question: "Explain", answer: "### Result\n\nUse `const`.", modelId: "model-1", preferences: {}, note: "", reviewLater: false, createdAt: new Date().toISOString() };
+    const { document } = await boot({ entries: [entry] });
+    expect(document.querySelector(".log-answer h3")?.textContent).toBe("Result");
+    expect(document.querySelector(".log-answer code")?.textContent).toBe("const");
   });
 
   it("reconciles a pre-response ask race to canonical running answer and keeps later deltas", async () => {
@@ -375,6 +793,33 @@ describe("Review Tutor composed page", () => {
     events?.emit("answer_delta", { id: "q-race", text: "continued" });
     expect(byId(document, "answer-text").textContent).toBe("canonical continued");
     expect(byId(document, "lifecycle").textContent).toBe("Tutor is answering.");
+  });
+
+  it("recovers canonical terminal state when cancellation loses a completion race", async () => {
+    const running = { id: "q-race", state: "running", answer: "partial" };
+    const answered = { id: "q-race", state: "answered", answer: "Complete" };
+    const conflict = new Response(JSON.stringify({ error: "question cancellation failed: expected a queued or running question; refresh state and retry" }), {
+      status: 409,
+      statusText: "Conflict",
+      headers: { "content-type": "application/json" },
+    });
+    const { document } = await boot({
+      askResponse: json({ id: "q-race", state: "queued", answer: "" }),
+      cancelResponse: conflict,
+      stateResponses: [state, { ...state, questions: [running] }, { ...state, questions: [answered] }],
+    });
+    input(document, "question", "Explain this");
+    byId(document, "ask").click();
+    await flush();
+    expect(byId(document, "question-state").textContent).toBe("running");
+
+    byId(document, "cancel").click();
+    await flush();
+
+    expect(byId(document, "question-state").textContent).toBe("answered");
+    expect(byId(document, "answer-text").textContent).toBe("Complete");
+    expect(byId(document, "cancel").disabled).toBe(true);
+    expect(byId(document, "error").textContent).toBe("");
   });
 
   it("keeps an accepted question queued when state reconciliation fails", async () => {

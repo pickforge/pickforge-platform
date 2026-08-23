@@ -52,12 +52,21 @@ export const pageScript = String.raw`
     touchSelection = false,
     lastTutorOpener = null,
     logEntries = [],
-    pendingQuiz = null;
+    pendingQuiz = null,
+    answerMarkdown = "",
+    activeView = "diff",
+    composerSelectionKey = null,
+    historyEntries = [],
+    historyIndex = 0,
+    activeHistoryBadge = null;
+  const learningBadgeGroups = new Map();
+  let railCollapsed = sessionStorage.getItem("reviewTutorRailCollapsed") === "1";
+  let restoreComposerOnDesktop = false;
   const QUIZ_IDS_KEY = "reviewTutorQuizEntryIds";
   const MAX_QUIZ_IDS = 100;
   const MAX_SELECTED_BYTES = 16 * 1024;
   const MAX_CONTEXT_BYTES = 32 * 1024;
-  const MOBILE_BREAKPOINT = 1040;
+  const MOBILE_BREAKPOINT = 860;
   const encoder = new TextEncoder();
   function readQuizEntryIds() {
     try {
@@ -120,6 +129,250 @@ export const pageScript = String.raw`
     select.replaceChildren();
     if (none) select.append(option("", "None"));
     for (const value of values) select.append(option(value));
+  }
+  function appendInline(parent, text, depth = 0) {
+    let buffer = "";
+    const flush = () => {
+      if (buffer) parent.append(document.createTextNode(buffer));
+      buffer = "";
+    };
+    for (let index = 0; index < text.length;) {
+      if (text[index] === "\\" && index + 1 < text.length) {
+        buffer += text[index + 1];
+        index += 2;
+        continue;
+      }
+      if (text.charCodeAt(index) === 96) {
+        let length = 1;
+        while (text.charCodeAt(index + length) === 96) length++;
+        const delimiter = String.fromCharCode(96).repeat(length);
+        const close = text.indexOf(delimiter, index + length);
+        if (close >= 0) {
+          flush();
+          const code = document.createElement("code");
+          code.textContent = text.slice(index + length, close);
+          parent.append(code);
+          index = close + length;
+          continue;
+        }
+      }
+      const strongMarker = text.slice(index, index + 2);
+      if (depth < 8 && (strongMarker === "**" || strongMarker === "__")) {
+        const close = text.indexOf(strongMarker, index + 2);
+        if (close > index + 2) {
+          flush();
+          const strong = document.createElement("strong");
+          appendInline(strong, text.slice(index + 2, close), depth + 1);
+          parent.append(strong);
+          index = close + 2;
+          continue;
+        }
+      }
+      if (depth < 8 && text[index] === "[") {
+        const separator = text.indexOf("](", index + 1);
+        const close = separator < 0 ? -1 : text.indexOf(")", separator + 2);
+        if (separator > index + 1 && close > separator + 2) {
+          const href = text.slice(separator + 2, close).trim();
+          let safe = false;
+          try {
+            const url = new URL(href);
+            safe = url.protocol === "http:" || url.protocol === "https:";
+          } catch {}
+          if (safe) {
+            flush();
+            const link = document.createElement("a");
+            link.href = href;
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+            appendInline(link, text.slice(index + 1, separator), depth + 1);
+            parent.append(link);
+            index = close + 1;
+            continue;
+          }
+        }
+      }
+      const marker = text[index];
+      if (
+        depth < 8 && (marker === "*" || marker === "_") &&
+        text[index + 1] && !/\s/.test(text[index + 1]) &&
+        (marker !== "_" || index === 0 || !/[\w]/.test(text[index - 1]))
+      ) {
+        const close = text.indexOf(marker, index + 1);
+        if (close > index + 1 && !/\s/.test(text[close - 1])) {
+          flush();
+          const emphasis = document.createElement("em");
+          appendInline(emphasis, text.slice(index + 1, close), depth + 1);
+          parent.append(emphasis);
+          index = close + 1;
+          continue;
+        }
+      }
+      buffer += text[index];
+      index++;
+    }
+    flush();
+  }
+  function fenceAt(line) {
+    const indent = line.length - line.trimStart().length;
+    if (indent > 3) return null;
+    const trimmed = line.trimStart();
+    const character = trimmed[0];
+    if (!character || (character.charCodeAt(0) !== 96 && character !== "~")) return null;
+    let length = 0;
+    while (trimmed[length] === character) length++;
+    return length >= 3
+      ? { character, length, info: trimmed.slice(length).trim() }
+      : null;
+  }
+  function listItem(line) {
+    const unordered = line.match(/^ {0,3}[-+*][ \t]+(.+)$/);
+    if (unordered) return { ordered: false, content: unordered[1] };
+    const ordered = line.match(/^ {0,3}\d+[.)][ \t]+(.+)$/);
+    return ordered ? { ordered: true, content: ordered[1] } : null;
+  }
+  function startsMarkdownBlock(line) {
+    return Boolean(
+      !line.trim() || fenceAt(line) || /^ {0,3}#{1,6}[ \t]+/.test(line) ||
+      /^ {0,3}>[ \t]?/.test(line) || listItem(line) ||
+      /^ {0,3}((\*[ \t]*){3,}|(-[ \t]*){3,}|(_[ \t]*){3,})$/.test(line),
+    );
+  }
+  function renderMarkdown(container, markdown) {
+    container.replaceChildren();
+    const lines = String(markdown || "").replace(/\r\n?/g, "\n").split("\n");
+    for (let index = 0; index < lines.length;) {
+      const line = lines[index];
+      if (!line.trim()) {
+        index++;
+        continue;
+      }
+      const fence = fenceAt(line);
+      if (fence) {
+        const content = [];
+        index++;
+        while (index < lines.length) {
+          const closing = fenceAt(lines[index]);
+          if (closing && closing.character === fence.character && closing.length >= fence.length && !closing.info) {
+            index++;
+            break;
+          }
+          content.push(lines[index]);
+          index++;
+        }
+        const pre = document.createElement("pre");
+        const code = document.createElement("code");
+        code.textContent = content.join("\n");
+        const language = fence.info.split(/\s+/)[0];
+        if (/^[\w#+.-]+$/.test(language || "")) code.dataset.language = language;
+        pre.append(code);
+        container.append(pre);
+        continue;
+      }
+      const heading = line.match(/^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$/);
+      if (heading) {
+        const node = document.createElement("h" + heading[1].length);
+        appendInline(node, heading[2]);
+        container.append(node);
+        index++;
+        continue;
+      }
+      if (/^ {0,3}((\*[ \t]*){3,}|(-[ \t]*){3,}|(_[ \t]*){3,})$/.test(line)) {
+        container.append(document.createElement("hr"));
+        index++;
+        continue;
+      }
+      if (/^ {0,3}>[ \t]?/.test(line)) {
+        const quoted = [];
+        while (index < lines.length && /^ {0,3}>[ \t]?/.test(lines[index])) {
+          quoted.push(lines[index].replace(/^ {0,3}>[ \t]?/, ""));
+          index++;
+        }
+        const blockquote = document.createElement("blockquote");
+        renderMarkdown(blockquote, quoted.join("\n"));
+        container.append(blockquote);
+        continue;
+      }
+      const firstItem = listItem(line);
+      if (firstItem) {
+        const list = document.createElement(firstItem.ordered ? "ol" : "ul");
+        while (index < lines.length) {
+          const item = listItem(lines[index]);
+          if (!item || item.ordered !== firstItem.ordered) break;
+          const node = document.createElement("li");
+          appendInline(node, item.content);
+          list.append(node);
+          index++;
+        }
+        container.append(list);
+        continue;
+      }
+      const paragraphLines = [line];
+      index++;
+      while (index < lines.length && !startsMarkdownBlock(lines[index])) {
+        paragraphLines.push(lines[index]);
+        index++;
+      }
+      const paragraph = document.createElement("p");
+      paragraphLines.forEach((part, partIndex) => {
+        const hardBreak = / {2,}$/.test(part);
+        appendInline(paragraph, hardBreak ? part.replace(/ {2,}$/, "") : part);
+        if (partIndex < paragraphLines.length - 1)
+          paragraph.append(hardBreak ? document.createElement("br") : document.createTextNode(" "));
+      });
+      container.append(paragraph);
+    }
+  }
+  function updateAnswerVisibility() {
+    element("answer").hidden = !answerMarkdown.trim() && !element("answer-tail").textContent.trim();
+  }
+  function setAnswer(markdown) {
+    answerMarkdown = typeof markdown === "string" ? markdown : "";
+    renderMarkdown(element("answer-text"), answerMarkdown);
+    updateAnswerVisibility();
+  }
+  function appendAnswer(markdown) {
+    answerMarkdown += markdown;
+    renderMarkdown(element("answer-text"), answerMarkdown);
+    updateAnswerVisibility();
+  }
+  function setAnswerTail(text) {
+    element("answer-tail").textContent = text;
+    updateAnswerVisibility();
+  }
+  const diffControls = ["files", "previous-file", "next-file", "select-lines", "open-composer", "totals"];
+  function setView(view, focusPanel = false) {
+    activeView = view === "log" ? "log" : "diff";
+    if (activeView === "log") hideInlineComposer();
+    element("diff").hidden = activeView !== "diff";
+    element("log-section").hidden = activeView !== "log";
+    for (const id of diffControls) element(id).hidden = activeView !== "diff";
+    element("mobile-ask").hidden = activeView !== "diff";
+    for (const name of ["diff", "log"]) {
+      const tab = element("view-" + name);
+      const selected = name === activeView;
+      tab.setAttribute("aria-selected", String(selected));
+      tab.tabIndex = selected ? 0 : -1;
+    }
+    announce(activeView === "log" ? "Learning log view." : "Diff view.");
+    if (focusPanel) (activeView === "log" ? element("log-title") : element("view-diff")).focus();
+  }
+  function handleViewKey(event) {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End", "Enter", " "].includes(event.key)) return;
+    const tabs = [element("view-diff"), element("view-log")];
+    const current = tabs.indexOf(event.currentTarget);
+    if (["Enter", " "].includes(event.key)) {
+      setView(event.currentTarget.id === "view-log" ? "log" : "diff");
+    } else {
+      const target = event.key === "Home"
+        ? tabs[0]
+        : event.key === "End"
+          ? tabs.at(-1)
+          : event.key === "ArrowLeft"
+            ? tabs[Math.max(0, current - 1)]
+            : tabs[Math.min(tabs.length - 1, current + 1)];
+      target.focus();
+    }
+    event.preventDefault();
   }
   function updateSourceFields() {
     for (const id of [
@@ -289,7 +542,180 @@ export const pageScript = String.raw`
       element("selection-preview").textContent = lines.slice(0, 6).join("\n") + (lines.length > 6 ? "\n…" + (lines.length - 6) + " more" : "");
       element("clear-selection").hidden = false;
     }
+    element("selection-helper").hidden = !selection;
     updateActions();
+  }
+  function anchorComposer() {
+    const tutor = element("tutor");
+    const endRow = selection && rowNode({ fileIndex: selection.fileIndex, rowIndex: selection.end });
+    const inline = tutor.classList.contains("open") && endRow && innerWidth > MOBILE_BREAKPOINT && !endRow.closest(".rows")?.hidden;
+    const active = tutor.contains(document.activeElement) ? document.activeElement : null;
+    const caret = active?.tagName === "TEXTAREA" ? [active.selectionStart, active.selectionEnd] : null;
+    let moved = false;
+    if (inline) {
+      if (tutor.previousElementSibling !== endRow) { endRow.after(tutor); moved = true; }
+    } else if (tutor.parentElement !== element("diff-pane") || tutor.nextElementSibling !== element("diff-scroll")) {
+      element("diff-scroll").before(tutor);
+      moved = true;
+    }
+    if (moved && active) {
+      active.focus({ preventScroll: true });
+      if (caret) active.setSelectionRange(caret[0], caret[1]);
+    }
+    return moved;
+  }
+  function reanchorOpenComposer() {
+    const tutor = element("tutor"), moved = anchorComposer();
+    if (moved && tutor.classList.contains("open") && innerWidth > MOBILE_BREAKPOINT)
+      tutor.scrollIntoView({ block: "nearest" });
+    return moved;
+  }
+  function hideInlineComposer() {
+    const tutor = element("tutor");
+    if (tutor.getAttribute("role") === "dialog" || !tutor.classList.contains("open")) return;
+    restoreComposerOnDesktop = false;
+    tutor.classList.remove("open");
+    if (activeHistoryBadge) activeHistoryBadge.setAttribute("aria-expanded", "false");
+    anchorComposer();
+  }
+  function selectionContains(fileIndex, rowIndex) {
+    return !!selection && selection.fileIndex === fileIndex && rowIndex >= selection.start && rowIndex <= selection.end;
+  }
+  function selectionIdentity(value = selection) {
+    if (!value) return (currentSource?.digest || "none") + ":all";
+    return [currentSource?.digest || "none", value.file, value.startLine ?? value.start, value.endLine ?? value.end, value.text].join(":");
+  }
+  function clearHistoryState() {
+    historyEntries = [];
+    historyIndex = 0;
+    element("history-pager").hidden = true;
+    if (activeHistoryBadge) activeHistoryBadge.setAttribute("aria-expanded", "false");
+    activeHistoryBadge = null;
+  }
+  function resetComposer() {
+    if (["queued", "running"].includes(currentQuestionState)) return;
+    currentQuestionId = undefined;
+    currentQuestionState = undefined;
+    element("question").value = "";
+    element("question-state").textContent = "";
+    element("answer").classList.remove("streaming");
+    setAnswerTail("");
+    setAnswer("");
+    setAskLabel("Ask");
+    clearHistoryState();
+    updateActions();
+  }
+  function prepareFreshComposer() {
+    const next = selectionIdentity();
+    if (composerSelectionKey !== next && !["queued", "running"].includes(currentQuestionState)) resetComposer();
+    composerSelectionKey = next;
+  }
+  function rangeForEntry(entry) {
+    if (!currentSource || entry.source?.digest !== currentSource.digest || !entry.selection?.file ||
+        !Number.isInteger(entry.selection.startLine) || !Number.isInteger(entry.selection.endLine)) return null;
+    const fileIndex = files.findIndex((file) => file.path === entry.selection.file);
+    if (fileIndex < 0) return null;
+    const file = files[fileIndex];
+    const expectedText = entry.selection.text || "";
+    for (let start = 0; start < file.lines.length; start++) {
+      const first = file.lines[start];
+      if (!rowSelectable(first) || first.selectLine !== entry.selection.startLine) continue;
+      for (let end = start; end < file.lines.length && file.lines[end].block === first.block; end++) {
+        const chosen = file.lines.slice(start, end + 1).filter(rowSelectable);
+        if (!chosen.length || chosen.map((item) => item.text).join("\n") !== expectedText) continue;
+        const commonNew = chosen.every((item) => item.new != null);
+        const commonOld = chosen.every((item) => item.old != null);
+        const side = commonNew ? "new" : commonOld ? "old" : null;
+        if (!side) continue;
+        const startLine = Math.min(...chosen.map((item) => item[side]));
+        const endLine = Math.max(...chosen.map((item) => item[side]));
+        if (startLine === entry.selection.startLine && endLine === entry.selection.endLine)
+          return { fileIndex, start, end };
+      }
+    }
+    return null;
+  }
+  function restoreEntryRange(entry) {
+    const range = rangeForEntry(entry);
+    if (!range) return false;
+    selectionAnchor = { fileIndex: range.fileIndex, rowIndex: range.start };
+    chooseRow(range.fileIndex, range.end, true, false);
+    selectionAnchor = null;
+    return true;
+  }
+  function renderHistoryEntry(index) {
+    const item = historyEntries[index];
+    if (!item || !restoreEntryRange(item.entry)) return;
+    historyIndex = index;
+    currentQuestionId = undefined;
+    currentQuestionState = "answered";
+    composerSelectionKey = selectionIdentity();
+    element("question").value = item.entry.question;
+    element("question-state").textContent = "answered";
+    setAnswer(item.entry.answer);
+    setAnswerTail("Saved answer · " + new Date(item.entry.createdAt).toLocaleString());
+    const pager = element("history-pager");
+    pager.hidden = historyEntries.length < 2;
+    element("history-position").textContent = (index + 1) + " of " + historyEntries.length;
+    element("history-previous").disabled = index === 0;
+    element("history-next").disabled = index === historyEntries.length - 1;
+    setAskLabel("Ask");
+    updateActions();
+    reanchorOpenComposer();
+  }
+  function openHistory(groupKey, badge) {
+    if (["queued", "running"].includes(currentQuestionState)) {
+      showError(new Error("cancel or wait for the current answer before opening a saved answer"), "Saved answer");
+      return;
+    }
+    const group = learningBadgeGroups.get(groupKey);
+    if (!group?.length) return;
+    clearHistoryState();
+    historyEntries = [...group].sort((left, right) => new Date(right.entry.createdAt) - new Date(left.entry.createdAt));
+    activeHistoryBadge = badge;
+    badge.setAttribute("aria-expanded", "true");
+    setView("diff");
+    renderHistoryEntry(0);
+    openTutor(badge, true);
+    element("question").focus();
+    announce("Saved answer restored.");
+  }
+  function updateLearningBadges() {
+    const existing = new Map([...document.querySelectorAll(".tutored-badge")]
+      .map((badge) => [badge.dataset.historyKey, badge]));
+    const nextGroups = new Map();
+    for (const entry of logEntries) {
+      const range = rangeForEntry(entry);
+      if (!range) continue;
+      const key = range.fileIndex + ":" + range.start;
+      const group = nextGroups.get(key) || [];
+      group.push({ entry, range });
+      nextGroups.set(key, group);
+    }
+    for (const [key, badge] of existing) {
+      if (!nextGroups.has(key)) badge.remove();
+    }
+    document.querySelectorAll(".diff-row.has-tutored").forEach((row) => row.classList.remove("has-tutored"));
+    learningBadgeGroups.clear();
+    for (const [key, group] of nextGroups) {
+      learningBadgeGroups.set(key, group);
+      const row = rowNode({ fileIndex: group[0].range.fileIndex, rowIndex: group[0].range.start });
+      if (!row) continue;
+      const count = group.length;
+      const first = group[0].entry.selection;
+      let badge = existing.get(key);
+      if (!badge || !badge.isConnected) {
+        badge = document.createElement("button");
+        badge.className = "tutored-badge";
+        badge.type = "button";
+        badge.dataset.historyKey = key;
+        badge.setAttribute("aria-expanded", "false");
+        row.append(badge);
+      }
+      badge.textContent = count === 1 ? "¶" : String(count);
+      badge.setAttribute("aria-label", count + " saved " + (count === 1 ? "answer" : "answers") + ", lines " + first.startLine + "–" + first.endLine);
+      row.classList.add("has-tutored");
+    }
   }
   function handleRowKey(event, fileIndex, rowIndex) {
     let target = rowIndex;
@@ -301,14 +727,19 @@ export const pageScript = String.raw`
         target = Math.min(files[fileIndex].lines.length - 1, rowIndex + 1);
         break;
       case " ":
+        hideInlineComposer();
         selectionAnchor = { fileIndex, rowIndex };
         chooseRow(fileIndex, rowIndex, false, false);
         event.preventDefault();
         return;
-      case "Enter":
-        chooseRow(fileIndex, rowIndex, true, true);
+      case "Enter": {
+        if (!selectionContains(fileIndex, rowIndex)) chooseRow(fileIndex, rowIndex, false, false);
+        const origin = rowNode({ fileIndex, rowIndex });
+        openTutor(origin);
+        element("question").focus();
         event.preventDefault();
         return;
+      }
       default:
         return;
     }
@@ -321,12 +752,14 @@ export const pageScript = String.raw`
       target += direction;
     }
     if (target < 0 || target >= files[fileIndex].lines.length) return;
+    hideInlineComposer();
     chooseRow(fileIndex, target, event.shiftKey, false);
     event.preventDefault();
     const next = rowNode({ fileIndex, rowIndex: target });
     if (next) next.focus();
   }
   function renderDiff() {
+    if (element("tutor").parentElement !== element("diff-pane")) element("diff-scroll").before(element("tutor"));
     const container = element("diff");
     container.replaceChildren();
     if (preambleText) {
@@ -388,7 +821,11 @@ export const pageScript = String.raw`
           : fileIndex === 0 && rowIndex === file.lines.findIndex(rowSelectable)
             ? 0
             : -1;
-        row.append(makeSpan("line-no", data.old == null ? "" : String(data.old)));
+        const firstLineNumber = makeSpan("line-no", data.old == null ? "" : String(data.old));
+        const lineAction = makeSpan("line-action", "+");
+        lineAction.setAttribute("aria-hidden", "true");
+        firstLineNumber.prepend(lineAction);
+        row.append(firstLineNumber);
         if (file.kind !== "plain") row.append(makeSpan("line-no", data.new == null ? "" : String(data.new)));
         row.append(
           makeSpan(
@@ -406,12 +843,40 @@ export const pageScript = String.raw`
       rows.addEventListener("pointerdown", (event) => {
         const row = event.target.closest(".diff-row[data-row]");
         if (!row || !rows.contains(row)) return;
-        if (event.pointerType === "touch" && !touchSelection) return;
+        const touch = event.pointerType === "touch";
+        if (event.target.closest(".tutored-badge")) return;
+        if (touch && !touchSelection) return;
+        if (!touch && event.target.closest(".line-action")) return;
+        if (!touch && !event.target.closest(".line-no,.marker")) return;
+        if (!touch) hideInlineComposer();
         const fileIndex = Number(row.dataset.file), rowIndex = Number(row.dataset.row);
         if (touchSelection && selectionAnchor) chooseRow(fileIndex, rowIndex, true, true);
-        else chooseRow(fileIndex, rowIndex, event.shiftKey, false);
+        else {
+          chooseRow(fileIndex, rowIndex, event.shiftKey, false);
+          if (!touch) row.focus({ preventScroll: true });
+        }
+      });
+      rows.addEventListener("click", (event) => {
+        const badge = event.target.closest(".tutored-badge");
+        if (badge) {
+          event.stopPropagation();
+          openHistory(badge.dataset.historyKey, badge);
+          return;
+        }
+        const action = event.target.closest(".line-action");
+        if (!action || event.pointerType === "touch") return;
+        const row = action.closest(".diff-row[data-row]");
+        if (!row || !rows.contains(row)) return;
+        const fileIndex = Number(row.dataset.file), rowIndex = Number(row.dataset.row);
+        if (!selectionContains(fileIndex, rowIndex)) chooseRow(fileIndex, rowIndex, false, false);
+        openTutor(row);
+        element("question").focus();
+      });
+      rows.addEventListener("mousedown", (event) => {
+        if (event.target.closest(".line-no,.marker") && !event.target.closest(".tutored-badge")) event.preventDefault();
       });
       rows.addEventListener("keydown", (event) => {
+        if (event.target.closest(".tutored-badge")) return;
         const row = event.target.closest(".diff-row[data-row]");
         if (row && rows.contains(row)) handleRowKey(event, Number(row.dataset.file), Number(row.dataset.row));
       });
@@ -421,6 +886,7 @@ export const pageScript = String.raw`
         disclosure.setAttribute("aria-label", (expanded ? "Expand " : "Collapse ") + file.path);
         disclosure.textContent = expanded ? "▸" : "▾";
         rows.hidden = expanded;
+        if (rows.contains(element("tutor"))) reanchorOpenComposer();
       });
       article.append(head, rows);
       container.append(article);
@@ -434,6 +900,7 @@ export const pageScript = String.raw`
       makeSpan("delete", "−" + deletions),
     );
     updateSelection();
+    updateLearningBadges();
   }
   function scrollFile(index) {
     const target = element("file-" + index);
@@ -466,7 +933,7 @@ export const pageScript = String.raw`
       ? "Load a source first."
       : !hasQuestion
         ? "Enter a question to ask the tutor."
-        : "Ready to ask.";
+        : "";
     const selectionLabel = selection && selection.startLine != null
       ? selection.file + ":" + selection.startLine + "-" + selection.endLine
       : selection ? selection.count + " selected lines" : "";
@@ -481,7 +948,7 @@ export const pageScript = String.raw`
   }
   function updateQuestion(question) {
     currentQuestionState = question.state;
-    if (typeof question.answer === "string") element("answer-text").textContent = question.answer;
+    if (typeof question.answer === "string") setAnswer(question.answer);
     element("question-state").replaceChildren();
     if (question.state === "running") {
       const pulse = document.createElement("span");
@@ -503,21 +970,18 @@ export const pageScript = String.raw`
     }
     if (question.state === "running") setAskLabel("Running");
     if (question.state === "answered") {
-      element("answer-text").textContent = question.answer;
       announce("Answer complete.");
       setAskLabel("Ask");
       refreshLog().catch((error) => showError(error, "Log refresh"));
     }
     if (question.state === "cancelled") {
       pendingQuiz = null;
-      element("answer-text").textContent = question.answer;
-      element("answer-tail").textContent = "Cancelled.";
+      setAnswerTail("Cancelled.");
       announce("Cancelled.");
       setAskLabel("Ask");
     }
     if (question.state === "failed") {
       pendingQuiz = null;
-      element("answer-text").textContent = question.answer;
       if (question.error)
         showError(new Error(question.error.message), "Question");
       announce("Question failed.");
@@ -526,17 +990,20 @@ export const pageScript = String.raw`
     updateActions();
   }
   async function reconcileQuestion() {
-    if (!currentQuestionId) return;
+    if (!currentQuestionId) return null;
     const snapshot = await api("/api/state");
     const question = snapshot.questions.find((item) => item.id === currentQuestionId);
     if (question) updateQuestion(question);
+    return question || null;
   }
   async function submitQuestion() {
     if (asking || !currentSource || !element("question").value.trim()) return;
     asking = true;
     clearError();
-    element("answer-tail").textContent = "";
-    element("answer-text").textContent = "";
+    clearHistoryState();
+    composerSelectionKey = selectionIdentity();
+    setAnswerTail("");
+    setAnswer("");
     element("ask").setAttribute("aria-busy", "true");
     setAskLabel("Asking…", true);
     announce("Question sent. Waiting for the tutor.");
@@ -644,6 +1111,7 @@ export const pageScript = String.raw`
       );
     if (!entries.length) {
       container.append(makeSpan("helper", "No learning entries yet."));
+      updateLearningBadges();
       return;
     }
     for (const entry of entries) {
@@ -655,7 +1123,7 @@ export const pageScript = String.raw`
       const meta = makeSpan("metadata", metadata(entry));
       const answer = document.createElement("div");
       answer.className = "log-answer";
-      answer.textContent = entry.answer;
+      renderMarkdown(answer, entry.answer);
       const noteLabel = document.createElement("label");
       noteLabel.className = "field";
       noteLabel.append(makeSpan("", "Note"));
@@ -737,6 +1205,7 @@ export const pageScript = String.raw`
       item.append(title, meta, answer, noteLabel, actions);
       container.append(item);
     }
+    updateLearningBadges();
   }
   async function refreshLog() {
     const revision = logRevision;
@@ -750,52 +1219,107 @@ export const pageScript = String.raw`
     logEntries = next;
     renderLog();
   }
-  function setBackgroundIsolated(isolated) {
-    for (const node of [document.querySelector(".topbar"), element("diff-pane"), element("log-section"), element("mobile-ask")]) {
+  function setBackgroundIsolated(isolated, owner) {
+    const nodes = owner === "config"
+      ? [document.querySelector(".topbar"), element("diff-pane"), element("mobile-ask")]
+      : [document.querySelector(".topbar"), element("source-setup"), document.querySelector(".toolbar"), element("diff-scroll"), document.querySelector(".rail"), element("mobile-ask")];
+    for (const node of nodes) {
       if (!node) continue;
       if (isolated) node.setAttribute("inert", "");
       else node.removeAttribute("inert");
     }
   }
-  function openTutor(opener) {
-    if (innerWidth > MOBILE_BREAKPOINT) return;
+  function updateModalLock() {
+    const tutorOpen = element("tutor").classList.contains("open") && element("tutor").getAttribute("role") === "dialog";
+    const rail = document.querySelector(".rail");
+    const configOpen = rail.classList.contains("config-open") && rail.getAttribute("role") === "dialog";
+    document.body.classList.toggle("modal-open", tutorOpen || configOpen);
+  }
+  function closeConfig(restore = true) {
+    const rail = document.querySelector(".rail");
+    const wasOpen = rail.classList.contains("config-open");
+    rail.classList.remove("config-open");
+    rail.removeAttribute("role");
+    rail.removeAttribute("aria-modal");
+    rail.removeAttribute("aria-labelledby");
+    setBackgroundIsolated(false, "config");
+    updateModalLock();
+    if (restore && wasOpen) element("open-config").focus();
+  }
+  function openConfig() {
+    if (element("tutor").getAttribute("role") === "dialog") closeTutor(false);
+    const rail = document.querySelector(".rail");
+    rail.classList.add("config-open");
+    rail.setAttribute("role", "dialog");
+    rail.setAttribute("aria-modal", "true");
+    rail.setAttribute("aria-labelledby", "config-title");
+    setBackgroundIsolated(true, "config");
+    updateModalLock();
+    rail.focus({ preventScroll: true });
+  }
+  function applyRail() {
+    const workbench = document.querySelector(".workbench"), rail = document.querySelector(".rail"), toggle = element("toggle-rail");
+    if (innerWidth > MOBILE_BREAKPOINT) {
+      closeConfig(false);
+      workbench.classList.toggle("rail-collapsed", railCollapsed);
+      element("config-section").hidden = railCollapsed;
+      toggle.setAttribute("aria-controls", "config-section");
+      toggle.setAttribute("aria-expanded", String(!railCollapsed));
+      toggle.setAttribute("aria-label", (railCollapsed ? "Expand" : "Collapse") + " configuration");
+      toggle.textContent = railCollapsed ? "‹" : "›";
+    } else {
+      workbench.classList.remove("rail-collapsed");
+      element("config-section").hidden = false;
+      toggle.removeAttribute("aria-controls");
+      toggle.removeAttribute("aria-expanded");
+      toggle.setAttribute("aria-label", "Close configuration");
+      toggle.textContent = "Close";
+    }
+  }
+  function openTutor(opener, preserve = false) {
+    if (!preserve) prepareFreshComposer();
     lastTutorOpener = opener;
+    restoreComposerOnDesktop = true;
     const tutor = element("tutor");
+    if (innerWidth > MOBILE_BREAKPOINT) {
+      tutor.classList.add("open");
+      reanchorOpenComposer();
+      return;
+    }
+    closeConfig(false);
     tutor.classList.add("open");
     tutor.setAttribute("role", "dialog");
     tutor.setAttribute("aria-modal", "true");
-    setBackgroundIsolated(true);
+    setBackgroundIsolated(true, "tutor");
+    updateModalLock();
     tutor.focus();
   }
-  function closeTutor() {
-    const tutor = element("tutor");
+  function closeTutor(restore = true) {
+    const tutor = element("tutor"), dialog = tutor.getAttribute("role") === "dialog";
+    restoreComposerOnDesktop = false;
     tutor.classList.remove("open");
+    if (activeHistoryBadge) activeHistoryBadge.setAttribute("aria-expanded", "false");
     tutor.setAttribute("role", "region");
     tutor.removeAttribute("aria-modal");
-    setBackgroundIsolated(false);
-    if (lastTutorOpener) lastTutorOpener.focus();
+    if (dialog) setBackgroundIsolated(false, "tutor");
+    anchorComposer();
+    updateModalLock();
+    const fallback = dialog ? lastTutorOpener : (selection ? rowNode(activeRow) : lastTutorOpener) || rowNode(activeRow) || element("open-composer");
+    if (restore && fallback) fallback.focus();
+  }
+  function trapFocus(event, container) {
+    if (event.key !== "Tab" || container.getAttribute("role") !== "dialog") return;
+    const focusable = [...container.querySelectorAll("button:not([disabled]),select:not([disabled]),textarea:not([disabled]),input:not([disabled])")]
+      .filter((node) => !node.closest("[hidden]"));
+    const first = focusable[0], last = focusable.at(-1), active = document.activeElement;
+    if (!first || !last || !container.contains(active)) return;
+    if (!focusable.includes(active)) { (event.shiftKey ? last : first).focus(); event.preventDefault(); }
+    else if (event.shiftKey && active === first) { last.focus(); event.preventDefault(); }
+    else if (!event.shiftKey && active === last) { first.focus(); event.preventDefault(); }
   }
   function trapDialog(event) {
-    if (event.key === "Escape" && element("tutor").classList.contains("open")) {
-      closeTutor();
-      return;
-    }
-    if (event.key !== "Tab" || !element("tutor").classList.contains("open"))
-      return;
-    const focusable = [
-      ...element("tutor").querySelectorAll(
-        "button:not([disabled]):not([hidden]),select:not([disabled]):not([hidden]),textarea:not([disabled]):not([hidden]),input:not([disabled]):not([hidden])",
-      ),
-    ];
-    const first = focusable[0],
-      last = focusable.at(-1);
-    if (event.shiftKey && document.activeElement === first) {
-      last.focus();
-      event.preventDefault();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      first.focus();
-      event.preventDefault();
-    }
+    if (event.key === "Escape" && element("tutor").classList.contains("open")) { closeTutor(); return; }
+    trapFocus(event, element("tutor"));
   }
   async function initialize() {
     fill(element("language"), HUMAN_LANGUAGES);
@@ -837,7 +1361,7 @@ export const pageScript = String.raw`
     events.addEventListener("answer_delta", (event) => {
       const delta = parseEvent(event, "Live answer");
       if (delta && delta.id === currentQuestionId) {
-        element("answer-text").textContent += delta.text;
+        appendAnswer(delta.text);
         element("answer").classList.add("streaming");
       }
     });
@@ -906,6 +1430,9 @@ export const pageScript = String.raw`
     selection = null;
     selectionAnchor = null;
     activeRow = null;
+    composerSelectionKey = null;
+    if (!["queued", "running"].includes(currentQuestionState)) resetComposer();
+    setView("diff");
     element("source-setup").hidden = true;
     element("change-source").hidden = false;
     element("top-source").textContent = source.label;
@@ -914,6 +1441,12 @@ export const pageScript = String.raw`
   }
   element("kind").addEventListener("change", updateSourceFields);
   element("model").addEventListener("change", updateThinking);
+  for (const id of ["view-diff", "view-log"]) {
+    element(id).addEventListener("click", () => setView(id === "view-log" ? "log" : "diff"));
+    element(id).addEventListener("keydown", handleViewKey);
+  }
+  element("history-previous").addEventListener("click", () => renderHistoryEntry(Math.max(0, historyIndex - 1)));
+  element("history-next").addEventListener("click", () => renderHistoryEntry(Math.min(historyEntries.length - 1, historyIndex + 1)));
   element("question").addEventListener("input", updateActions);
   element("question").addEventListener("keydown", (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
@@ -977,22 +1510,56 @@ export const pageScript = String.raw`
     selection = null;
     selectionAnchor = null;
     updateSelection(previousSelection, activeRow);
+    reanchorOpenComposer();
     rowNode(activeRow)?.focus();
   });
-  element("mobile-ask").addEventListener("click", (event) =>
-    openTutor(event.currentTarget),
-  );
+  element("mobile-ask").addEventListener("click", (event) => openTutor(event.currentTarget));
+  element("open-composer").addEventListener("click", (event) => { openTutor(event.currentTarget); element("question").focus(); });
+  element("open-config").addEventListener("click", openConfig);
+  element("toggle-rail").addEventListener("click", () => {
+    if (innerWidth <= MOBILE_BREAKPOINT) { closeConfig(); return; }
+    railCollapsed = !railCollapsed;
+    sessionStorage.setItem("reviewTutorRailCollapsed", railCollapsed ? "1" : "0");
+    applyRail();
+  });
+  element("jump-log").addEventListener("click", () => {
+    if (innerWidth <= MOBILE_BREAKPOINT) closeConfig(false);
+    setView("log", true);
+  });
   element("close-tutor").addEventListener("click", closeTutor);
   element("tutor").addEventListener("keydown", trapDialog);
+  document.querySelector(".rail").addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && event.currentTarget.getAttribute("role") === "dialog") { closeConfig(); return; }
+    trapFocus(event, event.currentTarget);
+  });
   addEventListener("resize", () => {
-    const tutor = element("tutor");
-    if (innerWidth <= MOBILE_BREAKPOINT || !tutor.classList.contains("open")) return;
-    const fallback = rowNode(activeRow) || element("change-source");
-    tutor.classList.remove("open");
-    tutor.setAttribute("role", "region");
-    tutor.removeAttribute("aria-modal");
-    setBackgroundIsolated(false);
-    if (fallback && !fallback.hidden) fallback.focus();
+    const tutor = element("tutor"), focusedInside = tutor.contains(document.activeElement);
+    if (innerWidth <= MOBILE_BREAKPOINT) {
+      if (tutor.classList.contains("open") && tutor.getAttribute("role") !== "dialog") {
+        restoreComposerOnDesktop = true;
+        tutor.classList.remove("open");
+        anchorComposer();
+        if (focusedInside) (rowNode(activeRow) || element("change-source")).focus();
+      }
+    } else {
+      if (tutor.getAttribute("role") === "dialog") {
+        restoreComposerOnDesktop = true;
+        tutor.setAttribute("role", "region");
+        tutor.removeAttribute("aria-modal");
+        setBackgroundIsolated(false, "tutor");
+        updateModalLock();
+      }
+      if (restoreComposerOnDesktop) {
+        tutor.classList.add("open");
+        reanchorOpenComposer();
+      } else {
+        tutor.classList.remove("open");
+        anchorComposer();
+      }
+      const fallback = rowNode(activeRow) || element("change-source");
+      if (focusedInside && !tutor.classList.contains("open") && fallback && !fallback.hidden) fallback.focus();
+    }
+    applyRail();
   });
   element("cancel").addEventListener("click", async () => {
     clearError();
@@ -1004,7 +1571,12 @@ export const pageScript = String.raw`
         }),
       );
     } catch (error) {
-      showError(error, "Cancellation");
+      let canonical = null;
+      try {
+        canonical = await reconcileQuestion();
+      } catch {}
+      if (!canonical || ["queued", "running"].includes(canonical.state))
+        showError(error, "Cancellation");
     }
   });
   element("refresh").addEventListener("click", () => {
@@ -1031,6 +1603,8 @@ export const pageScript = String.raw`
     }
   });
   updateSourceFields();
+  setView("diff");
+  applyRail();
   initialize().catch((error) => {
     element("connection").textContent = "failed";
     element("connection").dataset.state = "failed";

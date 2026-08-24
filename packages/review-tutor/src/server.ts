@@ -125,7 +125,7 @@ async function primaryRoute(request: IncomingMessage, response: ServerResponse, 
 async function secondaryRoute(request: IncomingMessage, response: ServerResponse, url: URL, session: ReviewTutorSession): Promise<void> {
   const method = request.method;
   const path = url.pathname;
-  if (method === "GET" && path === "/api/structure") return send(response, session.structure());
+  if (method === "GET" && path === "/api/structure") return send(response, await session.structure(url));
   if (method === "GET" && path === "/api/log") return send(response, await session.log(url));
   const log = path.match(/^\/api\/log\/([^/]+)$/);
   if (method === "PATCH" && log) return send(response, await session.patchLog(request, log[1]!));

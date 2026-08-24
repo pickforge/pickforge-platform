@@ -5,11 +5,11 @@ const recoveryStyles = `:root{color-scheme:dark;font-family:Geist,system-ui,sans
 
 export const bootstrapHtml = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Review Tutor · Pickforge</title><style>${recoveryStyles}</style></head>
-<body><p>Review Tutor session not found in this tab. Reopen /review-tutor in Pi, or paste the full tutor link.</p><script>
-try {
-  const token = sessionStorage.getItem("reviewTutorSession");
-  if (token) location.replace("/?session=" + encodeURIComponent(token));
-} catch {}
+<body><p id="message" hidden>Review Tutor session not found in this tab. Reopen /review-tutor in Pi, or paste the full tutor link.</p><script>
+let token = null;
+try { token = sessionStorage.getItem("reviewTutorSession"); } catch {}
+if (token) location.replace("/?session=" + encodeURIComponent(token));
+else document.getElementById("message").hidden = false;
 </script></body></html>`;
 
 export const staleSessionHtml = `<!doctype html>

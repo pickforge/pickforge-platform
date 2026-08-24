@@ -176,6 +176,39 @@ afterEach(async () => {
 });
 
 describe("local server security", () => {
+  it("serves page recovery HTML while preserving API authorization", async () => {
+    const { server } = await start();
+    try {
+      const bootstrap = await fetch(`http://127.0.0.1:${server.port}/`);
+      expect(bootstrap.status).toBe(200);
+      expect(bootstrap.headers.get("content-type")).toContain("text/html");
+      const bootstrapBody = await bootstrap.text();
+      expect(bootstrapBody).toContain('sessionStorage.getItem("reviewTutorSession")');
+      expect(bootstrapBody).toContain("location.replace");
+      expect(bootstrapBody).toContain("Review Tutor session not found in this tab. Reopen /review-tutor in Pi, or paste the full tutor link.");
+      expect(bootstrapBody).not.toContain(server.token);
+
+      const stale = await fetch(`http://127.0.0.1:${server.port}/?session=wrong`);
+      expect(stale.status).toBe(401);
+      expect(stale.headers.get("content-type")).toContain("text/html");
+      const staleBody = await stale.text();
+      expect(staleBody).toContain('sessionStorage.removeItem("reviewTutorSession")');
+      expect(staleBody).toContain("This Review Tutor session has ended. Reopen /review-tutor in Pi.");
+      expect(staleBody).not.toContain("location.replace");
+      expect(staleBody).not.toContain(server.token);
+
+      const page = await fetch(server.url);
+      expect(page.status).toBe(200);
+      await expect(page.text()).resolves.toBe(pageHtml);
+
+      const api = await fetch(`http://127.0.0.1:${server.port}/api/state`);
+      expect(api.status).toBe(401);
+      expect(api.headers.get("content-type")).toContain("application/json");
+    } finally {
+      await server.close();
+    }
+  });
+
   it("rejects missing tokens, wrong hosts, wrong origins, and OPTIONS", async () => {
     const { server } = await start();
     try {

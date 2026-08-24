@@ -1,6 +1,23 @@
 import { pageScript } from "./page-script.js";
 import { pageStyles } from "./page-styles.js";
 
+const recoveryStyles = `:root{color-scheme:dark;font-family:Geist,system-ui,sans-serif;background:#111113;color:#8b8b93}body{margin:0;min-height:100vh;display:grid;place-items:center}p{max-width:36rem;padding:24px;line-height:1.5}`;
+
+export const bootstrapHtml = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Review Tutor · Pickforge</title><style>${recoveryStyles}</style></head>
+<body><p id="message"></p><script>
+const token = sessionStorage.getItem("reviewTutorSession");
+if (token) location.replace("/?session=" + encodeURIComponent(token));
+else document.getElementById("message").textContent = "Review Tutor session not found in this tab. Reopen /review-tutor in Pi, or paste the full tutor link.";
+</script></body></html>`;
+
+export const staleSessionHtml = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Review Tutor · Pickforge</title><style>${recoveryStyles}</style></head>
+<body><p id="message"></p><script>
+sessionStorage.removeItem("reviewTutorSession");
+document.getElementById("message").textContent = "This Review Tutor session has ended. Reopen /review-tutor in Pi.";
+</script></body></html>`;
+
 export const pageHtml = `<!doctype html>
 <html lang="en">
 <head>

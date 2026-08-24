@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net";
 import { loadInput, type ExecFile } from "./inputs.ts";
 import { initProjectPaths } from "./log.ts";
-import { pageHtml } from "./page.ts";
+import { bootstrapHtml, pageHtml, staleSessionHtml } from "./page.ts";
 import { loadTutorRubric } from "./prompt.ts";
 import { validateSourceRequest, type ModelChoice } from "./protocol.ts";
 import { resolveStatePaths } from "./paths.ts";
@@ -72,18 +72,26 @@ function rejectRequest(request: IncomingMessage, response: ServerResponse, expec
   return false;
 }
 
-function authorizePage(request: IncomingMessage, response: ServerResponse, url: URL, token: string): boolean {
-  if (request.method !== "GET" || url.pathname !== "/") return false;
-  if (!equalToken(url.searchParams.get("session") ?? undefined, token)) {
-    json(response, 401, { error: "page token failed: expected the current session token; reopen /review-tutor" });
-    return true;
-  }
-  response.writeHead(200, {
+function html(response: ServerResponse, status: number, body: string, connect = false): void {
+  response.writeHead(status, {
     ...responseHeaders,
     "Content-Type": "text/html; charset=utf-8",
-    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';${connect ? " connect-src 'self';" : ""} base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
   });
-  response.end(pageHtml);
+  response.end(body);
+}
+
+function authorizePage(request: IncomingMessage, response: ServerResponse, url: URL, token: string): boolean {
+  if (request.method !== "GET" || url.pathname !== "/") return false;
+  if (!url.searchParams.has("session")) {
+    html(response, 200, bootstrapHtml);
+    return true;
+  }
+  if (!equalToken(url.searchParams.get("session") ?? undefined, token)) {
+    html(response, 401, staleSessionHtml);
+    return true;
+  }
+  html(response, 200, pageHtml, true);
   return true;
 }
 

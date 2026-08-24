@@ -119,6 +119,8 @@ async function boot(options: {
   source?: typeof source;
   storedPageId?: string;
   storedQuizIds?: string;
+  storedStructureMode?: string;
+  throwStructureModeRead?: boolean;
   stateResponses?: unknown[];
   structureResponses?: Array<Promise<Response> | Response | unknown | Error>;
   failHeartbeat?: boolean;
@@ -129,7 +131,15 @@ async function boot(options: {
   Object.defineProperty(window, "innerWidth", { value: options.width ?? 1440, writable: true, configurable: true });
   if (options.storedPageId !== undefined) window.sessionStorage.setItem("reviewTutorPageId", options.storedPageId);
   if (options.storedQuizIds !== undefined) window.sessionStorage.setItem("reviewTutorQuizEntryIds", options.storedQuizIds);
+  if (options.storedStructureMode !== undefined) window.sessionStorage.setItem("reviewTutorStructureMode", options.storedStructureMode);
   if (options.railCollapsed) window.sessionStorage.setItem("reviewTutorRailCollapsed", "1");
+  if (options.throwStructureModeRead) {
+    const getItem = window.sessionStorage.getItem.bind(window.sessionStorage);
+    window.sessionStorage.getItem = vi.fn((key: string) => {
+      if (key === "reviewTutorStructureMode") throw new Error("storage blocked");
+      return getItem(key);
+    });
+  }
   const script = pageHtml.match(/<script>([\s\S]*?)<\/script>/)?.[1];
   if (!script) throw new Error("Inline page script was not composed");
   window.document.documentElement.innerHTML = pageHtml
@@ -212,6 +222,54 @@ function input(document: TestDocument, id: string, value: string) {
   node.dispatchEvent(new Event("input", { bubbles: true }));
   node.dispatchEvent(new Event("change", { bubbles: true }));
   return node;
+}
+
+type GraphPoint = { x: number; y: number };
+type GraphRect = GraphPoint & { width: number; height: number };
+
+function graphPathPoints(path: any): GraphPoint[] {
+  const values = (path.getAttribute("d")?.match(/-?\d+(?:\.\d+)?/g) ?? []).map(Number);
+  return Array.from({ length: values.length / 2 }, (_, index) => ({ x: values[index * 2], y: values[index * 2 + 1] }));
+}
+
+function segmentIntersectsRect(start: GraphPoint, end: GraphPoint, rect: GraphRect) {
+  const inset = 0.001;
+  const left = rect.x + inset, right = rect.x + rect.width - inset;
+  const top = rect.y + inset, bottom = rect.y + rect.height - inset;
+  let near = 0, far = 1;
+  const dimensions: Array<[number, number, number, number]> = [
+    [start.x, end.x - start.x, left, right],
+    [start.y, end.y - start.y, top, bottom],
+  ];
+  for (const [origin, delta, minimum, maximum] of dimensions) {
+    if (Math.abs(delta) < inset) {
+      if (origin < minimum || origin > maximum) return false;
+      continue;
+    }
+    const first = (minimum - origin) / delta, second = (maximum - origin) / delta;
+    near = Math.max(near, Math.min(first, second));
+    far = Math.min(far, Math.max(first, second));
+    if (near > far) return false;
+  }
+  return true;
+}
+
+function graphNodeRects(document: TestDocument): GraphRect[] {
+  return Array.from(document.querySelectorAll(".structure-graph-node rect")).map((rect: any) => ({
+    x: Number(rect.getAttribute("x")),
+    y: Number(rect.getAttribute("y")),
+    width: Number(rect.getAttribute("width")),
+    height: Number(rect.getAttribute("height")),
+  }));
+}
+
+function expectGraphPathsClearNodes(document: TestDocument) {
+  const rects = graphNodeRects(document);
+  for (const path of Array.from(document.querySelectorAll(".structure-graph-edge .structure-graph-line")) as any[]) {
+    const points = graphPathPoints(path);
+    for (let index = 1; index < points.length; index++)
+      expect(rects.some((rect) => segmentIntersectsRect(points[index - 1]!, points[index]!, rect)), path.getAttribute("d")).toBe(false);
+  }
 }
 
 describe("Review Tutor composed page", () => {
@@ -326,6 +384,12 @@ describe("Review Tutor composed page", () => {
     expect(byId(document, "log-section").previousElementSibling).toBe(byId(document, "structure-section"));
     expect(byId(document, "diff").getAttribute("role")).toBe("tabpanel");
     expect(byId(document, "structure-section").getAttribute("role")).toBe("tabpanel");
+    expect(byId(document, "structure-content").getAttribute("role")).toBe("tabpanel");
+    expect(byId(document, "structure-content").getAttribute("aria-labelledby")).toBe("structure-mode-list");
+    expect(byId(document, "structure-content").tabIndex).toBe(0);
+    expect(byId(document, "structure-graph").getAttribute("role")).toBe("tabpanel");
+    expect(byId(document, "structure-graph").getAttribute("aria-labelledby")).toBe("structure-mode-graph");
+    expect(byId(document, "structure-graph").tabIndex).toBe(0);
     expect(byId(document, "log-section").getAttribute("role")).toBe("tabpanel");
     expect(byId(document, "log-section").hidden).toBe(true);
     expect(byId(document, "view-diff").getAttribute("aria-selected")).toBe("true");
@@ -342,10 +406,386 @@ describe("Review Tutor composed page", () => {
     byId(document, "view-diff").dispatchEvent(new window.KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
     expect(document.activeElement).toBe(byId(document, "view-structure"));
     expect(tabs.map((tab) => tab.tabIndex)).toEqual([-1, 0, -1]);
-    expect(Array.from(document.querySelectorAll('.view-tab[tabindex="0"]'))).toEqual([byId(document, "view-structure")]);
+    expect(Array.from(byId(document, "view-switch").querySelectorAll('.view-tab[tabindex="0"]'))).toEqual([byId(document, "view-structure")]);
     byId(document, "view-structure").dispatchEvent(new window.KeyboardEvent("keydown", { key: "End", bubbles: true }));
     expect(document.activeElement).toBe(byId(document, "view-log"));
     expect(tabs.map((tab) => tab.tabIndex)).toEqual([-1, -1, 0]);
+  });
+
+  it("defaults the Structure switch to List and persists Graph per tab without refetching", async () => {
+    const loaded = await boot({ width: 860 });
+    byId(loaded.document, "view-structure").click();
+    await flush();
+
+    expect(byId(loaded.document, "structure-mode-list").getAttribute("aria-selected")).toBe("true");
+    expect(byId(loaded.document, "structure-content").hidden).toBe(false);
+    expect(loaded.window.sessionStorage.getItem("reviewTutorStructureMode")).toBeNull();
+    byId(loaded.document, "structure-mode-graph").click();
+    expect(loaded.window.sessionStorage.getItem("reviewTutorStructureMode")).toBe("graph");
+    expect(byId(loaded.document, "structure-content").hidden).toBe(true);
+    expect(byId(loaded.document, "structure-graph").hidden).toBe(false);
+    expect(byId(loaded.document, "structure-shared").contains(byId(loaded.document, "structure-partial"))).toBe(true);
+    expect(loaded.requests.filter((request) => request.path === "/api/structure")).toHaveLength(1);
+    expect(byId(loaded.document, "lifecycle").textContent).toBe("Structure graph mode.");
+
+    const restored = await boot({ storedStructureMode: "graph" });
+    byId(restored.document, "view-structure").click();
+    await flush();
+    expect(byId(restored.document, "structure-mode-graph").getAttribute("aria-selected")).toBe("true");
+    expect(byId(restored.document, "structure-graph").hidden).toBe(false);
+
+    const invalid = await boot({ storedStructureMode: "invalid" });
+    byId(invalid.document, "view-structure").click();
+    await flush();
+    expect(byId(invalid.document, "structure-mode-list").getAttribute("aria-selected")).toBe("true");
+
+    const readFailure = await boot({ throwStructureModeRead: true });
+    byId(readFailure.document, "view-structure").click();
+    await flush();
+    expect(byId(readFailure.document, "structure-mode-list").getAttribute("aria-selected")).toBe("true");
+
+    const writeFailure = await boot();
+    byId(writeFailure.document, "view-structure").click();
+    await flush();
+    const setItem = writeFailure.window.sessionStorage.setItem.bind(writeFailure.window.sessionStorage);
+    writeFailure.window.sessionStorage.setItem = vi.fn(() => { throw new Error("storage blocked"); });
+    expect(() => byId(writeFailure.document, "structure-mode-graph").click()).not.toThrow();
+    expect(byId(writeFailure.document, "structure-graph").hidden).toBe(false);
+    writeFailure.window.sessionStorage.setItem = setItem;
+  });
+
+  it("lays out DAGs and cycles deterministically with directory ordering", async () => {
+    const dag = {
+      ...structure,
+      comparison: { ...structure.comparison, partial: false, reasons: [] },
+      files: [
+        { path: "z/a.ts", status: "added", analyzed: true },
+        { path: "a/z.ts", status: "modified", analyzed: true },
+        { path: "mid/b.ts", status: "modified", analyzed: true },
+        { path: "end/d.ts", status: "unchanged", analyzed: true },
+      ],
+      edges: [
+        { from: "z/a.ts", to: "mid/b.ts", kind: "import", typeOnly: false, status: "added", evidence: [] },
+        { from: "a/z.ts", to: "mid/b.ts", kind: "import", typeOnly: false, status: "modified", evidence: [] },
+        { from: "mid/b.ts", to: "end/d.ts", kind: "import", typeOnly: false, status: "unchanged", evidence: [] },
+      ],
+      limits: { ...structure.limits, truncated: false, omitted: [] },
+    };
+    const first = await boot({ structureResponses: [dag] });
+    byId(first.document, "view-structure").click();
+    await flush();
+    byId(first.document, "structure-mode-graph").click();
+    const firstSvg = first.document.querySelector(".structure-graph-svg") as any;
+    const firstPaths = Array.from(firstSvg.querySelectorAll(".structure-graph-edge .structure-graph-line")).map((path: any) => path.getAttribute("d"));
+    expect(firstSvg.dataset.layout).toBeTruthy();
+    expect(firstPaths.every((path) => path?.startsWith("M") && path.includes("L") && !path.includes("Q"))).toBe(true);
+    expect(Array.from(first.document.querySelectorAll(".structure-graph-node")).map((node: any) => [node.dataset.path, node.dataset.layer])).toEqual([
+      ["a/z.ts", "0"],
+      ["z/a.ts", "0"],
+      ["mid/b.ts", "1"],
+      ["end/d.ts", "2"],
+    ]);
+
+    const second = await boot({ structureResponses: [dag] });
+    byId(second.document, "view-structure").click();
+    await flush();
+    byId(second.document, "structure-mode-graph").click();
+    const secondSvg = second.document.querySelector(".structure-graph-svg") as any;
+    expect(secondSvg.dataset.layout).toBe(firstSvg.dataset.layout);
+    expect(Array.from(secondSvg.querySelectorAll(".structure-graph-edge .structure-graph-line")).map((path: any) => path.getAttribute("d"))).toEqual(firstPaths);
+
+    const cycle = {
+      ...dag,
+      files: ["a.ts", "b.ts", "c.ts"].map((path) => ({ path, status: "modified", analyzed: true })),
+      edges: [
+        { from: "a.ts", to: "b.ts", kind: "import", typeOnly: false, status: "modified", evidence: [] },
+        { from: "b.ts", to: "c.ts", kind: "import", typeOnly: false, status: "modified", evidence: [] },
+        { from: "c.ts", to: "a.ts", kind: "import", typeOnly: false, status: "modified", evidence: [] },
+      ],
+    };
+    const cycled = await boot({ structureResponses: [cycle] });
+    byId(cycled.document, "view-structure").click();
+    await flush();
+    byId(cycled.document, "structure-mode-graph").click();
+    expect(Array.from(cycled.document.querySelectorAll(".structure-graph-node")).map((node: any) => [node.dataset.path, node.dataset.layer])).toEqual([
+      ["a.ts", "0"],
+      ["b.ts", "1"],
+      ["c.ts", "2"],
+    ]);
+  });
+
+  it("routes long edges below every intermediate layer without crossing node boxes", async () => {
+    const paths = ["src/a.ts", "src/b.ts", "src/c.ts"];
+    const longEdgeGraph = {
+      ...structure,
+      comparison: { ...structure.comparison, partial: false, reasons: [] },
+      files: paths.map((path) => ({ path, status: "modified", analyzed: true })),
+      edges: [
+        { from: paths[0], to: paths[1], kind: "import", typeOnly: false, status: "modified", evidence: [] },
+        { from: paths[1], to: paths[2], kind: "import", typeOnly: false, status: "modified", evidence: [] },
+        { from: paths[0], to: paths[2], kind: "import", typeOnly: false, status: "added", evidence: [] },
+      ],
+      limits: { ...structure.limits, truncated: false, omitted: [] },
+    };
+    const { document } = await boot({ structureResponses: [longEdgeGraph] });
+    byId(document, "view-structure").click();
+    await flush();
+    byId(document, "structure-mode-graph").click();
+
+    const middleRect = document.querySelector('.structure-graph-node[data-path="src/b.ts"] rect') as any;
+    const longPath = document.querySelector('.structure-graph-edge[data-from="src/a.ts"][data-to="src/c.ts"] path') as any;
+    expect(longPath).toBeTruthy();
+    expect(Math.max(...graphPathPoints(longPath).map((point) => point.y))).toBeGreaterThan(Number(middleRect.getAttribute("y")) + Number(middleRect.getAttribute("height")));
+    expectGraphPathsClearNodes(document);
+  });
+
+  it("routes back edges through layer gutters without crossing crowded endpoint layers", async () => {
+    const layer0 = ["a/0.ts", "a/1.ts", "a/2.ts"];
+    const layer1 = ["b/0.ts", "b/1.ts", "b/2.ts"];
+    const layer2 = ["c/0.ts", "c/1.ts", "c/2.ts"];
+    const paths = [...layer0, ...layer1, ...layer2];
+    const cycle = {
+      ...structure,
+      comparison: { ...structure.comparison, partial: false, reasons: [] },
+      files: paths.map((path) => ({ path, status: "modified", analyzed: true })),
+      edges: [
+        ...layer0.map((from, index) => ({ from, to: layer1[index], kind: "import", typeOnly: false, status: "modified", evidence: [] })),
+        ...layer1.map((from, index) => ({ from, to: layer2[index], kind: "import", typeOnly: false, status: "modified", evidence: [] })),
+        { from: layer2[1], to: layer0[1], kind: "import", typeOnly: false, status: "removed", evidence: [] },
+      ],
+      limits: { ...structure.limits, truncated: false, omitted: [] },
+    };
+    const { document } = await boot({ structureResponses: [cycle] });
+    byId(document, "view-structure").click();
+    await flush();
+    byId(document, "structure-mode-graph").click();
+
+    const svg = document.querySelector(".structure-graph-svg") as any;
+    const backPath = document.querySelector('.structure-graph-edge[data-from="c/1.ts"][data-to="a/1.ts"] .structure-graph-line') as any;
+    const points = graphPathPoints(backPath);
+    const sourceRect = document.querySelector('.structure-graph-node[data-path="c/1.ts"] rect') as any;
+    const targetRect = document.querySelector('.structure-graph-node[data-path="a/1.ts"] rect') as any;
+    expect(points[0]!.x).toBeCloseTo(Number(sourceRect.getAttribute("x")) + Number(sourceRect.getAttribute("width")));
+    expect(points.at(-1)?.x).toBeCloseTo(Number(targetRect.getAttribute("x")) + Number(targetRect.getAttribute("width")));
+    expect(Number(svg.getAttribute("viewBox").split(" ")[2])).toBeGreaterThan(Math.max(...points.map((point) => point.x)));
+    expectGraphPathsClearNodes(document);
+  });
+
+  it("routes back edges below the drawing and extends the SVG viewBox", async () => {
+    const paths = ["src/a.ts", "src/b.ts", "src/c.ts"];
+    const cycle = {
+      ...structure,
+      comparison: { ...structure.comparison, partial: false, reasons: [] },
+      files: paths.map((path) => ({ path, status: "modified", analyzed: true })),
+      edges: [
+        { from: paths[0], to: paths[1], kind: "import", typeOnly: false, status: "modified", evidence: [] },
+        { from: paths[1], to: paths[2], kind: "import", typeOnly: false, status: "modified", evidence: [] },
+        { from: paths[2], to: paths[0], kind: "import", typeOnly: false, status: "removed", evidence: [] },
+      ],
+      limits: { ...structure.limits, truncated: false, omitted: [] },
+    };
+    const { document } = await boot({ structureResponses: [cycle] });
+    byId(document, "view-structure").click();
+    await flush();
+    byId(document, "structure-mode-graph").click();
+
+    const svg = document.querySelector(".structure-graph-svg") as any;
+    const backPath = document.querySelector('.structure-graph-edge[data-from="src/c.ts"][data-to="src/a.ts"] .structure-graph-line') as any;
+    const drawingBottom = Math.max(...graphNodeRects(document).map((rect) => rect.y + rect.height));
+    const laneBottom = Math.max(...graphPathPoints(backPath).map((point) => point.y));
+    expect(laneBottom).toBeGreaterThan(drawingBottom);
+    expect(Number(svg.getAttribute("viewBox").split(" ")[3])).toBeGreaterThan(laneBottom);
+    expectGraphPathsClearNodes(document);
+  });
+
+  it("offsets parallel and shared back-edge ports deterministically", async () => {
+    const parallel = {
+      ...structure,
+      comparison: { ...structure.comparison, partial: false, reasons: [] },
+      files: ["a.ts", "b.ts"].map((path) => ({ path, status: "modified", analyzed: true })),
+      edges: ["dynamic-import", "import", "require"].map((kind) => ({ from: "a.ts", to: "b.ts", kind, typeOnly: false, status: "modified", evidence: [] })),
+      limits: { ...structure.limits, truncated: false, omitted: [] },
+    };
+    const parallelPage = await boot({ structureResponses: [parallel] });
+    byId(parallelPage.document, "view-structure").click();
+    await flush();
+    byId(parallelPage.document, "structure-mode-graph").click();
+    const parallelPaths = Array.from(parallelPage.document.querySelectorAll(".structure-graph-line"), (path: any) => path.getAttribute("d"));
+    expect(new Set(parallelPaths).size).toBe(3);
+
+    const sharedBack = {
+      ...structure,
+      comparison: { ...structure.comparison, partial: false, reasons: [] },
+      files: ["a.ts", "b.ts", "c.ts", "d.ts"].map((path) => ({ path, status: "modified", analyzed: true })),
+      edges: [
+        { from: "a.ts", to: "b.ts", kind: "import", typeOnly: false, status: "modified", evidence: [] },
+        { from: "b.ts", to: "c.ts", kind: "import", typeOnly: false, status: "modified", evidence: [] },
+        { from: "c.ts", to: "a.ts", kind: "import", typeOnly: false, status: "removed", evidence: [] },
+        { from: "c.ts", to: "a.ts", kind: "require", typeOnly: false, status: "removed", evidence: [] },
+      ],
+      limits: { ...structure.limits, truncated: false, omitted: [] },
+    };
+    const backPage = await boot({ structureResponses: [sharedBack] });
+    byId(backPage.document, "view-structure").click();
+    await flush();
+    byId(backPage.document, "structure-mode-graph").click();
+    const stems = Array.from(backPage.document.querySelectorAll('.structure-graph-edge[data-from="c.ts"][data-to="a.ts"] .structure-graph-line'), (path: any) => graphPathPoints(path)[0]!.y);
+    expect(new Set(stems).size).toBe(2);
+  });
+
+  it("enforces inclusive graph size bounds and the zero-drawable copy", async () => {
+    const inclusivePaths = Array.from({ length: 60 }, (_, index) => `src/i${String(index).padStart(2, "0")}.ts`);
+    const inclusive = {
+      ...structure,
+      files: inclusivePaths.map((path) => ({ path, status: "modified", analyzed: true })),
+      edges: Array.from({ length: 200 }, (_, index) => ({ from: inclusivePaths[index % 59], to: inclusivePaths[(index % 59) + 1], kind: "import", typeOnly: false, status: "modified", evidence: [] })),
+    };
+    const inclusivePage = await boot({ structureResponses: [inclusive] });
+    byId(inclusivePage.document, "view-structure").click();
+    await flush();
+    byId(inclusivePage.document, "structure-mode-graph").click();
+    expect(inclusivePage.document.querySelector(".structure-graph-svg")).not.toBeNull();
+
+    const nodePaths = Array.from({ length: 61 }, (_, index) => `src/n${String(index).padStart(2, "0")}.ts`);
+    const tooManyNodes = {
+      ...structure,
+      files: nodePaths.map((path) => ({ path, status: "modified", analyzed: true })),
+      edges: nodePaths.slice(1).map((path, index) => ({ from: nodePaths[index], to: path, kind: "import", typeOnly: false, status: "modified", evidence: [] })),
+    };
+    const nodePage = await boot({ structureResponses: [tooManyNodes] });
+    byId(nodePage.document, "view-structure").click();
+    await flush();
+    byId(nodePage.document, "structure-mode-graph").click();
+    expect(byId(nodePage.document, "structure-graph").textContent).toBe("Graph is too large for this view (61 files, 60 connections). Use the list.");
+    expect(nodePage.document.querySelector(".structure-graph-svg")).toBeNull();
+
+    const tooManyEdges = {
+      ...structure,
+      files: [
+        { path: "a.ts", status: "modified", analyzed: true },
+        { path: "b.ts", status: "modified", analyzed: true },
+      ],
+      edges: Array.from({ length: 201 }, () => ({ from: "a.ts", to: "b.ts", kind: "import", typeOnly: false, status: "modified", evidence: [] })),
+    };
+    const edgePage = await boot({ structureResponses: [tooManyEdges] });
+    byId(edgePage.document, "view-structure").click();
+    await flush();
+    byId(edgePage.document, "structure-mode-graph").click();
+    expect(byId(edgePage.document, "structure-graph").textContent).toBe("Graph is too large for this view (2 files, 201 connections). Use the list.");
+
+    const zero = await boot({ structureResponses: [{ ...structure, files: structure.files.map((file) => ({ ...file, analyzed: false })), edges: [] }] });
+    byId(zero.document, "view-structure").click();
+    await flush();
+    byId(zero.document, "structure-mode-graph").click();
+    expect(byId(zero.document, "structure-graph").textContent).toBe("No connections to draw.");
+  });
+
+  it("keeps graph selection exclusive, keyboard ordered, labelled, and Escape-restorable", async () => {
+    const { window, document } = await boot();
+    byId(document, "view-structure").click();
+    await flush();
+    byId(document, "structure-mode-graph").click();
+    const svg = document.querySelector(".structure-graph-svg") as any;
+    expect(svg.getAttribute("role")).toBe("group");
+    expect(svg.getAttribute("aria-label")).toBe("Structure graph, 4 files, 4 connections");
+    expect(Array.from(svg.querySelectorAll("defs marker")).map((marker: any) => marker.id)).toEqual([
+      "structure-arrow-added",
+      "structure-arrow-removed",
+      "structure-arrow-modified",
+      "structure-arrow-unchanged",
+      "structure-arrow-selected",
+    ]);
+    const controls = Array.from(svg.querySelectorAll('g[role="button"]')) as any[];
+    const nodes = controls.filter((control) => control.classList.contains("structure-graph-node"));
+    const edges = controls.filter((control) => control.classList.contains("structure-graph-edge"));
+    expect(controls.slice(0, nodes.length)).toEqual(nodes);
+    expect(edges.map((edge) => edge.getAttribute("aria-label"))).toEqual([
+      "src/a.ts → src/new.ts, re-export, edited",
+      "src/b.ts → src/a.ts, import, added",
+      "src/new.ts → src/a.ts, dynamic, unchanged",
+      "src/old.ts → src/a.ts, require, removed",
+    ]);
+    expect(nodes.map((node) => node.getAttribute("aria-label"))).toContain("src/a.ts, edited");
+    expect(nodes.every((node) => node.tabIndex === 0 && node.getAttribute("aria-label"))).toBe(true);
+    expect(svg.querySelector('.structure-graph-node[data-path="src/a.ts"] title')).toBeNull();
+    expect(edges.every((edge) => edge.tabIndex === 0)).toBe(true);
+    for (const edge of edges) {
+      const hit = edge.querySelector(".structure-graph-hit"), line = edge.querySelector(".structure-graph-line");
+      expect(hit).toBe(edge.firstElementChild);
+      expect(hit.getAttribute("d")).toBe(line.getAttribute("d"));
+      expect(hit.getAttribute("style")).toBe("fill:none;stroke:transparent;stroke-width:14;pointer-events:stroke");
+    }
+    expect(pageHtml).toContain(".structure-graph-edge.type-only {\nopacity:.7}");
+    expect(pageHtml).not.toContain("graph-focus-visible");
+    expect(pageHtml).not.toContain("graph-endpoint");
+    expect(pageHtml).not.toContain(".structure-mode-switch .view-tab");
+
+    const editedNode = svg.querySelector('.structure-graph-node[data-path="src/a.ts"]') as any;
+    editedNode.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    expect(svg.querySelectorAll(".graph-selected")).toHaveLength(1);
+    expect(byId(document, "lifecycle").textContent).toBe("src/a.ts, edited selected.");
+    expect(Array.from(byId(document, "structure-graph-evidence").querySelectorAll(".connection-target"), (target: any) => target.textContent)).toEqual(["src/new.ts"]);
+    editedNode.dispatchEvent(new window.KeyboardEvent("keydown", { key: " ", bubbles: true, cancelable: true }));
+    expect(byId(document, "lifecycle").textContent).toBe("src/a.ts, edited selected.");
+    edges[0].dispatchEvent(new window.KeyboardEvent("keydown", { key: " ", bubbles: true, cancelable: true }));
+    expect(svg.querySelectorAll(".graph-selected")).toHaveLength(1);
+    expect(edges[0].classList.contains("graph-selected")).toBe(true);
+    expect(edges[0].querySelector(".structure-graph-line")?.getAttribute("marker-end")).toBe("url(#structure-arrow-selected)");
+    expect(svg.querySelectorAll(".graph-endpoint,.graph-focus-visible")).toHaveLength(0);
+    edges[0].focus();
+    edges[0].dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(svg.querySelectorAll(".graph-selected,.graph-endpoint")).toHaveLength(0);
+    expect(edges[0].querySelector(".structure-graph-line")?.getAttribute("marker-end")).toBe("url(#structure-arrow-modified)");
+    expect(byId(document, "lifecycle").textContent).toBe("Selection cleared.");
+    expect(document.activeElement).toBe(byId(document, "structure-mode-graph"));
+  });
+
+  it("adds node titles only for ellipsised labels", async () => {
+    const longPath = "src/" + "deep/".repeat(8) + "file.ts";
+    const snapshot = {
+      ...structure,
+      files: [
+        { path: "short.ts", status: "modified", analyzed: true },
+        { path: longPath, status: "added", analyzed: true },
+      ],
+      edges: [{ from: "short.ts", to: longPath, kind: "import", typeOnly: false, status: "added", evidence: [] }],
+    };
+    const { document } = await boot({ structureResponses: [snapshot] });
+    byId(document, "view-structure").click();
+    await flush();
+    byId(document, "structure-mode-graph").click();
+    expect(document.querySelector('.structure-graph-node[data-path="short.ts"] title')).toBeNull();
+    expect(document.querySelector('.structure-graph-node[data-path="' + longPath + '"] title')?.textContent).toBe(longPath);
+  });
+
+  it("reuses graph evidence rendering and lands Open in Diff on the list's exact row", async () => {
+    const graphPage = await boot();
+    byId(graphPage.document, "view-structure").click();
+    await flush();
+    byId(graphPage.document, "structure-mode-graph").click();
+    const graphEdge = Array.from(graphPage.document.querySelectorAll(".structure-graph-edge") as any).find((edge: any) => edge.dataset.from === "src/b.ts" && edge.dataset.to === "src/a.ts") as any;
+    graphEdge.dispatchEvent(new graphPage.window.MouseEvent("click", { bubbles: true }));
+    const graphPanel = byId(graphPage.document, "structure-graph-evidence");
+    expect(graphPanel.previousElementSibling).toBe(byId(graphPage.document, "structure-graph"));
+    expect(graphPanel.parentElement).toBe(byId(graphPage.document, "structure-section"));
+    expect(graphPanel.querySelector(".connection-row")?.getAttribute("aria-expanded")).toBe("true");
+    expect(graphPanel.querySelector(".evidence-code")?.textContent).toContain("import type");
+    (graphPanel.querySelector(".open-in-diff") as any).click();
+    const graphLanding = graphPage.document.querySelector(".diff-row.structure-landing") as any;
+
+    const listPage = await boot();
+    byId(listPage.document, "view-structure").click();
+    await flush();
+    const listRow = Array.from(listPage.document.querySelectorAll(".connection-row") as any).find((row: any) => row.textContent.includes("src/a.ts") && row.textContent.includes("import")) as any;
+    listRow.click();
+    (listRow.nextElementSibling.querySelector(".open-in-diff") as any).click();
+    const listLanding = listPage.document.querySelector(".diff-row.structure-landing") as any;
+
+    expect([graphLanding.dataset.file, graphLanding.dataset.row]).toEqual([listLanding.dataset.file, listLanding.dataset.row]);
+    expect(graphPage.document.querySelectorAll(".diff-row.structure-landing")).toHaveLength(1);
+    byId(graphPage.document, "view-structure").click();
+    byId(graphPage.document, "structure-mode-list").click();
+    expect(graphPage.document.querySelector("#structure-graph-evidence")).toBeNull();
   });
 
   it("fetches structure once per input and refetches the new payload after a source switch", async () => {

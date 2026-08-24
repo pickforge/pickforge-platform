@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createExecFileAdapter,
   createServerLifecycle,
+  modelChoices,
 } from "../extensions/review-tutor.ts";
 import { pageHtml } from "../src/page.ts";
 import { resolveStatePaths } from "../src/paths.ts";
@@ -512,6 +513,50 @@ describe("extension lifecycle and command execution", () => {
       },
       expect.any(Function),
     );
+  });
+});
+
+describe("scoped model discovery", () => {
+  const sol = { provider: "openai", id: "gpt-5.6-sol", name: "GPT-5.6 Sol", reasoning: true };
+  const luna = { provider: "openai", id: "gpt-5.6-luna", name: "GPT-5.6 Luna", reasoning: true };
+  const basic = { provider: "local", id: "basic", name: "", reasoning: false };
+
+  function context(
+    scoped: Array<{ model: unknown; thinkingLevel?: string }>,
+    available: unknown[],
+  ) {
+    return {
+      scopedModels: scoped,
+      modelRegistry: { getAvailable: () => available },
+    } as never;
+  }
+
+  it("lists only session-scoped models when a scope is configured", () => {
+    expect(modelChoices(context([{ model: sol }], [sol, luna]))).toEqual([
+      {
+        id: "openai/gpt-5.6-sol",
+        label: "GPT-5.6 Sol",
+        thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh"],
+      },
+    ]);
+  });
+
+  it("falls back to the availability snapshot without a scope", () => {
+    expect(modelChoices(context([], [sol, basic])).map((choice) => choice.id)).toEqual([
+      "openai/gpt-5.6-sol",
+      "local/basic",
+    ]);
+  });
+
+  it("labels unnamed models canonically and limits thinking for non-reasoning models", () => {
+    expect(modelChoices(context([{ model: basic }], [sol]))).toEqual([
+      { id: "local/basic", label: "local/basic", thinkingLevels: ["off"] },
+    ]);
+  });
+
+  it("narrows thinking to an explicitly pinned scope level", () => {
+    const chosen = modelChoices(context([{ model: sol, thinkingLevel: "high" }], []));
+    expect(chosen[0]!.thinkingLevels).toEqual(["high"]);
   });
 });
 

@@ -290,8 +290,16 @@ position:fixed;top:calc(var(--topbar-h) + 10px);left:50%;translate:-50% 0;z-inde
 display:none}
 .structure-section {
 contain:layout;min-width:0;padding:14px 14px 100px;overflow-x:hidden}
+.structure-head {
+display:flex;align-items:center;gap:12px;margin:0;flex-wrap:wrap}
+.structure-head:has(> :not([hidden])) {
+margin-bottom:10px}
 .structure-mode-switch {
-width:max-content;margin:0 0 10px}
+width:max-content;margin:0}
+.structure-neighbours {
+display:flex;align-items:center;gap:7px;color:var(--subtle);font-size:12px;cursor:pointer}
+.structure-neighbours input {
+width:auto;height:auto;margin:0;accent-color:var(--ember)}
 #structure-graph {
 max-width:100%;overflow-x:auto;overflow-y:hidden}
 .structure-graph-svg {
@@ -308,7 +316,7 @@ color:var(--green)}
 color:var(--rose)}
 .structure-graph-node.status-modified,.structure-graph-edge.status-modified,.structure-graph-marker.status-modified {
 color:var(--amber)}
-.structure-graph-node.status-unchanged,.structure-graph-node.status-renamed,.structure-graph-edge.status-unchanged,.structure-graph-marker.status-unchanged {
+.structure-graph-node.status-unchanged,.structure-graph-node.status-renamed,.structure-graph-node.status-context,.structure-graph-edge.status-unchanged,.structure-graph-marker.status-unchanged {
 color:var(--muted)}
 .structure-graph-marker.status-selected {
 color:var(--ember)}
@@ -350,7 +358,7 @@ margin-top:10px}
 position:static;min-width:0}
 .structure-file-path {
 min-width:0;margin:0;font:12px var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.status-chip,.connection-kind,.connection-type {
+.status-chip,.connection-kind,.connection-type,.connection-context {
 flex:none;color:var(--muted);font:600 10px var(--font-mono);letter-spacing:.1em;text-transform:uppercase}
 .status-added {
 color:var(--green)}
@@ -358,12 +366,16 @@ color:var(--green)}
 color:var(--rose)}
 .status-modified {
 color:var(--amber)}
+.status-context {
+color:var(--muted)}
 .structure-file-note {
 display:block;padding:6px 14px;border-bottom:1px solid var(--hairline);color:var(--muted);font:11px var(--font-mono);overflow-wrap:anywhere}
 .connection-list {
 min-width:0}
 .connection-row {
 width:100%;min-width:0;min-height:32px;display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:9px;padding:3px 12px;border:0;border-radius:0;background:transparent;text-align:left;white-space:normal}
+.connection-target-wrap {
+min-width:0;display:flex;align-items:center;gap:7px;flex-wrap:wrap}
 .connection-row:hover:not(:disabled) {
 background:var(--surface-2)}
 .connection-row.selected {
@@ -378,7 +390,7 @@ min-width:0;display:flex;align-items:center;gap:12px;padding:7px 12px 7px 22px;b
 border-top:1px solid var(--hairline)}
 .evidence-code {
 flex:1;min-width:0;color:var(--subtle);font:12px/1.5 var(--font-mono);white-space:pre-wrap;overflow-wrap:anywhere}
-.open-in-diff {
+.open-in-diff,.ask-tutor-evidence {
 flex:none}
 .log-section {
 contain:layout;padding:20px 14px 100px;border-top:1px solid var(--hairline);scroll-margin-top:8px}
@@ -477,7 +489,7 @@ overflow:visible;text-overflow:clip;white-space:normal;overflow-wrap:anywhere}
 grid-template-columns:auto auto auto minmax(0,1fr);grid-template-areas:"kind type status ." "target target target target";gap:2px 8px;padding-top:5px;padding-bottom:5px}
 .connection-kind {
 grid-area:kind}
-.connection-target {
+.connection-target-wrap {
 grid-area:target}
 .connection-type {
 grid-area:type}
@@ -485,13 +497,15 @@ grid-area:type}
 grid-area:status}
 .connection-evidence li {
 align-items:stretch;flex-direction:column;padding-left:12px}
-.open-in-diff {
+.open-in-diff,.ask-tutor-evidence {
 width:100%;min-height:var(--control-h-touch)}
 }
 .diff-scroll {
 overflow:visible}
 .structure-section {
 padding-left:8px;padding-right:8px}
+.structure-neighbours {
+min-height:var(--control-h-touch)}
 .connection-row {
 min-height:var(--control-h-touch)}
 .file-head {
@@ -526,7 +540,7 @@ top:6px}
 display:block;position:fixed;z-index:30;left:12px;right:12px;bottom:12px;min-height:48px;box-shadow:0 4px 18px #000;background:var(--ember);color:#160a02;border-color:var(--ember);font-weight:700}
 .mobile-ask:disabled {
 opacity:1}
-.structure-error-card button,.structure-partial summary,.open-in-diff {
+.structure-error-card button,.structure-partial summary,.open-in-diff,.ask-tutor-evidence {
 min-height:var(--control-h-touch)}
 .structure-partial summary {
 padding:8px 4px}

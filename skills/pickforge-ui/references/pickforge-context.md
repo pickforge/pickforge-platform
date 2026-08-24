@@ -5,6 +5,7 @@ Load only what the task needs. Find the Pickforge workspace root by locating the
 ## Always for directed visual work
 
 - Target repo `AGENTS.md` and `CLAUDE.md` when applicable
+- `branding-visual/DESIGN-PRINCIPLES.md` (binding; read first)
 - Running/current surface, relevant components, tokens, screenshots, and tests
 - `branding-visual/BRAND-IDENTITY.md`
 - `branding-visual/DESIGN-TOKENS.md`

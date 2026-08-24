@@ -22,6 +22,7 @@ If `design-director` is not installed, stop directed work and report the missing
 - **Brand source:** `branding-visual/` is canonical for studio identity, shared tokens, marks, typography, motion, and voice.
 - **Visual character:** cinematic, restrained, sharp, opinionated, and dev-coded. Product usability wins over marketing spectacle.
 - **Accent discipline:** one ember focal point per composition. Semantic status colors remain functional exceptions.
+- **Minimal by default:** `branding-visual/DESIGN-PRINCIPLES.md` is binding. One element per job, nothing revealed before it has content, every added element justified in the contract (a contract with two indicators for one state is rejected), and acceptance answers "could this be less?".
 - **Typography:** Geist and Geist Mono through the repo's existing font/token setup.
 - **Motion:** deliberate and useful; preserve orientation, reveal state, or confirm action. Respect reduced motion.
 - **Validation:** use the target app's established screenshots, VRT, goldens, and real resizing/input paths. Never replace rendered inspection with unit tests.
@@ -42,4 +43,4 @@ Use it only when the task needs relevant mirror context, drift comparison, a bro
 
 ## Finish
 
-Return representative rendered evidence to the same named design lead. Run app-local functional checks plus the narrowest visual validation. If the change creates a reusable brand rule or token, update `branding-visual/` in its own properly scoped change; do not bury canonical system edits inside an app feature.
+Return representative rendered evidence to the same named design lead; acceptance must answer "could this be less?" with "no" or a named reason. Run app-local functional checks plus the narrowest visual validation. If the change creates a reusable brand rule or token, update `branding-visual/` in its own properly scoped change; do not bury canonical system edits inside an app feature.

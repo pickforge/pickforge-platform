@@ -182,6 +182,7 @@ describe("local server security", () => {
       const bootstrap = await fetch(`http://127.0.0.1:${server.port}/`);
       expect(bootstrap.status).toBe(200);
       expect(bootstrap.headers.get("content-type")).toContain("text/html");
+      expect(bootstrap.headers.get("content-security-policy")).not.toContain("connect-src");
       const bootstrapBody = await bootstrap.text();
       expect(bootstrapBody).toContain('sessionStorage.getItem("reviewTutorSession")');
       expect(bootstrapBody).toContain("location.replace");
@@ -199,6 +200,7 @@ describe("local server security", () => {
 
       const page = await fetch(server.url);
       expect(page.status).toBe(200);
+      expect(page.headers.get("content-security-policy")).toContain("connect-src 'self'");
       await expect(page.text()).resolves.toBe(pageHtml);
 
       const api = await fetch(`http://127.0.0.1:${server.port}/api/state`);

@@ -5,17 +5,17 @@ const recoveryStyles = `:root{color-scheme:dark;font-family:Geist,system-ui,sans
 
 export const bootstrapHtml = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Review Tutor · Pickforge</title><style>${recoveryStyles}</style></head>
-<body><p id="message"></p><script>
-const token = sessionStorage.getItem("reviewTutorSession");
-if (token) location.replace("/?session=" + encodeURIComponent(token));
-else document.getElementById("message").textContent = "Review Tutor session not found in this tab. Reopen /review-tutor in Pi, or paste the full tutor link.";
+<body><p>Review Tutor session not found in this tab. Reopen /review-tutor in Pi, or paste the full tutor link.</p><script>
+try {
+  const token = sessionStorage.getItem("reviewTutorSession");
+  if (token) location.replace("/?session=" + encodeURIComponent(token));
+} catch {}
 </script></body></html>`;
 
 export const staleSessionHtml = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Review Tutor · Pickforge</title><style>${recoveryStyles}</style></head>
-<body><p id="message"></p><script>
-sessionStorage.removeItem("reviewTutorSession");
-document.getElementById("message").textContent = "This Review Tutor session has ended. Reopen /review-tutor in Pi.";
+<body><p>This Review Tutor session has ended. Reopen /review-tutor in Pi.</p><script>
+try { sessionStorage.removeItem("reviewTutorSession"); } catch {}
 </script></body></html>`;
 
 export const pageHtml = `<!doctype html>

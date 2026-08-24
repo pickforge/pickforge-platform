@@ -38,6 +38,15 @@ export const pageScript = String.raw`
     history.replaceState({}, "", location.pathname);
   }
   const token = sessionStorage.getItem("reviewTutorSession");
+  const PAGE_ID_KEY = "reviewTutorPageId";
+  function readPageId() {
+    const stored = sessionStorage.getItem(PAGE_ID_KEY);
+    if (stored && stored.length <= 64) return stored;
+    const id = crypto.randomUUID();
+    sessionStorage.setItem(PAGE_ID_KEY, id);
+    return id;
+  }
+  const pageId = readPageId();
   let state,
     currentSource,
     currentQuestionId,
@@ -60,6 +69,7 @@ export const pageScript = String.raw`
     historyIndex = 0,
     activeHistoryBadge = null;
   const learningBadgeGroups = new Map();
+  const foreignActiveIds = new Set();
   let railCollapsed = sessionStorage.getItem("reviewTutorRailCollapsed") === "1";
   let restoreComposerOnDesktop = false;
   const QUIZ_IDS_KEY = "reviewTutorQuizEntryIds";
@@ -327,15 +337,33 @@ export const pageScript = String.raw`
   function updateAnswerVisibility() {
     element("answer").hidden = !answerMarkdown.trim() && !element("answer-tail").textContent.trim();
   }
-  function setAnswer(markdown) {
-    answerMarkdown = typeof markdown === "string" ? markdown : "";
+  const useFrames = typeof requestAnimationFrame === "function" && typeof cancelAnimationFrame === "function";
+  const scheduleAnswerFrame = useFrames
+    ? (callback) => requestAnimationFrame(callback)
+    : (callback) => setTimeout(callback, 16);
+  const cancelAnswerFrame = useFrames
+    ? (handle) => cancelAnimationFrame(handle)
+    : (handle) => clearTimeout(handle);
+  let pendingAnswerFrame;
+  function renderAnswer() {
+    pendingAnswerFrame = undefined;
     renderMarkdown(element("answer-text"), answerMarkdown);
     updateAnswerVisibility();
   }
+  function cancelPendingAnswerFrame() {
+    if (pendingAnswerFrame === undefined) return;
+    cancelAnswerFrame(pendingAnswerFrame);
+    pendingAnswerFrame = undefined;
+  }
+  function setAnswer(markdown) {
+    cancelPendingAnswerFrame();
+    answerMarkdown = typeof markdown === "string" ? markdown : "";
+    renderAnswer();
+  }
   function appendAnswer(markdown) {
     answerMarkdown += markdown;
-    renderMarkdown(element("answer-text"), answerMarkdown);
-    updateAnswerVisibility();
+    if (pendingAnswerFrame === undefined)
+      pendingAnswerFrame = scheduleAnswerFrame(renderAnswer);
   }
   function setAnswerTail(text) {
     element("answer-tail").textContent = text;
@@ -939,21 +967,25 @@ export const pageScript = String.raw`
     element("ask").append(document.createTextNode(text));
   }
   function canAsk(questionState = currentQuestionState) {
-    return !!currentSource && !asking && !["queued", "running"].includes(questionState) && !!element("question").value.trim();
+    return !!currentSource && !asking && !["queued", "running"].includes(questionState) &&
+      foreignActiveIds.size === 0 && !!element("question").value.trim();
   }
   function updateActions(questionState = currentQuestionState) {
     element("load").disabled = loading;
     const hasQuestion = element("question").value.trim().length > 0;
-    const active = asking || ["queued", "running"].includes(questionState);
+    const ownActive = ["queued", "running"].includes(questionState);
+    const active = asking || ownActive || foreignActiveIds.size > 0;
     element("ask").disabled = !canAsk(questionState);
     element("ask").classList.toggle("busy-neutral", active);
     element("cancel").disabled =
-      questionState !== "queued" && questionState !== "running";
+      !currentQuestionId || (questionState !== "queued" && questionState !== "running");
     element("ask-helper").textContent = !currentSource
       ? "Load a source first."
       : !hasQuestion
         ? "Enter a question to ask the tutor."
-        : "";
+        : foreignActiveIds.size > 0 && !asking && !ownActive
+          ? "Another tab is asking. Wait for it to finish."
+          : "";
     const selectionLabel = selection && selection.startLine != null
       ? selection.file + ":" + selection.startLine + "-" + selection.endLine
       : selection ? selection.count + " selected lines" : "";
@@ -1069,6 +1101,7 @@ export const pageScript = String.raw`
         body: JSON.stringify({
           protocol: "rt/1",
           inputId: currentSource.id,
+          ownerPageId: pageId,
           selection: {
             text: safeSelection.text,
             file: safeSelection.file,
@@ -1411,25 +1444,36 @@ export const pageScript = String.raw`
     events.addEventListener("question", (event) => {
       const question = parseEvent(event, "Question update");
       if (!question) return;
-      if (asking && !currentQuestionId) bufferAskEvent("question", question);
+      if (question.ownerPageId !== undefined && question.ownerPageId !== pageId) {
+        if (["queued", "running"].includes(question.state)) foreignActiveIds.add(question.id);
+        else if (["answered", "failed", "cancelled"].includes(question.state)) foreignActiveIds.delete(question.id);
+        updateActions();
+      } else if (asking && !currentQuestionId) bufferAskEvent("question", question);
       else if (question.id === currentQuestionId) updateQuestion(question);
     });
     events.addEventListener("state", (event) => {
       const snapshot = parseEvent(event, "State update");
       if (!snapshot) return;
+      foreignActiveIds.clear();
+      for (const item of snapshot.questions)
+        if (item.ownerPageId !== undefined && item.ownerPageId !== pageId && ["queued", "running"].includes(item.state))
+          foreignActiveIds.add(item.id);
       if (snapshot.input && snapshot.input.id !== currentSource?.id)
         acceptSource(snapshot.input);
       let question = snapshot.questions.find(
         (item) => item.id === currentQuestionId,
       );
       if (!currentQuestionId) {
-        question = snapshot.questions
-          .filter((item) => ["queued", "running"].includes(item.state))
+        const activeQuestions = snapshot.questions
+          .filter((item) => ["queued", "running"].includes(item.state));
+        question = activeQuestions
+          .filter((item) => item.ownerPageId === pageId || item.ownerPageId === undefined)
           .at(-1);
         if (asking && question) bufferAskEvent("question", question);
         else currentQuestionId = question?.id;
       }
       if (question && question.id === currentQuestionId) updateQuestion(question);
+      updateActions();
     });
     events.addEventListener("source", (event) => {
       const source = parseEvent(event, "Source update");

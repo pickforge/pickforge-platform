@@ -97,6 +97,16 @@ describe("closed protocol", () => {
     })).toThrow(/three/);
   });
 
+  it("accepts optional bounded page ownership and rejects invalid ownership", () => {
+    expect(validateAskRequest(ask)).toEqual(ask);
+    expect(validateAskRequest({ ...ask, ownerPageId: "page-1" })).toEqual({
+      ...ask,
+      ownerPageId: "page-1",
+    });
+    expect(() => validateAskRequest({ ...ask, ownerPageId: "x".repeat(65) })).toThrow(/64/);
+    expect(() => validateAskRequest({ ...ask, ownerPageId: 1 })).toThrow(/non-empty string/);
+  });
+
   it("enforces quiz values, unique languages, and ordered line ranges", () => {
     expect(validateLogPatch({ quizOutcome: "got_it" })).toEqual({ quizOutcome: "got_it" });
     expect(validateLogPatch({ quizOutcome: "almost" })).toEqual({ quizOutcome: "almost" });

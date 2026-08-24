@@ -67,7 +67,13 @@ export const pageScript = String.raw`
     composerSelectionKey = null,
     historyEntries = [],
     historyIndex = 0,
-    activeHistoryBadge = null;
+    activeHistoryBadge = null,
+    structureSnapshot = null,
+    structureError = null,
+    structureInputId = null,
+    structureStatus = "idle",
+    structureRequestSequence = 0,
+    selectedConnection = null;
   const learningBadgeGroups = new Map();
   const foreignActiveIds = new Set();
   let railCollapsed = sessionStorage.getItem("reviewTutorRailCollapsed") === "1";
@@ -370,28 +376,263 @@ export const pageScript = String.raw`
     updateAnswerVisibility();
   }
   const diffControls = ["files", "previous-file", "next-file", "select-lines", "open-composer", "totals"];
+  function structureStatusLabel(status) {
+    return status === "modified" ? "edited" : status;
+  }
+  function structureKindLabel(kind) {
+    return kind === "reexport" ? "re-export" : kind === "dynamic-import" ? "dynamic" : kind;
+  }
+  function resetStructure() {
+    structureRequestSequence++;
+    structureSnapshot = null;
+    structureError = null;
+    structureInputId = null;
+    structureStatus = "idle";
+    selectedConnection = null;
+    element("structure-content").replaceChildren();
+  }
+  function clearStructureLanding() {
+    document.querySelector(".diff-row.structure-landing")?.classList.remove("structure-landing");
+  }
+  function normalizedLine(text) {
+    return String(text || "").trim().replace(/\s+/g, " ");
+  }
+  function jumpToEvidence(evidence, edgeStatus, evidenceIndex, allEvidence) {
+    clearStructureLanding();
+    const fileIndex = files.findIndex((file) => file.path === evidence.path);
+    if (fileIndex < 0) {
+      announce(evidence.path + " is not in the diff view.");
+      return;
+    }
+    let preferredKind = edgeStatus === "added"
+      ? "addition"
+      : edgeStatus === "removed"
+        ? "deletion"
+        : null;
+    if (edgeStatus === "modified") {
+      const identical = allEvidence.length > 1 && allEvidence.every((item) => normalizedLine(item.text) === normalizedLine(allEvidence[0].text));
+      preferredKind = identical || evidenceIndex > 0 ? "addition" : "deletion";
+    }
+    const matches = [];
+    const evidenceText = normalizedLine(evidence.text);
+    files[fileIndex].lines.forEach((line, rowIndex) => {
+      const lineText = normalizedLine(line.text);
+      if (rowSelectable(line) && line.selectLine === evidence.line && evidenceText && (lineText === evidenceText || lineText.startsWith(evidenceText)))
+        matches.push({ line, rowIndex });
+    });
+    const target = preferredKind
+      ? matches.find((match) => match.line.kind === preferredKind) || matches[0]
+      : matches[0];
+    setView("diff");
+    scrollFile(fileIndex);
+    if (!target) {
+      const head = element("file-" + fileIndex)?.querySelector(".file-head");
+      head?.focus({ preventScroll: true });
+      announce("Line " + evidence.line + " is not in the diff view.");
+      return;
+    }
+    const control = rowControl({ fileIndex, rowIndex: target.rowIndex });
+    const row = rowNode({ fileIndex, rowIndex: target.rowIndex });
+    row?.classList.add("structure-landing");
+    row?.scrollIntoView({ block: "center" });
+    control?.focus({ preventScroll: true });
+  }
+  function renderStructure() {
+    selectedConnection = null;
+    const container = element("structure-content");
+    container.replaceChildren();
+    if (!currentSource || structureStatus === "loading") {
+      const empty = document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = currentSource ? "Analyzing structure…" : "Load a source to begin reviewing.";
+      container.append(empty);
+      return;
+    }
+    if (structureStatus === "error") {
+      const card = document.createElement("div");
+      card.className = "structure-error-card";
+      const message = document.createElement("p");
+      message.id = "structure-error";
+      message.textContent = structureError;
+      const retry = document.createElement("button");
+      retry.id = "structure-retry";
+      retry.className = "ghost";
+      retry.type = "button";
+      retry.textContent = "Retry";
+      retry.addEventListener("click", () => {
+        structureStatus = "idle";
+        ensureStructure();
+        element("structure-title")?.focus();
+      });
+      card.append(message, retry);
+      container.append(card);
+      return;
+    }
+    if (!structureSnapshot) return;
+    const snapshot = structureSnapshot;
+    const comparison = document.createElement("p");
+    comparison.id = "structure-comparison";
+    comparison.className = "structure-comparison";
+    comparison.textContent = snapshot.comparison.from + " → " + snapshot.comparison.to;
+    container.append(comparison);
+    const disclosureItems = [
+      ...snapshot.comparison.reasons.map((reason) => ({ reason })),
+      ...snapshot.limits.omitted,
+    ];
+    if (snapshot.comparison.partial || snapshot.limits.truncated) {
+      const notice = document.createElement("aside");
+      notice.id = "structure-partial";
+      notice.className = "structure-partial";
+      const sentence = document.createElement("p");
+      sentence.textContent = "Structure analysis is partial; some connections may be missing.";
+      const details = document.createElement("details");
+      const summary = document.createElement("summary");
+      summary.textContent = disclosureItems.length + " " + (disclosureItems.length === 1 ? "reason" : "reasons");
+      const reasons = document.createElement("ul");
+      for (const item of disclosureItems) {
+        const reason = document.createElement("li");
+        reason.textContent = (item.path ? item.path + ": " : "") + item.reason;
+        reasons.append(reason);
+      }
+      details.append(summary, reasons);
+      notice.append(sentence, details);
+      container.append(notice);
+    }
+    if (!snapshot.edges.length)
+      container.append(makeSpan("structure-zero", "No connections among changed files. Unchanged neighbours are outside this view."));
+    snapshot.files.forEach((file, fileIndex) => {
+      const connections = snapshot.edges.filter((edge) => edge.from === file.path);
+      if (!connections.length && !(!file.analyzed && file.reason)) return;
+      const group = document.createElement("section");
+      group.className = "structure-file";
+      const headingId = "structure-file-" + fileIndex;
+      group.setAttribute("aria-labelledby", headingId);
+      const head = document.createElement("div");
+      head.className = "structure-file-head file-head";
+      const heading = document.createElement("h3");
+      heading.id = headingId;
+      heading.className = "structure-file-path";
+      heading.textContent = file.path;
+      heading.title = file.path;
+      const status = makeSpan("structure-file-status status-chip status-" + file.status, file.status);
+      head.append(heading, status);
+      group.append(head);
+      if (file.renamedFrom)
+        group.append(makeSpan("structure-file-note", "renamed from " + file.renamedFrom));
+      if (!file.analyzed && file.reason)
+        group.append(makeSpan("structure-file-note", file.reason));
+      const list = document.createElement("div");
+      list.className = "connection-list";
+      connections.forEach((edge, edgeIndex) => {
+        const key = fileIndex + "-" + edgeIndex;
+        const evidenceId = "connection-evidence-" + key;
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = "connection-row";
+        row.dataset.status = edge.status;
+        row.setAttribute("aria-expanded", "false");
+        row.setAttribute("aria-controls", evidenceId);
+        row.append(
+          makeSpan("connection-kind", structureKindLabel(edge.kind)),
+          makeSpan("connection-target", edge.to),
+        );
+        if (edge.typeOnly) row.append(makeSpan("connection-type", "type"));
+        row.append(makeSpan("connection-status status-chip status-" + edge.status, structureStatusLabel(edge.status)));
+        const evidenceList = document.createElement("ul");
+        evidenceList.id = evidenceId;
+        evidenceList.className = "connection-evidence";
+        evidenceList.hidden = true;
+        edge.evidence.forEach((evidence, evidenceIndex) => {
+          const item = document.createElement("li");
+          const code = document.createElement("span");
+          code.className = "evidence-code";
+          code.textContent = evidence.line + "  " + evidence.text;
+          const open = document.createElement("button");
+          open.type = "button";
+          open.className = "ghost open-in-diff";
+          open.textContent = "Open in Diff";
+          open.addEventListener("click", () => jumpToEvidence(evidence, edge.status, evidenceIndex, edge.evidence));
+          item.append(code, open);
+          evidenceList.append(item);
+        });
+        row.addEventListener("click", () => {
+          const expanded = row.getAttribute("aria-expanded") === "true";
+          if (selectedConnection && selectedConnection !== row) {
+            selectedConnection.classList.remove("selected");
+            selectedConnection.setAttribute("aria-expanded", "false");
+            element(selectedConnection.getAttribute("aria-controls")).hidden = true;
+          }
+          selectedConnection = row;
+          row.classList.add("selected");
+          row.setAttribute("aria-expanded", String(!expanded));
+          evidenceList.hidden = expanded;
+        });
+        list.append(row, evidenceList);
+      });
+      if (connections.length) group.append(list);
+      container.append(group);
+    });
+  }
+  function ensureStructure() {
+    if (!currentSource) {
+      renderStructure();
+      return;
+    }
+    if (structureInputId === currentSource.id && structureStatus !== "idle") return;
+    const inputId = currentSource.id;
+    const sequence = ++structureRequestSequence;
+    structureInputId = inputId;
+    structureStatus = "loading";
+    renderStructure();
+    announce("Analyzing structure…");
+    api("/api/structure").then((snapshot) => {
+      if (sequence !== structureRequestSequence || currentSource?.id !== inputId) return;
+      if (snapshot?.inputId !== inputId) {
+        structureError = "Structure analysis did not match the current source.";
+        structureSnapshot = null;
+        structureStatus = "error";
+        renderStructure();
+        announce(structureError);
+        return;
+      }
+      structureSnapshot = snapshot;
+      structureError = null;
+      structureStatus = "loaded";
+      renderStructure();
+      announce("Structure analysis complete.");
+    }).catch((error) => {
+      if (sequence !== structureRequestSequence || currentSource?.id !== inputId) return;
+      structureError = error instanceof Error ? error.message : String(error);
+      structureSnapshot = null;
+      structureStatus = "error";
+      renderStructure();
+      announce("Structure analysis failed: " + structureError);
+    });
+  }
   function setView(view, focusPanel = false) {
-    activeView = view === "log" ? "log" : "diff";
-    if (activeView === "log") hideInlineComposer();
+    activeView = ["diff", "structure", "log"].includes(view) ? view : "diff";
+    if (activeView !== "diff") hideInlineComposer();
     element("diff").hidden = activeView !== "diff";
+    element("structure-section").hidden = activeView !== "structure";
     element("log-section").hidden = activeView !== "log";
     for (const id of diffControls) element(id).hidden = activeView !== "diff";
     element("mobile-ask").hidden = activeView !== "diff";
-    for (const name of ["diff", "log"]) {
+    for (const name of ["diff", "structure", "log"]) {
       const tab = element("view-" + name);
       const selected = name === activeView;
       tab.setAttribute("aria-selected", String(selected));
       tab.tabIndex = selected ? 0 : -1;
     }
-    announce(activeView === "log" ? "Learning log view." : "Diff view.");
-    if (focusPanel) (activeView === "log" ? element("log-title") : element("view-diff")).focus();
+    announce(activeView === "log" ? "Learning log view." : activeView === "structure" ? "Structure view." : "Diff view.");
+    if (activeView === "structure") ensureStructure();
+    if (focusPanel) (activeView === "log" ? element("log-title") : activeView === "structure" ? element("structure-title") : element("view-diff")).focus();
   }
   function handleViewKey(event) {
     if (!["ArrowLeft", "ArrowRight", "Home", "End", "Enter", " "].includes(event.key)) return;
-    const tabs = [element("view-diff"), element("view-log")];
+    const tabs = [element("view-diff"), element("view-structure"), element("view-log")];
     const current = tabs.indexOf(event.currentTarget);
     if (["Enter", " "].includes(event.key)) {
-      setView(event.currentTarget.id === "view-log" ? "log" : "diff");
+      setView(event.currentTarget.id.replace("view-", ""));
     } else {
       const target = event.key === "Home"
         ? tabs[0]
@@ -400,6 +641,7 @@ export const pageScript = String.raw`
           : event.key === "ArrowLeft"
             ? tabs[Math.max(0, current - 1)]
             : tabs[Math.min(tabs.length - 1, current + 1)];
+      tabs.forEach((tab) => { tab.tabIndex = tab === target ? 0 : -1; });
       target.focus();
     }
     event.preventDefault();
@@ -511,6 +753,7 @@ export const pageScript = String.raw`
   function chooseRow(fileIndex, rowIndex, extend, confirm) {
     const file = files[fileIndex], row = file.lines[rowIndex];
     if (!rowSelectable(row)) return;
+    clearStructureLanding();
     clearError();
     const previousAnchor = selectionAnchor;
     if (!extend || !selectionAnchor || selectionAnchor.fileIndex !== fileIndex || file.lines[selectionAnchor.rowIndex].block !== row.block)
@@ -828,6 +1071,7 @@ export const pageScript = String.raw`
       article.id = "file-" + fileIndex;
       const head = document.createElement("div");
       head.className = "file-head";
+      head.tabIndex = -1;
       const disclosure = document.createElement("button");
       disclosure.textContent = "▾";
       disclosure.setAttribute("aria-label", "Collapse " + file.path);
@@ -1513,6 +1757,7 @@ export const pageScript = String.raw`
   }
   function acceptSource(source) {
     currentSource = source;
+    resetStructure();
     const parsed = parseUnifiedDiff(source.content, source.label);
     files = parsed.files;
     preambleText = parsed.preamble;
@@ -1530,8 +1775,8 @@ export const pageScript = String.raw`
   }
   element("kind").addEventListener("change", updateSourceFields);
   element("model").addEventListener("change", updateThinking);
-  for (const id of ["view-diff", "view-log"]) {
-    element(id).addEventListener("click", () => setView(id === "view-log" ? "log" : "diff"));
+  for (const id of ["view-diff", "view-structure", "view-log"]) {
+    element(id).addEventListener("click", () => setView(id.replace("view-", "")));
     element(id).addEventListener("keydown", handleViewKey);
   }
   element("history-previous").addEventListener("click", () => renderHistoryEntry(Math.max(0, historyIndex - 1)));

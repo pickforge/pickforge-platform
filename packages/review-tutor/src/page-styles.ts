@@ -18,7 +18,7 @@ button:hover:not(:disabled) {
 border-color:rgba(255,255,255,.28)}
 button:disabled {
 cursor:not-allowed;opacity:.48}
-button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,[tabindex]:focus-visible {
+button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-visible,[tabindex]:focus-visible {
 outline:2px solid rgba(255,122,26,.6);outline-offset:2px}
 input,select {
 width:100%;height:var(--control-h);padding:0 10px}
@@ -105,7 +105,7 @@ display:none}
 .diff-scroll {
 overflow:auto;min-height:0;scroll-behavior:smooth}
 .empty {
-padding:56px 24px;color:var(--muted)}
+display:block;margin:0;padding:56px 24px;color:var(--muted)}
 .diff-preamble {
 margin:14px 14px 4px;padding:10px 12px;border:1px solid var(--hairline);border-radius:var(--radius-card);background:var(--surface-1);color:var(--muted);font:11px/1.6 var(--font-mono);white-space:pre-wrap;overflow-wrap:anywhere}
 .file {
@@ -134,6 +134,8 @@ background:rgba(60,190,125,.07);box-shadow:inset 2px 0 var(--green)}
 background:rgba(220,80,95,.07);box-shadow:inset 2px 0 var(--rose)}
 .diff-row.selected {
 background:rgba(255,122,26,.11);box-shadow:inset 2px 0 var(--ember)}
+.diff-row.structure-landing {
+box-shadow:inset 2px 0 var(--ember)}
 .file.plain .diff-row {
 grid-template-columns:52px 24px minmax(0,1fr)}
 .file.plain .line-no:nth-child(2) {
@@ -286,6 +288,64 @@ content:"";display:inline-block;width:7px;height:1em;background:var(--ember);ver
 position:fixed;top:calc(var(--topbar-h) + 10px);left:50%;translate:-50% 0;z-index:60;max-width:min(560px,calc(100vw - 24px));padding:10px 14px;border:1px solid rgba(231,123,134,.4);border-radius:var(--radius-control);background:var(--surface-2);color:#ff9ca5;white-space:pre-wrap;box-shadow:0 6px 24px rgba(0,0,0,.5)}
 .error:empty {
 display:none}
+.structure-section {
+contain:layout;min-width:0;padding:14px 14px 100px;overflow-x:hidden}
+.structure-comparison {
+margin:0 0 10px;color:var(--subtle);font:12px var(--font-mono)}
+.structure-partial {
+margin:0 0 14px;padding:10px 12px;border:1px solid var(--amber);border-radius:var(--radius-card);background:var(--surface-1);color:var(--subtle)}
+.structure-partial p {
+margin:0}
+.structure-partial details {
+margin-top:6px}
+.structure-partial summary {
+width:max-content;max-width:100%;color:var(--amber);cursor:pointer;font:600 11px var(--font-mono)}
+.structure-partial ul {
+margin:7px 0 0;padding-left:20px;overflow-wrap:anywhere}
+.structure-error-card {
+display:flex;align-items:center;gap:12px;padding:12px;border:1px solid var(--rose);border-radius:var(--radius-card);background:var(--surface-1)}
+.structure-error-card p {
+flex:1;min-width:0;margin:0;color:var(--rose);overflow-wrap:anywhere}
+.structure-zero {
+display:block;padding:24px 0;color:var(--muted)}
+.structure-file {
+min-width:0;border:1px solid var(--hairline);border-radius:var(--radius-card);overflow:clip;background:var(--surface-1)}
+.structure-file + .structure-file {
+margin-top:10px}
+.structure-file-head {
+position:static;min-width:0}
+.structure-file-path {
+min-width:0;margin:0;font:12px var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.status-chip,.connection-kind,.connection-type {
+flex:none;color:var(--muted);font:600 10px var(--font-mono);letter-spacing:.1em;text-transform:uppercase}
+.status-added {
+color:var(--green)}
+.status-removed {
+color:var(--rose)}
+.status-modified {
+color:var(--amber)}
+.structure-file-note {
+display:block;padding:6px 14px;border-bottom:1px solid var(--hairline);color:var(--muted);font:11px var(--font-mono);overflow-wrap:anywhere}
+.connection-list {
+min-width:0}
+.connection-row {
+width:100%;min-width:0;min-height:32px;display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:9px;padding:3px 12px;border:0;border-radius:0;background:transparent;text-align:left;white-space:normal}
+.connection-row:hover:not(:disabled) {
+background:var(--surface-2)}
+.connection-row.selected {
+position:relative;z-index:1;outline:1px solid var(--ember);outline-offset:-1px;background:var(--surface-2)}
+.connection-target {
+min-width:0;color:var(--text);font:12px var(--font-mono);overflow-wrap:anywhere}
+.connection-evidence {
+margin:0;padding:0;list-style:none;border-top:1px solid var(--hairline);background:var(--surface)}
+.connection-evidence li {
+min-width:0;display:flex;align-items:center;gap:12px;padding:7px 12px 7px 22px;border-left:2px solid var(--hairline-strong)}
+.connection-evidence li + li {
+border-top:1px solid var(--hairline)}
+.evidence-code {
+flex:1;min-width:0;color:var(--subtle);font:12px/1.5 var(--font-mono);white-space:pre-wrap;overflow-wrap:anywhere}
+.open-in-diff {
+flex:none}
 .log-section {
 contain:layout;padding:20px 14px 100px;border-top:1px solid var(--hairline);scroll-margin-top:8px}
 .log-head {
@@ -377,9 +437,29 @@ column-gap:2px}
 flex:1 1 100%}
 .toolbar .totals {
 margin-left:0}
+.structure-file-path {
+overflow:visible;text-overflow:clip;white-space:normal;overflow-wrap:anywhere}
+.connection-row {
+grid-template-columns:auto auto auto minmax(0,1fr);grid-template-areas:"kind type status ." "target target target target";gap:2px 8px;padding-top:5px;padding-bottom:5px}
+.connection-kind {
+grid-area:kind}
+.connection-target {
+grid-area:target}
+.connection-type {
+grid-area:type}
+.connection-status {
+grid-area:status}
+.connection-evidence li {
+align-items:stretch;flex-direction:column;padding-left:12px}
+.open-in-diff {
+width:100%;min-height:var(--control-h-touch)}
 }
 .diff-scroll {
 overflow:visible}
+.structure-section {
+padding-left:8px;padding-right:8px}
+.connection-row {
+min-height:var(--control-h-touch)}
 .file-head {
 top:var(--filehead-top);min-height:var(--control-h-touch);height:var(--control-h-touch)}
 .diff-row {
@@ -412,6 +492,10 @@ top:6px}
 display:block;position:fixed;z-index:30;left:12px;right:12px;bottom:12px;min-height:48px;box-shadow:0 4px 18px #000;background:var(--ember);color:#160a02;border-color:var(--ember);font-weight:700}
 .mobile-ask:disabled {
 opacity:1}
+.structure-error-card button,.structure-partial summary,.open-in-diff {
+min-height:var(--control-h-touch)}
+.structure-partial summary {
+padding:8px 4px}
 .source-actions .primary {
 min-height:var(--control-h-touch)}
 .field select,.field input,.field textarea {

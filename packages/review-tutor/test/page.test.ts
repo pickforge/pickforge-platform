@@ -513,7 +513,7 @@ describe("Review Tutor composed page", () => {
   it("submits contiguous selection and applies a synchronous duplicate Ask lock", async () => {
     let resolveAsk!: (response: Response) => void;
     const pending = new Promise<Response>((resolve) => { resolveAsk = resolve; });
-    const { window, document, requests } = await boot({ askResponse: pending });
+    const { window, document, requests, events } = await boot({ askResponse: pending });
     const rows = selectableRows(document);
     const reachable = lineControl(rows.find((row) => lineControl(row).tabIndex === 0));
     reachable.focus();
@@ -528,7 +528,8 @@ describe("Review Tutor composed page", () => {
     ask.click();
     expect(ask.disabled).toBe(true);
     expect(ask.getAttribute("aria-busy")).toBe("true");
-    expect(ask.textContent).toContain("Asking…");
+    expect(ask.textContent).toBe("Sending");
+    expect(ask.querySelector(".busy-dot")?.getAttribute("aria-hidden")).toBe("true");
     expect(requests.filter((request) => request.path === "/api/ask")).toHaveLength(1);
     resolveAsk(json({ id: "q-1", state: "queued", answer: "", createdAt: new Date().toISOString() }));
     await flush();
@@ -539,7 +540,14 @@ describe("Review Tutor composed page", () => {
     expect(payload).not.toHaveProperty("harness");
     expect(ask.getAttribute("aria-busy")).toBe("false");
     expect(ask.textContent).toBe("Queued");
+    expect(ask.querySelector(".busy-dot")).not.toBeNull();
     expect(ask.classList.contains("busy-neutral")).toBe(true);
+    events?.emit("question", { id: "q-1", state: "running", answer: "" });
+    expect(ask.textContent).toBe("Answering");
+    expect(ask.querySelector(".busy-dot")).not.toBeNull();
+    events?.emit("question", { id: "q-1", state: "answered", answer: "Done" });
+    expect(ask.textContent).toBe("Ask");
+    expect(ask.querySelector(".busy-dot")).toBeNull();
   });
 
   it("keeps Space and Shift+Arrow selection-only, then opens and focuses on Enter", async () => {

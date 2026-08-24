@@ -956,13 +956,13 @@ export const pageScript = String.raw`
     const current = Number(element("files").value || 0);
     scrollFile((current + delta + files.length) % files.length);
   }
-  function setAskLabel(text, spinner = false) {
+  function setAskLabel(text, busy = false) {
     element("ask").replaceChildren();
-    if (spinner) {
-      const icon = document.createElement("span");
-      icon.className = "spinner";
-      icon.setAttribute("aria-hidden", "true");
-      element("ask").append(icon);
+    if (busy) {
+      const dot = document.createElement("span");
+      dot.className = "busy-dot";
+      dot.setAttribute("aria-hidden", "true");
+      element("ask").append(dot);
     }
     element("ask").append(document.createTextNode(text));
   }
@@ -1008,9 +1008,9 @@ export const pageScript = String.raw`
     } else element("answer").classList.remove("streaming");
     if (question.state === "queued") {
       announce("Question queued.");
-      setAskLabel("Queued");
+      setAskLabel("Queued", true);
     }
-    if (question.state === "running") setAskLabel("Running");
+    if (question.state === "running") setAskLabel("Answering", true);
     if (question.state === "answered") {
       announce("Answer complete.");
       setAskLabel("Ask");
@@ -1075,7 +1075,7 @@ export const pageScript = String.raw`
     setAnswerTail("");
     setAnswer("");
     element("ask").setAttribute("aria-busy", "true");
-    setAskLabel("Asking…", true);
+    setAskLabel("Sending", true);
     announce("Question sent. Waiting for the tutor.");
     updateActions();
     try {

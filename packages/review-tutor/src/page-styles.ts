@@ -232,6 +232,8 @@ color:var(--subtle);font-size:12px;margin:8px 0 0}
 display:none;margin:0}
 .spinner {
 display:inline-block;width:12px;height:12px;border:2px solid rgba(0,0,0,.3);border-top-color:#160a02;border-radius:50%;margin-right:7px;vertical-align:-2px;animation:spin .7s linear infinite}
+.busy-dot {
+display:inline-block;width:6px;height:6px;margin-right:8px;border-radius:50%;background:var(--ember);animation:blink 1.2s ease-in-out infinite}
 .answer {
 margin-top:12px;padding-top:10px;border-top:1px solid var(--hairline)}
 .answer-head {

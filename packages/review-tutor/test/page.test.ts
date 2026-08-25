@@ -19,7 +19,8 @@ const source = {
     "diff --git a/src/b.ts b/src/b.ts",
     "--- a/src/b.ts",
     "+++ b/src/b.ts",
-    "@@ -1 +1 @@",
+    "@@ -0,0 +1,2 @@",
+    "+import type { a } from './a.js';",
     "+export const b = true;",
   ].join("\n"),
 };
@@ -29,6 +30,39 @@ const state = {
   input: source,
   models: [{ id: "model-1", label: "Model One", thinkingLevels: ["low"] }],
   questions: [],
+};
+
+const structure = {
+  protocol: "rt/1",
+  inputId: source.id,
+  comparison: {
+    kind: "worktree",
+    label: "Working tree",
+    from: "index",
+    to: "working tree",
+    partial: true,
+    reasons: ["One file exceeded the analysis limit."],
+  },
+  files: [
+    { path: "src/b.ts", status: "added", additions: 2, deletions: 0, analyzed: true },
+    { path: "src/a.ts", status: "modified", additions: 1, deletions: 1, analyzed: true },
+    { path: "src/old.ts", status: "removed", additions: 0, deletions: 2, analyzed: true },
+    { path: "src/new.ts", status: "renamed", renamedFrom: "src/legacy.ts", additions: 0, deletions: 0, analyzed: true },
+    { path: "vendor/generated.ts", status: "modified", additions: 3, deletions: 3, analyzed: false, reason: "File exceeded the statement limit." },
+  ],
+  edges: [
+    { from: "src/b.ts", to: "src/a.ts", kind: "import", typeOnly: true, status: "added", specifier: "./a.js", evidence: [{ path: "src/b.ts", line: 1, text: "import type { a } from './a.js';" }] },
+    { from: "src/a.ts", to: "src/new.ts", kind: "reexport", typeOnly: false, status: "modified", specifier: "./new.js", evidence: [{ path: "src/a.ts", line: 2, text: "export { value } from './new.js';" }] },
+    { from: "src/old.ts", to: "src/a.ts", kind: "require", typeOnly: false, status: "removed", specifier: "./a", evidence: [{ path: "src/old.ts", line: 1, text: "require('./a');" }] },
+    { from: "src/new.ts", to: "src/a.ts", kind: "dynamic-import", typeOnly: false, status: "unchanged", specifier: "./a.js", evidence: [] },
+  ],
+  limits: {
+    maxFiles: 200,
+    maxEdges: 2000,
+    maxEvidencePerEdge: 4,
+    truncated: true,
+    omitted: [{ path: "src/skipped.ts", reason: "Edge limit reached." }],
+  },
 };
 
 class FakeEventSource {
@@ -66,6 +100,16 @@ function logResponse(value: Promise<Response> | Response | unknown[] | undefined
   return json(value ?? fallback);
 }
 
+function stateResponse(value: unknown) {
+  if (value instanceof Error) throw value;
+  return json(value);
+}
+
+function structureResponse(value: Promise<Response> | Response | unknown | Error) {
+  if (value instanceof Error) throw value;
+  return value instanceof Promise || value instanceof Response ? value : json(value);
+}
+
 async function boot(options: {
   width?: number;
   askResponse?: Promise<Response> | Response;
@@ -76,6 +120,7 @@ async function boot(options: {
   storedPageId?: string;
   storedQuizIds?: string;
   stateResponses?: unknown[];
+  structureResponses?: Array<Promise<Response> | Response | unknown | Error>;
   failHeartbeat?: boolean;
   railCollapsed?: boolean;
 } = {}) {
@@ -95,15 +140,13 @@ async function boot(options: {
   const requests: Array<{ path: string; init?: RequestInit }> = [];
   const stateResponses = [...(options.stateResponses ?? [])];
   const logResponses = [...(options.logResponses ?? [])];
+  const structureResponses = [...(options.structureResponses ?? [structure])];
   const bootState = { ...state, input: options.source ?? source };
   const fetch = vi.fn(async (path: string, init?: RequestInit) => {
     requests.push({ path, init });
-    if (path === "/api/state") {
-      const response = stateResponses.shift() ?? bootState;
-      if (response instanceof Error) throw response;
-      return json(response);
-    }
+    if (path === "/api/state") return stateResponse(stateResponses.shift() ?? bootState);
     if (path === "/api/log?limit=100") return logResponse(logResponses.shift(), options.entries ?? []);
+    if (path === "/api/structure") return structureResponse(structureResponses.shift() ?? structure);
     if (path === "/api/heartbeat" && options.failHeartbeat) return Promise.reject(new Error("heartbeat down"));
     if (path === "/api/ask") return options.askResponse ?? json({ id: "q-1", state: "queued", answer: "", createdAt: new Date().toISOString() });
     if (path.startsWith("/api/log/")) return json({});
@@ -155,6 +198,11 @@ function lineControl(row: any) {
   const control = row.querySelector(".line-select");
   if (!control) throw new Error("Missing selectable line control");
   return control;
+}
+
+function pressEnter(window: InstanceType<typeof Window>, control: any) {
+  if (control.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })))
+    control.click();
 }
 
 function input(document: TestDocument, id: string, value: string) {
@@ -274,13 +322,400 @@ describe("Review Tutor composed page", () => {
     expect(byId(document, "error").parentElement).toBe(document.body);
     expect(byId(document, "lifecycle").parentElement).toBe(document.body);
     expect(byId(document, "log-section").parentElement).toBe(byId(document, "diff-scroll"));
-    expect(byId(document, "log-section").previousElementSibling).toBe(byId(document, "diff"));
+    expect(byId(document, "structure-section").previousElementSibling).toBe(byId(document, "diff"));
+    expect(byId(document, "log-section").previousElementSibling).toBe(byId(document, "structure-section"));
     expect(byId(document, "diff").getAttribute("role")).toBe("tabpanel");
+    expect(byId(document, "structure-section").getAttribute("role")).toBe("tabpanel");
     expect(byId(document, "log-section").getAttribute("role")).toBe("tabpanel");
     expect(byId(document, "log-section").hidden).toBe(true);
     expect(byId(document, "view-diff").getAttribute("aria-selected")).toBe("true");
     expect(byId(document, "view-log").getAttribute("aria-selected")).toBe("false");
     expect(Array.from(byId(document, "harness").options).map((item: any) => [item.value, item.textContent])).toEqual([["pi", "Pi"]]);
+  });
+
+  it("adds Structure to the peer tablist with roving keyboard focus", async () => {
+    const { window, document } = await boot();
+    const tabs = Array.from(byId(document, "view-switch").querySelectorAll('[role="tab"]')) as any[];
+    expect(tabs.map((tab) => tab.textContent)).toEqual(["Diff", "Structure", "Learning log"]);
+    expect(tabs.map((tab) => tab.tabIndex)).toEqual([0, -1, -1]);
+
+    byId(document, "view-diff").dispatchEvent(new window.KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+    expect(document.activeElement).toBe(byId(document, "view-structure"));
+    expect(tabs.map((tab) => tab.tabIndex)).toEqual([-1, 0, -1]);
+    expect(Array.from(document.querySelectorAll('.view-tab[tabindex="0"]'))).toEqual([byId(document, "view-structure")]);
+    byId(document, "view-structure").dispatchEvent(new window.KeyboardEvent("keydown", { key: "End", bubbles: true }));
+    expect(document.activeElement).toBe(byId(document, "view-log"));
+    expect(tabs.map((tab) => tab.tabIndex)).toEqual([-1, -1, 0]);
+  });
+
+  it("fetches structure once per input and refetches the new payload after a source switch", async () => {
+    const nextSource = { ...source, id: "input-2", digest: "digest-2", label: "Next tree" };
+    const nextStructure = {
+      ...structure,
+      inputId: nextSource.id,
+      comparison: { ...structure.comparison, label: "Next tree", from: "main", to: "feature" },
+    };
+    const { document, requests, events } = await boot({ structureResponses: [structure, nextStructure] });
+
+    byId(document, "view-structure").click();
+    await flush();
+    byId(document, "view-diff").click();
+    byId(document, "view-structure").click();
+    await flush();
+    expect(requests.filter((request) => request.path === "/api/structure")).toHaveLength(1);
+    expect(requests.find((request) => request.path === "/api/structure")?.init?.headers).toMatchObject({ Authorization: "Bearer secret-token" });
+
+    events?.emit("source", nextSource);
+    byId(document, "view-structure").click();
+    await flush();
+    expect(requests.filter((request) => request.path === "/api/structure")).toHaveLength(2);
+    expect(byId(document, "structure-comparison").textContent).toBe("main → feature");
+  });
+
+  it("shows a retryable error when a structure snapshot does not match the current input", async () => {
+    const { document } = await boot({
+      structureResponses: [{ ...structure, inputId: "other-input", comparison: { ...structure.comparison, from: "wrong", to: "snapshot" } }],
+    });
+    byId(document, "view-structure").click();
+    await flush();
+    expect(document.querySelector("#structure-comparison")).toBeNull();
+    expect(byId(document, "structure-error").textContent).toBe("Structure analysis did not match the current source.");
+    expect(byId(document, "structure-retry").textContent).toBe("Retry");
+    expect(byId(document, "lifecycle").textContent).toBe("Structure analysis did not match the current source.");
+  });
+
+  it("ignores a fetched structure snapshot when an SSE source switch wins the race", async () => {
+    let resolveOld!: (response: Response) => void;
+    const oldPending = new Promise<Response>((resolve) => { resolveOld = resolve; });
+    const nextSource = { ...source, id: "input-2", digest: "digest-2", label: "Next tree" };
+    const nextStructure = {
+      ...structure,
+      inputId: nextSource.id,
+      comparison: { ...structure.comparison, from: "base", to: "next" },
+    };
+    const { document, events } = await boot({ structureResponses: [oldPending, nextStructure] });
+
+    byId(document, "view-structure").click();
+    resolveOld(json({ ...structure, inputId: "other-input", comparison: { ...structure.comparison, from: "wrong", to: "snapshot" } }));
+    events?.emit("source", nextSource);
+    await flush();
+    expect(document.querySelector("#structure-comparison")).toBeNull();
+
+    byId(document, "view-structure").click();
+    await flush();
+    expect(byId(document, "structure-comparison").textContent).toBe("base → next");
+  });
+
+  it("renders block empty states, announces view then loading, and focuses the title after Retry", async () => {
+    let resolveStructure!: (response: Response) => void;
+    const pending = new Promise<Response>((resolve) => { resolveStructure = resolve; });
+    const typedError = new Response(JSON.stringify({ error: "structure unavailable" }), { status: 503, statusText: "Unavailable", headers: { "content-type": "application/json" } });
+    const { document } = await boot({ structureResponses: [pending, structure] });
+    const announcements: string[] = [];
+    const observer = new document.defaultView!.MutationObserver((records) => {
+      for (const record of records)
+        announcements.push(Array.from(record.addedNodes).map((node: any) => node.textContent).join(""));
+    });
+    observer.observe(byId(document, "lifecycle"), { childList: true });
+
+    byId(document, "view-structure").click();
+    await Promise.resolve();
+    expect(byId(document, "lifecycle").textContent).toBe("Analyzing structure…");
+    expect(announcements.filter(Boolean)).toEqual(["Structure view.", "Analyzing structure…"]);
+    expect(byId(document, "structure-content").firstElementChild?.tagName).toBe("P");
+    resolveStructure(typedError);
+    await flush();
+    expect(byId(document, "structure-error").textContent).toBe("structure unavailable");
+    expect(byId(document, "lifecycle").textContent).toBe("Structure analysis failed: structure unavailable");
+    byId(document, "structure-retry").click();
+    expect(document.activeElement).toBe(byId(document, "structure-title"));
+    await flush();
+    expect(byId(document, "structure-comparison").textContent).toBe("index → working tree");
+    expect(document.activeElement).toBe(byId(document, "structure-title"));
+    observer.disconnect();
+  });
+
+  it("clears stale connection state across an error, Retry, and loaded re-render", async () => {
+    const nextSource = { ...source, id: "input-2", digest: "digest-2", label: "Next tree" };
+    const nextStructure = { ...structure, inputId: nextSource.id };
+    const typedError = new Response(JSON.stringify({ error: "structure unavailable" }), { status: 503, headers: { "content-type": "application/json" } });
+    const { document, events } = await boot({ structureResponses: [structure, typedError, nextStructure] });
+
+    byId(document, "view-structure").click();
+    await flush();
+    (document.querySelector(".connection-row") as any).click();
+    events?.emit("source", nextSource);
+    byId(document, "view-structure").click();
+    await flush();
+    byId(document, "structure-retry").click();
+    await flush();
+    const rows = Array.from(document.querySelectorAll(".connection-row")) as any[];
+    rows[1].click();
+    expect(rows[1].getAttribute("aria-expanded")).toBe("true");
+    expect(pageHtml).toContain("function renderStructure() {\n    selectedConnection = null;");
+    expect(pageHtml).not.toContain("function structureText(");
+    expect(pageHtml).not.toContain("message.textContent = structureSnapshot");
+  });
+
+  it("renders the locked structure hierarchy, statuses, partial disclosure, and empty copy", async () => {
+    const { document } = await boot();
+    byId(document, "view-structure").click();
+    await flush();
+
+    expect(byId(document, "structure-partial").textContent).toContain("Structure analysis is partial; some connections may be missing.");
+    expect(byId(document, "structure-partial").querySelector("summary")?.textContent).toBe("2 reasons");
+    expect(byId(document, "structure-partial").textContent).toContain("src/skipped.ts: Edge limit reached.");
+    const groups = Array.from(document.querySelectorAll(".structure-file")) as any[];
+    expect(groups).toHaveLength(5);
+    expect(groups.every((group) => group.tagName === "SECTION" && group.getAttribute("aria-labelledby"))).toBe(true);
+    expect(groups.map((group) => group.querySelector(".structure-file-status")?.textContent)).toEqual(["added", "modified", "removed", "renamed", "modified"]);
+    expect(groups[3].textContent).toContain("renamed from src/legacy.ts");
+    expect(groups[4].textContent).toContain("File exceeded the statement limit.");
+    expect(groups[2].querySelector('.connection-row[data-status="removed"]')).not.toBeNull();
+    expect(document.querySelector(".connection-type")?.textContent).toBe("type");
+    expect(document.querySelector('.connection-row[data-status="modified"] .connection-status')?.textContent).toBe("edited");
+    expect(groups.every((group) => !group.querySelector(".file-counts"))).toBe(true);
+    expect(groups.every((group) => group.querySelector(".structure-file-path")?.getAttribute("title") === group.querySelector(".structure-file-path")?.textContent)).toBe(true);
+    expect(pageHtml).toMatch(/\.structure-file-head \{\nposition:static/);
+
+    const emptySnapshot = {
+      ...structure,
+      comparison: { ...structure.comparison, partial: false, reasons: [] },
+      files: [
+        { ...structure.files[3] },
+        { ...structure.files[4] },
+      ],
+      edges: [],
+      limits: { ...structure.limits, truncated: false, omitted: [] },
+    };
+    const emptyPage = await boot({ structureResponses: [emptySnapshot] });
+    byId(emptyPage.document, "view-structure").click();
+    await flush();
+    expect(byId(emptyPage.document, "structure-content").textContent).toContain("No connections among changed files. Unchanged neighbours are outside this view.");
+    const emptyGroups = emptyPage.document.querySelectorAll(".structure-file");
+    expect(emptyGroups).toHaveLength(1);
+    expect(emptyGroups.item(0)?.textContent).not.toContain("renamed from");
+    expect(emptyGroups.item(0)?.textContent).toContain("File exceeded the statement limit.");
+  });
+
+  it("renders only a header and reason for an unanalyzed file without connections", async () => {
+    const binarySnapshot = {
+      ...structure,
+      files: [{ path: "assets/logo.bin", status: "added", additions: 0, deletions: 0, analyzed: false, reason: "binary content: no import data" }],
+      edges: [],
+    };
+    const { document } = await boot({ width: 390, structureResponses: [binarySnapshot] });
+    byId(document, "view-structure").click();
+    await flush();
+
+    const group = document.querySelector(".structure-file") as unknown as HTMLElement;
+    expect(Array.from(group.children).map((child) => child.className)).toEqual([
+      "structure-file-head file-head",
+      "structure-file-note",
+    ]);
+    expect(group.children.item(1)?.textContent).toBe("binary content: no import data");
+  });
+
+  it("supports Enter activation, same-row collapse, single selection, and evidence jumps", async () => {
+    const { window, document } = await boot();
+    byId(document, "view-structure").click();
+    await flush();
+    const rows = Array.from(document.querySelectorAll(".connection-row")) as any[];
+    expect(rows[0].tagName).toBe("BUTTON");
+    pressEnter(window, rows[0]);
+    expect(rows[0].getAttribute("aria-expanded")).toBe("true");
+    expect(rows[0].classList.contains("selected")).toBe(true);
+    expect(byId(document, rows[0].getAttribute("aria-controls")).tagName).toBe("UL");
+    rows[0].click();
+    expect(rows[0].getAttribute("aria-expanded")).toBe("false");
+    rows[0].click();
+    rows[1].click();
+    expect(rows[0].getAttribute("aria-expanded")).toBe("false");
+    expect(rows[0].classList.contains("selected")).toBe(false);
+    expect(rows[1].getAttribute("aria-expanded")).toBe("true");
+    rows[0].click();
+    const open = byId(document, rows[0].getAttribute("aria-controls")).querySelector("button") as any;
+    open.click();
+    expect(byId(document, "diff").hidden).toBe(false);
+    expect(byId(document, "structure-section").hidden).toBe(true);
+    expect(document.activeElement).toBe(lineControl(selectableRows(document).find((row) => row.dataset.file === "1" && row.dataset.row === "1")));
+    expect(document.querySelectorAll(".diff-row.structure-landing")).toHaveLength(1);
+    lineControl(selectableRows(document)[0]).dispatchEvent(new document.defaultView!.Event("pointerdown", { bubbles: true }));
+    expect(document.querySelectorAll(".diff-row.structure-landing")).toHaveLength(0);
+  });
+
+  it("anchors modified evidence to its old and new sides, preferring additions for identical text", async () => {
+    const modifiedSource = {
+      ...source,
+      content: "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-old value\n+new value",
+    };
+    const modifiedStructure = {
+      ...structure,
+      files: [{ path: "a.ts", status: "modified", additions: 1, deletions: 1, analyzed: true }],
+      edges: [{
+        from: "a.ts", to: "b.ts", kind: "import", typeOnly: false, status: "modified", specifier: "./b.js",
+        evidence: [{ path: "a.ts", line: 1, text: "old value" }, { path: "a.ts", line: 1, text: "new value" }],
+      }],
+    };
+    const oldPage = await boot({ source: modifiedSource, structureResponses: [modifiedStructure] });
+    byId(oldPage.document, "view-structure").click();
+    await flush();
+    (oldPage.document.querySelector(".connection-row") as any).click();
+    const opens = Array.from(oldPage.document.querySelectorAll(".open-in-diff")) as any[];
+    opens[0].click();
+    expect(oldPage.document.querySelector(".diff-row.structure-landing")?.classList.contains("deletion")).toBe(true);
+
+    byId(oldPage.document, "view-structure").click();
+    (oldPage.document.querySelector(".connection-row") as any).click();
+    (Array.from(oldPage.document.querySelectorAll(".open-in-diff")) as any[])[1].click();
+    expect(oldPage.document.querySelector(".diff-row.structure-landing")?.classList.contains("addition")).toBe(true);
+    expect(oldPage.document.querySelectorAll(".diff-row.structure-landing")).toHaveLength(1);
+
+    const identicalSource = { ...modifiedSource, content: modifiedSource.content.replace("old value", "same").replace("new value", "same") };
+    const identicalStructure = {
+      ...modifiedStructure,
+      edges: [{ ...modifiedStructure.edges[0], evidence: [{ path: "a.ts", line: 1, text: "same" }, { path: "a.ts", line: 1, text: "same" }] }],
+    };
+    const identicalPage = await boot({ source: identicalSource, structureResponses: [identicalStructure] });
+    byId(identicalPage.document, "view-structure").click();
+    await flush();
+    (identicalPage.document.querySelector(".connection-row") as any).click();
+    (identicalPage.document.querySelector(".open-in-diff") as any).click();
+    expect(identicalPage.document.querySelector(".diff-row.structure-landing")?.classList.contains("addition")).toBe(true);
+  });
+
+  it("matches analyzer-truncated evidence as a prefix of the full diff line", async () => {
+    const prefix = "x".repeat(200);
+    const prefixSource = {
+      ...source,
+      content: `diff --git a/long.ts b/long.ts\n--- /dev/null\n+++ b/long.ts\n@@ -0,0 +1 @@\n+${prefix} full suffix`,
+    };
+    const prefixStructure = {
+      ...structure,
+      files: [{ path: "long.ts", status: "added", additions: 1, deletions: 0, analyzed: true }],
+      edges: [{
+        from: "long.ts", to: "target.ts", kind: "import", typeOnly: false, status: "added", specifier: "./target",
+        evidence: [{ path: "long.ts", line: 1, text: prefix }],
+      }],
+    };
+    const loaded = await boot({ source: prefixSource, structureResponses: [prefixStructure] });
+    byId(loaded.document, "view-structure").click();
+    await flush();
+    (loaded.document.querySelector(".connection-row") as any).click();
+    (loaded.document.querySelector(".open-in-diff") as any).click();
+    expect(loaded.document.querySelector(".diff-row.structure-landing")?.textContent).toContain("full suffix");
+  });
+
+  it("falls back to a matching line when the preferred diff side is absent", async () => {
+    const fallbackSource = {
+      ...source,
+      content: "diff --git a/added.ts b/added.ts\n--- /dev/null\n+++ b/added.ts\n@@ -0,0 +1 @@\n+only present here",
+    };
+    const fallbackStructure = {
+      ...structure,
+      files: [{ path: "added.ts", status: "added", additions: 1, deletions: 0, analyzed: true }],
+      edges: [{
+        from: "added.ts", to: "target.ts", kind: "import", typeOnly: false, status: "removed", specifier: "./target",
+        evidence: [{ path: "added.ts", line: 1, text: "only present here" }],
+      }],
+    };
+    const loaded = await boot({ source: fallbackSource, structureResponses: [fallbackStructure] });
+    byId(loaded.document, "view-structure").click();
+    await flush();
+    (loaded.document.querySelector(".connection-row") as any).click();
+    (loaded.document.querySelector(".open-in-diff") as any).click();
+    expect(loaded.document.querySelector(".diff-row.structure-landing")?.classList.contains("addition")).toBe(true);
+  });
+
+  it("matches indented and removed-file evidence after whitespace normalization", async () => {
+    const evidenceSource = {
+      ...source,
+      content: [
+        "diff --git a/indented.ts b/indented.ts", "--- a/indented.ts", "+++ b/indented.ts", "@@ -0,0 +1 @@", "+  call(  value );",
+        "diff --git a/removed.ts b/removed.ts", "--- a/removed.ts", "+++ /dev/null", "@@ -1 +0,0 @@", "-gone();",
+      ].join("\n"),
+    };
+    const evidenceStructure = {
+      ...structure,
+      files: [
+        { path: "indented.ts", status: "added", additions: 1, deletions: 0, analyzed: true },
+        { path: "removed.ts", status: "removed", additions: 0, deletions: 1, analyzed: true },
+      ],
+      edges: [
+        { from: "indented.ts", to: "value.ts", kind: "import", typeOnly: false, status: "added", specifier: "./value", evidence: [{ path: "indented.ts", line: 1, text: "call( value );" }] },
+        { from: "removed.ts", to: "gone.ts", kind: "import", typeOnly: false, status: "removed", specifier: "./gone", evidence: [{ path: "removed.ts", line: 1, text: "gone();" }] },
+      ],
+    };
+    const loaded = await boot({ source: evidenceSource, structureResponses: [evidenceStructure] });
+    byId(loaded.document, "view-structure").click();
+    await flush();
+    const rows = Array.from(loaded.document.querySelectorAll(".connection-row")) as any[];
+    rows[0].click();
+    (loaded.document.querySelector(".open-in-diff") as any).click();
+    expect(loaded.document.querySelector(".diff-row.structure-landing")?.classList.contains("addition")).toBe(true);
+
+    byId(loaded.document, "view-structure").click();
+    rows[1].click();
+    (rows[1].nextElementSibling.querySelector(".open-in-diff") as any).click();
+    expect(loaded.document.querySelector(".diff-row.structure-landing")?.classList.contains("deletion")).toBe(true);
+    expect(loaded.document.querySelectorAll(".diff-row.structure-landing")).toHaveLength(1);
+  });
+
+  it("announces unavailable evidence and only leaves Structure when the file is rendered", async () => {
+    const unavailable = {
+      ...structure,
+      files: [{ path: "src/a.ts", status: "modified", additions: 1, deletions: 1, analyzed: true }],
+      edges: [
+        { from: "src/a.ts", to: "line.ts", kind: "import", typeOnly: false, status: "added", specifier: "./line", evidence: [{ path: "src/a.ts", line: 99, text: "missing();" }] },
+        { from: "src/a.ts", to: "file.ts", kind: "import", typeOnly: false, status: "added", specifier: "./file", evidence: [{ path: "not-rendered.ts", line: 1, text: "missing();" }] },
+      ],
+    };
+    const { document } = await boot({ structureResponses: [unavailable] });
+    byId(document, "view-structure").click();
+    await flush();
+    const rows = Array.from(document.querySelectorAll(".connection-row")) as any[];
+    rows[0].click();
+    (rows[0].nextElementSibling.querySelector(".open-in-diff") as any).click();
+    expect(byId(document, "diff").hidden).toBe(false);
+    expect(byId(document, "lifecycle").textContent).toBe("Line 99 is not in the diff view.");
+    expect(document.activeElement).toBe(document.querySelector("#file-0 .file-head"));
+    expect(document.querySelectorAll(".diff-row.structure-landing")).toHaveLength(0);
+
+    byId(document, "view-structure").click();
+    rows[1].click();
+    (rows[1].nextElementSibling.querySelector(".open-in-diff") as any).click();
+    expect(byId(document, "structure-section").hidden).toBe(false);
+    expect(byId(document, "lifecycle").textContent).toBe("not-rendered.ts is not in the diff view.");
+  });
+
+  it("uses touch targets and compact chips without making structure heads sticky", async () => {
+    expect(pageHtml).toContain("button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-visible,[tabindex]:focus-visible");
+    expect(pageHtml).toMatch(/\.status-chip,\.connection-kind,\.connection-type \{\n[^}]*font:600 10px/);
+    expect(pageHtml).toMatch(/@media\(max-width:860px\)[\s\S]*\.structure-error-card button,\.structure-partial summary,\.open-in-diff \{\nmin-height:var\(--control-h-touch\)/);
+    expect(pageHtml).toMatch(/@media\(max-width:520px\)[\s\S]*\.structure-file-path \{\n[^}]*white-space:normal[^}]*overflow-wrap:anywhere/);
+    expect(pageHtml).toContain('grid-template-areas:"kind type status ." "target target target target"');
+
+    const mobileStyles = pageHtml.slice(pageHtml.indexOf("@media(max-width:860px)"));
+    expect(mobileStyles).toMatch(/\.structure-partial summary \{\npadding:8px 4px\}/);
+    expect(mobileStyles).not.toMatch(/\.structure-partial summary \{\n[^}]*display:flex/);
+    expect(pageHtml).toMatch(/\.empty \{\ndisplay:block[^}]*\}/);
+    expect(pageHtml).not.toMatch(/\.empty \{\n[^}]*text-align:center/);
+    expect(pageHtml).toMatch(/\.diff-row\.structure-landing \{\nbox-shadow:inset 2px 0 var\(--ember\)\}/);
+    expect(pageHtml).not.toMatch(/\.diff-row\.structure-landing \{\n[^}]*background/);
+  });
+
+  it("mirrors Diff's no-input block and renders the 360px structure DOM without a layout engine", async () => {
+    const noInput = await boot({ width: 360, stateResponses: [{ ...state, input: undefined }] });
+    byId(noInput.document, "view-structure").click();
+    expect(byId(noInput.document, "structure-content").textContent).toBe("Load a source to begin reviewing.");
+    expect(byId(noInput.document, "structure-content").firstElementChild?.tagName).toBe("P");
+    expect(noInput.requests.filter((request) => request.path === "/api/structure")).toHaveLength(0);
+
+    const loaded = await boot({ width: 360 });
+    byId(loaded.document, "view-structure").click();
+    await flush();
+    const panel = byId(loaded.document, "structure-section");
+    expect(panel.scrollWidth).toBeLessThanOrEqual(panel.clientWidth);
   });
 
   it("switches Diff and Learning log as stable peer views", async () => {
@@ -299,6 +734,8 @@ describe("Review Tutor composed page", () => {
     expect(document.querySelector(".log-entry textarea")).toBe(note);
 
     byId(document, "view-log").dispatchEvent(new window.KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true }));
+    expect(document.activeElement).toBe(byId(document, "view-structure"));
+    byId(document, "view-structure").dispatchEvent(new window.KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true }));
     expect(document.activeElement).toBe(byId(document, "view-diff"));
     expect(byId(document, "diff").hidden).toBe(true);
     byId(document, "view-diff").dispatchEvent(new window.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
@@ -816,7 +1253,7 @@ describe("Review Tutor composed page", () => {
     expect(document.querySelectorAll(".diff-preamble")).toHaveLength(1);
     expect(document.querySelectorAll(".file")).toHaveLength(2);
     expect(document.querySelectorAll("#files option")).toHaveLength(2);
-    expect(byId(document, "totals").textContent).toBe("+2 −1");
+    expect(byId(document, "totals").textContent).toBe("+3 −1");
   });
 
   it("omits fabricated coordinates for mixed old/new selection and reports count", async () => {

@@ -523,6 +523,22 @@ describe("Review Tutor composed page", () => {
     const fallback = await boot({ harnesses: unavailableHarnesses, storedHarness: "claude-code", storedModelByHarness: stored });
     expect(byId(fallback.document, "harness").value).toBe("pi");
     expect(byId(fallback.document, "model").value).toBe("model-1");
+
+    const garbage = await boot({ harnesses: threeHarnesses, storedHarness: "codex", storedModelByHarness: "{not json" });
+    expect(byId(garbage.document, "harness").value).toBe("codex");
+    expect(byId(garbage.document, "model").value).toBe("codex:gpt");
+  });
+
+  it("labels a saved answer from a harness that is no longer available like the export does", async () => {
+    const entry = {
+      id: "entry-codex", inputId: "old-input", source: { kind: source.kind, label: source.label, digest: source.digest },
+      selection: { file: "src/a.ts", startLine: 1, endLine: 2, text: "const newValue = 2;\ncontext();", context: "" },
+      question: "q", answer: "a", modelId: "codex:gpt-5.6-sol", preferences: {}, note: "", reviewLater: false,
+      createdAt: "2026-08-25T00:00:00.000Z",
+    };
+    const { document } = await boot({ entries: [entry] });
+    (document.querySelector(".tutored-badge") as any).click();
+    expect(byId(document, "answer-attribution").textContent).toBe("codex · gpt-5.6-sol");
   });
 
   it("submits only the selected harness's model and keeps the answer identity it started with", async () => {
@@ -1787,6 +1803,7 @@ describe("Review Tutor composed page", () => {
 
     byId(document, "history-next").click();
     expect(byId(document, "question").value).toBe("Older question");
+    expect(byId(document, "answer-attribution").textContent).toBe("Pi · Model One");
     expect(byId(document, "answer-text").textContent).toBe("Older answer");
     expect(byId(document, "history-position").textContent).toBe("2 of 2");
 

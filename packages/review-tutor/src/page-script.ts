@@ -2246,7 +2246,11 @@ export const pageScript = String.raw`
     for (const harness of harnesses())
       for (const model of harness.models || [])
         if (model.id === modelId) return harness.label + " · " + model.label;
-    return modelId ? String(modelId) : "";
+    if (!modelId) return "";
+    // Same fallback as the HTML export: the namespace before the first ":" (when it precedes any "/") is the harness.
+    const text = String(modelId), separator = text.indexOf(":"), slash = text.indexOf("/");
+    const namespaced = separator >= 0 && (slash < 0 || separator < slash);
+    return namespaced ? harnessLabel(text.slice(0, separator)) + " · " + text.slice(separator + 1) : text;
   }
   function setAnswerAttribution(modelId) {
     element("answer-attribution").textContent = attribution(modelId);

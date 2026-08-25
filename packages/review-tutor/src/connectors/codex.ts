@@ -9,6 +9,7 @@ import type {
   ParsedAnswer,
   SpawnSpec,
 } from "./types.ts";
+import { redact } from "./redact.ts";
 import { ConnectorError } from "./types.ts";
 
 const MAX_CATALOG_BYTES = 1024 * 1024;
@@ -129,11 +130,7 @@ function providerMessage(message: string, model: string): ConnectorError {
   } else if (/model .* not (found|supported)|unknown model|invalid model/i.test(message)) {
     safe = `Codex rejected model ${model}.`;
   } else {
-    safe = message
-      .replace(/\b(?:url|cf-ray|request id):\s*\S+/gi, "")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 200);
+    safe = redact(message).replace(/\s+/g, " ").trim().slice(0, 200);
   }
   return new ConnectorError(safe || "Codex failed to complete the turn.");
 }

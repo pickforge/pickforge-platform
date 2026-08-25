@@ -304,6 +304,17 @@ describe("Codex parsing", () => {
       type: "turn.failed",
       error: { message: "provider failed url: https://provider.invalid cf-ray: ray_fixture request id: req_fixture" },
     }), output)).not.toThrow(/url:|cf-ray:|request id:/i);
+    let leaked: Error | undefined;
+    try {
+      connector.parseLine(JSON.stringify({
+        type: "turn.failed",
+        error: { message: "upstream refused: Authorization: Bearer sk-proj-fakefakefake thread_id: thread_abc token=abcdef123" },
+      }), output);
+    } catch (error) {
+      leaked = error as Error;
+    }
+    expect(leaked?.message).toContain("[redacted]");
+    expect(leaked?.message).not.toMatch(/sk-proj|thread_abc|abcdef123|Bearer sk/);
   });
 });
 

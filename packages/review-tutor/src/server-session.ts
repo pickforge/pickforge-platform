@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { ConnectorRegistry } from "./connectors/registry.ts";
+import type { HarnessConnector } from "./connectors/types.ts";
 import { exportLearningHtml } from "./export-html.ts";
 import { loadInput, type ExecFile } from "./inputs.ts";
 import { appendEntry, foldLog, persistInput, updateEntry } from "./log.ts";
@@ -10,7 +12,7 @@ import type { SseHub } from "./sse.ts";
 import { structureSnapshotWithNeighbours } from "./structure.ts";
 
 export interface RunnerLike {
-  run(request: { provider: string; model: string; thinking: string; cwd: string; prompt: string }, delta: (text: string) => void): Promise<{ answer: string; usage?: Record<string, number> }>;
+  run(request: { connector: HarnessConnector; model: string; thinking: string; cwd: string; prompt: string }, delta: (text: string) => void): Promise<{ answer: string; usage?: Record<string, number> }>;
   cancel(reason?: string): void;
   shutdown(): Promise<void>;
 }
@@ -20,7 +22,9 @@ export interface SessionReply { status: number; value: unknown }
 interface SessionOptions {
   cwd: string;
   canonicalRepo: string;
+  registry: ConnectorRegistry;
   models: ModelChoice[];
+  harnesses: Array<{ id: string; label: string; available: boolean; reason?: string }>;
   execFile: ExecFile;
 }
 
@@ -147,9 +151,10 @@ export class ReviewTutorSession {
   }
 
   private async executeQuestion(id: string, view: QuestionView, ask: AskRequest, source: InputSnapshot): Promise<void> {
-    const [provider, ...modelParts] = ask.modelId.split("/");
+    const resolved = this.options.registry.resolve(ask.modelId);
+    if (!resolved) throw new Error("model selection failed: unknown harness; refresh state and retry");
     const result = await this.runner.run({
-      provider: provider!, model: modelParts.join("/"), thinking: ask.thinkingLevel,
+      connector: resolved.connector, model: resolved.model, thinking: ask.thinkingLevel,
       cwd: this.options.canonicalRepo,
       prompt: buildTutorPrompt(this.rubric, { ...ask, input: source, history: this.threadHistory }),
     }, (text) => {
@@ -158,7 +163,12 @@ export class ReviewTutorSession {
       this.hub.emit("answer_delta", { id, text });
     });
     if (this.questions.get(id)?.state === "cancelled") return;
-    await this.answerQuestion(view, ask, source, result);
+    await this.answerQuestion(
+      view,
+      { ...ask, modelId: `${resolved.connector.id}:${resolved.model}` },
+      source,
+      result,
+    );
   }
 
   private async answerQuestion(view: QuestionView, ask: AskRequest, source: InputSnapshot, result: { answer: string; usage?: Record<string, number> }): Promise<void> {
@@ -208,6 +218,7 @@ export class ReviewTutorSession {
 
   state(): SessionReply {
     return { status: 200, value: { protocol: "rt/1", models: this.options.models,
+      harnesses: this.options.harnesses,
       input: this.currentInput, questions: [...this.questions.values()], lastHeartbeat: this.lastHeartbeat } };
   }
 
@@ -222,7 +233,11 @@ export class ReviewTutorSession {
     const ask = validateAskRequest(await readBody(request));
     if (!this.inputs.has(ask.inputId)) return { status: 409, value: {
       error: "ask input failed: expected an input loaded during this server session; reload the source and retry" } };
-    const model = this.options.models.find((candidate) => candidate.id === ask.modelId);
+    const resolved = this.options.registry.resolve(ask.modelId);
+    if (!resolved) return { status: 400, value: {
+      error: "model selection failed: unknown harness; refresh state and retry" } };
+    const canonicalId = `${resolved.connector.id}:${resolved.model}`;
+    const model = this.options.models.find((candidate) => candidate.id === canonicalId);
     if (!model || !model.thinkingLevels.includes(ask.thinkingLevel)) return { status: 400, value: {
       error: "model selection failed: expected an available model and thinking level; refresh state and retry" } };
     if (this.queue.length >= LIMITS.queue) return { status: 429, value: {
@@ -319,7 +334,9 @@ export class ReviewTutorSession {
     return { status: 200, value: entry };
   }
 
-  async export(): Promise<string> { return exportLearningHtml(await foldLog(this.paths)); }
+  async export(): Promise<string> {
+    return exportLearningHtml(await foldLog(this.paths), this.options.registry);
+  }
 
   async heartbeat(request: IncomingMessage): Promise<SessionReply> {
     validateEmptyObject(await readBody(request), "heartbeat body");

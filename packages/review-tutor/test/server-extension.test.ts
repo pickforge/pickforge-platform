@@ -9,6 +9,9 @@ import {
   createServerLifecycle,
   modelChoices,
 } from "../extensions/review-tutor.ts";
+import { createConnectorRegistry } from "../src/connectors/registry.ts";
+import type { HarnessConnector } from "../src/connectors/types.ts";
+import { createReviewTutorFlags } from "../src/flags.ts";
 import { pageHtml } from "../src/page.ts";
 import { resolveStatePaths } from "../src/paths.ts";
 import type { AskRequest } from "../src/protocol.ts";
@@ -18,6 +21,10 @@ const skillPath = fileURLToPath(
   new URL("../skills/review-tutor/SKILL.md", import.meta.url),
 );
 const temporaryRoots: string[] = [];
+
+function registry(models = [{ id: "provider/model", label: "Model", thinkingLevels: ["low"] }]) {
+  return createConnectorRegistry({ flags: createReviewTutorFlags(), piModels: models });
+}
 
 interface DeferredResult {
   promise: Promise<{ answer: string }>;
@@ -33,14 +40,14 @@ function deferredResult(): DeferredResult {
 }
 
 class ControlledRunner {
-  readonly calls: Array<{ prompt: string; deferred: DeferredResult }> = [];
+  readonly calls: Array<{ connector: HarnessConnector; model: string; prompt: string; deferred: DeferredResult }> = [];
   cancelCalls = 0;
   shutdownCalls = 0;
   completedCalls = 0;
 
-  async run(request: { prompt: string }, delta: (text: string) => void) {
+  async run(request: { connector: HarnessConnector; model: string; prompt: string }, delta: (text: string) => void) {
     const deferred = deferredResult();
-    this.calls.push({ prompt: request.prompt, deferred });
+    this.calls.push({ connector: request.connector, model: request.model, prompt: request.prompt, deferred });
     delta("live");
     try {
       return await deferred.promise;
@@ -81,7 +88,7 @@ async function start(
   const server = await startReviewTutorServer({
     cwd: "/repo",
     canonicalRepo: "/repo",
-    models: [{ id: "provider/model", label: "Model", thinkingLevels: ["low"] }],
+    registry: registry(),
     skillPath,
     home,
     runner,
@@ -309,6 +316,45 @@ describe("local server security", () => {
   );
 });
 
+describe("connector protocol boundary", () => {
+  it("reports namespaced state, resolves legacy Pi asks, rejects unknown harnesses, and exports harness details", async () => {
+    const { server, runner } = await start();
+    try {
+      const state = await (await call(server.port, server.token, "/api/state")).json() as {
+        models: Array<{ id: string }>;
+        harnesses: Array<{ id: string; label: string; available: boolean }>;
+      };
+      expect(state.models.map((model) => model.id)).toEqual(["pi:provider/model"]);
+      expect(state.harnesses).toEqual([{ id: "pi", label: "Pi", available: true }]);
+
+      const source = await loadSource(server.port, server.token);
+      expect((await ask(server.port, server.token, source.id)).status).toBe(202);
+      await waitFor(() => runner.calls.length === 1);
+      expect(runner.calls[0]).toMatchObject({
+        connector: { id: "pi", label: "Pi" },
+        model: "provider/model",
+      });
+      runner.calls[0]!.deferred.resolve({ answer: "answer" });
+      await waitFor(() => runner.completedCalls === 1);
+
+      const unknown = await call(server.port, server.token, "/api/ask", {
+        method: "POST",
+        body: JSON.stringify({ ...askBody(source.id), modelId: "codex:x" }),
+      });
+      expect(unknown.status).toBe(400);
+      await expect(unknown.json()).resolves.toEqual({
+        error: "model selection failed: unknown harness; refresh state and retry",
+      });
+
+      const exported = await (await call(server.port, server.token, "/api/export")).text();
+      expect(exported).toContain("<dt>Harness</dt><dd>Pi</dd>");
+      expect(exported).toContain("<dt>Model</dt><dd>provider/model</dd>");
+    } finally {
+      await server.close();
+    }
+  });
+});
+
 describe("local server question lifecycle", () => {
   it("stores and echoes question page ownership", async () => {
     const { server } = await start();
@@ -454,7 +500,7 @@ describe("local server startup and shutdown", () => {
     await expect(startReviewTutorServer({
       cwd: "/repo",
       canonicalRepo: "/repo",
-      models: [{ id: "provider/model", label: "Model", thinkingLevels: ["low"] }],
+      registry: registry(),
       skillPath,
       home,
       runner,

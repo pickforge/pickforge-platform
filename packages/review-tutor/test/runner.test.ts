@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
+import { PiConnector } from "../src/connectors/pi.ts";
 import {
   TutorRunner,
   createChildEnvironment,
@@ -16,8 +17,8 @@ class FakeChild extends EventEmitter {
 }
 
 const request = {
-  provider: "p",
-  model: "m",
+  connector: new PiConnector(),
+  model: "p/m",
   thinking: "low",
   cwd: "/repo",
   prompt: "secret prompt",

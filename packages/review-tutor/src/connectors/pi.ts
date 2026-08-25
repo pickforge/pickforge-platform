@@ -1,0 +1,141 @@
+import type {
+  ConnectorRequest,
+  Discovery,
+  DiscoveryDeps,
+  HarnessConnector,
+  ParseSink,
+  ParsedAnswer,
+  SpawnSpec,
+} from "./types.ts";
+import { ConnectorError } from "./types.ts";
+
+interface PiContent {
+  type?: unknown;
+  text?: unknown;
+}
+
+interface PiMessage {
+  role?: unknown;
+  content?: unknown;
+  usage?: unknown;
+}
+
+interface PiEvent {
+  type?: unknown;
+  message?: PiMessage;
+  messages?: PiMessage[];
+  assistantMessageEvent?: {
+    type?: unknown;
+    delta?: unknown;
+  };
+}
+
+function parseEvent(line: string): PiEvent {
+  try {
+    return JSON.parse(line) as PiEvent;
+  } catch {
+    throw new ConnectorError(
+      "malformed_output",
+      "Pi JSON parsing failed: expected one valid JSON object per LF-delimited line; inspect child output and retry",
+    );
+  }
+}
+
+function finalAnswer(messages: PiMessage[] | undefined): string | undefined {
+  if (!Array.isArray(messages)) return undefined;
+  const final = messages.filter((message) => message?.role === "assistant").at(-1);
+  if (!Array.isArray(final?.content)) {
+    return typeof final?.content === "string" ? final.content : "";
+  }
+  return (final.content as PiContent[])
+    .filter((content) => content?.type === "text")
+    .map((content) => typeof content.text === "string" ? content.text : "")
+    .join("");
+}
+
+export class PiConnector implements HarnessConnector {
+  readonly id = "pi" as const;
+  readonly label = "Pi";
+  private answer?: string;
+  private answerUsage?: Record<string, number>;
+
+  async discover(deps: DiscoveryDeps): Promise<Discovery> {
+    return {
+      available: true,
+      version: deps.piVersion ?? "unknown",
+      models: deps.piModels.map((model) => ({ ...model, id: `pi:${model.id}` })),
+    };
+  }
+
+  spawnSpec(request: ConnectorRequest): SpawnSpec {
+    this.answer = undefined;
+    this.answerUsage = undefined;
+    const [provider, ...modelParts] = request.model.split("/");
+    return {
+      command: "pi",
+      args: [
+        "--mode", "json", "--no-extensions", "--no-skills", "--no-prompt-templates",
+        "--no-context-files", "--no-session", "-p", "--tools", "read,grep,find,ls",
+        "--provider", provider!, "--model", modelParts.join("/"), "--thinking", request.thinking,
+      ],
+    };
+  }
+
+  parseLine(line: string, sink: ParseSink): void {
+    const event = parseEvent(line);
+    const update = event.type === "message_update" ? event.assistantMessageEvent : undefined;
+    if (update?.type === "text_delta" && typeof update.delta === "string") {
+      sink.delta(update.delta);
+    }
+    if (event.type === "message_end" && event.message?.usage && typeof event.message.usage === "object") {
+      this.answerUsage = event.message.usage as Record<string, number>;
+      sink.usage(this.answerUsage);
+    }
+    if (event.type === "agent_end" && Array.isArray(event.messages)) {
+      const candidate = finalAnswer(event.messages);
+      if (this.answer === undefined || candidate?.trim()) {
+        this.answer = candidate;
+        if (candidate !== undefined) sink.final(candidate);
+      }
+    }
+  }
+
+  finish(_sink: ParseSink): ParsedAnswer {
+    if (!this.answer?.trim()) {
+      throw new ConnectorError(
+        "empty_answer",
+        "Pi answer failed: expected a non-empty final assistant message in agent_end; choose another question or model and retry",
+      );
+    }
+    return { answer: this.answer, ...(this.answerUsage ? { usage: this.answerUsage } : {}) };
+  }
+}
+
+export function parsePiJson() {
+  const connector = new PiConnector();
+  let pending = "";
+  const sink = {
+    events: [] as Array<{ type: "delta"; text: string }>,
+    delta(text: string) { this.events.push({ type: "delta", text }); },
+    usage() {},
+    final() {},
+  };
+  return {
+    push(chunk: string) {
+      pending += chunk;
+      sink.events = [];
+      for (;;) {
+        const newline = pending.indexOf("\n");
+        if (newline < 0) break;
+        const line = pending.slice(0, newline);
+        pending = pending.slice(newline + 1);
+        if (line) connector.parseLine(line, sink);
+      }
+      return sink.events;
+    },
+    finish() {
+      if (pending.trim()) connector.parseLine(pending, sink);
+      return connector.finish(sink);
+    },
+  };
+}

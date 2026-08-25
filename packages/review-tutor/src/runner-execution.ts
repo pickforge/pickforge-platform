@@ -1,6 +1,6 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import { parsePiJson, type PiResult } from "./pi-json.ts";
+import type { HarnessConnector, ParsedAnswer, ParseSink } from "./connectors/types.ts";
 import { LIMITS } from "./protocol.ts";
 
 export interface ExecutionOptions {
@@ -14,9 +14,9 @@ export interface ExecutionOptions {
 
 export class RunnerExecution {
   readonly completion: Promise<void>;
-  private readonly parser = parsePiJson();
   private readonly stdoutDecoder = new StringDecoder("utf8");
   private readonly stderrDecoder = new StringDecoder("utf8");
+  private pending = "";
   private stdoutBytes = 0;
   private stderr = "";
   private terminalError?: Error;
@@ -24,18 +24,21 @@ export class RunnerExecution {
   private timeout?: ReturnType<typeof setTimeout>;
   private escalation?: ReturnType<typeof setTimeout>;
   private complete!: () => void;
-  private resolve!: (result: PiResult) => void;
+  private resolve!: (result: ParsedAnswer) => void;
   private reject!: (error: Error) => void;
-  readonly result: Promise<PiResult>;
+  readonly result: Promise<ParsedAnswer>;
+  private readonly sink: ParseSink;
 
   constructor(
     private readonly child: ChildProcessWithoutNullStreams,
+    private readonly connector: HarnessConnector,
     private readonly options: ExecutionOptions,
-    private readonly onDelta: (text: string) => void,
+    onDelta: (text: string) => void,
     private readonly onSettled: () => void,
   ) {
+    this.sink = { delta: onDelta, usage: () => {}, final: () => {} };
     this.completion = new Promise<void>((resolve) => { this.complete = resolve; });
-    this.result = new Promise<PiResult>((resolve, reject) => {
+    this.result = new Promise<ParsedAnswer>((resolve, reject) => {
       this.resolve = resolve;
       this.reject = reject;
     });
@@ -43,6 +46,7 @@ export class RunnerExecution {
   }
 
   start(prompt: string): void {
+    if (this.terminalError || this.settled) return;
     this.timeout = this.options.setTimeout(
       () => this.stop(`timed out after ${this.options.timeoutMs} milliseconds`),
       this.options.timeoutMs,
@@ -90,7 +94,7 @@ export class RunnerExecution {
       return;
     }
     try { this.consume(this.stdoutDecoder.write(chunk)); } catch (error) {
-      this.stop("Pi output handling failed", error instanceof Error ? error : new Error(String(error)));
+      this.stop("connector output handling failed", error instanceof Error ? error : new Error(String(error)));
     }
   };
 
@@ -106,7 +110,7 @@ export class RunnerExecution {
   };
 
   private readonly onError = (error: Error): void => {
-    this.fail(new Error(`question child spawn failed: ${error.message}; verify Pi is installed and retry`));
+    this.fail(new Error(`question child spawn failed: ${error.message}; verify the harness is installed and retry`));
   };
 
   private readonly onClose = (code: number | null, signal: NodeJS.Signals | null): void => {
@@ -116,9 +120,10 @@ export class RunnerExecution {
       this.stderr += this.stderrDecoder.end();
       if (this.terminalError) return this.fail(this.terminalError);
       if (code !== 0) return this.fail(new Error(
-        `question child failed: expected exit code 0, received ${String(code)}${signal ? ` (${signal})` : ""}; stderr tail: ${this.stderr.slice(-LIMITS.stderr)}; check Pi model access and retry`,
+        `question child failed: expected exit code 0, received ${String(code)}${signal ? ` (${signal})` : ""}; stderr tail: ${this.stderr.slice(-LIMITS.stderr)}; check model access and retry`,
       ));
-      const result = this.parser.finish();
+      if (this.pending.trim()) this.connector.parseLine(this.pending, this.sink);
+      const result = this.connector.finish(this.sink);
       if (this.cleanup()) this.resolve(result);
     } catch (error) {
       this.fail(error instanceof Error ? error : new Error(String(error)));
@@ -126,7 +131,14 @@ export class RunnerExecution {
   };
 
   private consume(text: string): void {
-    for (const event of this.parser.push(text)) this.onDelta(event.text);
+    this.pending += text;
+    for (;;) {
+      const newline = this.pending.indexOf("\n");
+      if (newline < 0) break;
+      const line = this.pending.slice(0, newline);
+      this.pending = this.pending.slice(newline + 1);
+      if (line) this.connector.parseLine(line, this.sink);
+    }
   }
 
   private fail(error: Error): void {

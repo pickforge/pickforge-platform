@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadInput } from "../src/inputs.ts";
-import { parsePiJson } from "../src/pi-json.ts";
+import { parsePiJson } from "../src/connectors/pi.ts";
 import { buildTutorPrompt, loadTutorRubric } from "../src/prompt.ts";
 import {
   validateAskRequest,

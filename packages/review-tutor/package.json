@@ -13,6 +13,9 @@
     "test": "cd ../.. && vitest run packages/review-tutor/test",
     "typecheck": "tsc -p ../../tsconfig.json --noEmit"
   },
+  "dependencies": {
+    "@pickforge/flags": "workspace:*"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.83.0"
   },

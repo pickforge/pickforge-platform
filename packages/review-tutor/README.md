@@ -1,6 +1,6 @@
 # @pickforge/review-tutor
 
-Review Tutor is a local-first, browser-based companion for guided reviews of PRs, diffs, and code. Questions run in an isolated tutor child, never in the main Pi conversation. GitHub remains the source of truth. Review Tutor never approves, comments on, or edits a PR. Answers, notes, and quiz results stay local.
+Review Tutor is a local-first, browser-based companion for guided reviews of PRs, diffs, and code. Questions run in an isolated tutor child, never in the main Pi conversation. GitHub remains the source of truth. Review Tutor never approves, comments on, or edits a PR. Answers, notes, and quiz results stay local. Harness connectors are tracked in [#63](https://github.com/pickforge/pickforge-platform/issues/63).
 
 ## Install
 
@@ -43,6 +43,10 @@ With no argument, choose a source in the browser. The browser supports worktree,
 ## Model selection
 
 The model dialog lists the session's scoped models when `--models` or the settings scope configures them. Otherwise, it lists all available models. Thinking levels are offered only for reasoning models. A scope entry with an explicit level, such as `gpt-5.6-sol:high`, pins the tutor to that level.
+
+## Harness connectors
+
+A harness connector owns model discovery, isolated invocation, and stream parsing while the shared runner owns process lifetime, bounds, and cancellation. Pi is the only registered connector today; Claude Code and Codex support is tracked in [#63](https://github.com/pickforge/pickforge-platform/issues/63). The `reviewTutorHarnessConnectors` flag defaults off. For local testing on main, set `REVIEW_TUTOR_FLAGS=reviewTutorHarnessConnectors` before starting Pi. Child processes receive only the shared environment allowlist plus keys explicitly declared by their connector, and runner failures redact common API keys, bearer credentials, and tokens before leaving the process boundary.
 
 ## Local data
 

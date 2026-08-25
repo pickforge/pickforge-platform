@@ -527,6 +527,7 @@ describe("Review Tutor composed page", () => {
     const garbage = await boot({ harnesses: threeHarnesses, storedHarness: "codex", storedModelByHarness: "{not json" });
     expect(byId(garbage.document, "harness").value).toBe("codex");
     expect(byId(garbage.document, "model").value).toBe("codex:gpt");
+    expect(options(garbage.document, "thinking")).toEqual([["low", "low"], ["high", "high"]]);
   });
 
   it("labels a saved answer from a harness that is no longer available like the export does", async () => {

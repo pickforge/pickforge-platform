@@ -531,6 +531,10 @@ export const pageScript = String.raw`
       const code = document.createElement("span");
       code.className = "evidence-code";
       code.textContent = evidence.line + "  " + evidence.text;
+      item.append(code);
+      evidenceList.append(item);
+      // Evidence inside an unchanged neighbour has no diff row to land on, so it gets no actions.
+      if (!files.some((file) => file.path === evidence.path)) return;
       const open = document.createElement("button");
       open.type = "button";
       open.className = "ghost open-in-diff";
@@ -544,8 +548,7 @@ export const pageScript = String.raw`
         const targetIndex = tutorEvidenceIndex(edge, evidenceIndex);
         jumpToEvidence(edge.evidence[targetIndex], edge.status, targetIndex, edge.evidence, true);
       });
-      item.append(code, askTutor, open);
-      evidenceList.append(item);
+      item.append(askTutor, open);
     });
     row.addEventListener("click", () => {
       const expanded = row.getAttribute("aria-expanded") === "true";

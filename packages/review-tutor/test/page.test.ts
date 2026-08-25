@@ -1181,6 +1181,31 @@ describe("Review Tutor composed page", () => {
     expect(document.querySelectorAll(".diff-row.structure-landing")).toHaveLength(0);
   });
 
+  it("offers no diff actions on evidence that lives in an unchanged neighbour", async () => {
+    const withNeighbour = {
+      ...structure,
+      neighbours: { state: "on", count: 1 },
+      files: [...structure.files, { path: "src/ctx.ts", status: "context", additions: 0, deletions: 0, analyzed: true }],
+      edges: [
+        ...structure.edges,
+        { from: "src/ctx.ts", to: "src/a.ts", kind: "import", typeOnly: false, status: "unchanged", specifier: "./a.js", evidence: [{ path: "src/ctx.ts", line: 3, text: "import { a } from './a.js';" }] },
+      ],
+    };
+    const { document } = await boot({ structureResponses: [withNeighbour] });
+    byId(document, "view-structure").click();
+    await flush();
+    const rows = [...document.querySelectorAll(".connection-row")] as any[];
+    const contextRow = rows.find((row) => row.querySelector(".connection-target")?.textContent === "src/a.ts" && row.closest("[data-path='src/ctx.ts']"))
+      ?? rows.find((row) => byId(document, row.getAttribute("aria-controls")).textContent?.includes("import { a } from './a.js';"));
+    expect(contextRow).toBeDefined();
+    const evidence = byId(document, contextRow.getAttribute("aria-controls"));
+    expect(evidence.querySelector(".evidence-code")?.textContent).toBe("3  import { a } from './a.js';");
+    expect(evidence.querySelector(".ask-tutor-evidence")).toBeNull();
+    expect(evidence.querySelector(".open-in-diff")).toBeNull();
+    const changedRow = rows.find((row) => byId(document, row.getAttribute("aria-controls")).textContent?.includes("import type { a }"));
+    expect(byId(document, changedRow.getAttribute("aria-controls")).querySelector(".ask-tutor-evidence")).not.toBeNull();
+  });
+
   it("asks from graph evidence through the existing list selection path", async () => {
     const { document } = await boot();
     byId(document, "view-structure").click();
@@ -1438,9 +1463,9 @@ describe("Review Tutor composed page", () => {
 
     byId(document, "view-structure").click();
     rows[1].click();
-    (rows[1].nextElementSibling.querySelector(".open-in-diff") as any).click();
-    expect(byId(document, "structure-section").hidden).toBe(false);
-    expect(byId(document, "lifecycle").textContent).toBe("not-rendered.ts is not in the diff view.");
+    expect(rows[1].nextElementSibling.querySelector(".evidence-code")).not.toBeNull();
+    expect(rows[1].nextElementSibling.querySelector(".open-in-diff")).toBeNull();
+    expect(rows[1].nextElementSibling.querySelector(".ask-tutor-evidence")).toBeNull();
   });
 
   it("uses touch targets and compact chips without making structure heads sticky", async () => {

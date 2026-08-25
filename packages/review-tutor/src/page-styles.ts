@@ -51,7 +51,7 @@ color:var(--rose)}
 .ghost {
 background:transparent}
 .workbench {
-height:calc(100vh - var(--topbar-h));display:grid;grid-template-columns:minmax(0,1fr) clamp(320px,30vw,400px)}
+height:calc(100vh - var(--topbar-h));display:grid;grid-template-columns:minmax(0,1fr) clamp(320px,30vw,400px);transition:grid-template-columns 200ms ease}
 .workbench.rail-collapsed {
 grid-template-columns:minmax(0,1fr) 44px}
 .diff-pane {

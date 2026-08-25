@@ -36,7 +36,17 @@ export class RunnerExecution {
     onDelta: (text: string) => void,
     private readonly onSettled: () => void,
   ) {
-    this.sink = { delta: onDelta, usage: () => {}, final: () => {} };
+    let answer: string | undefined;
+    let answerUsage: Record<string, number> | undefined;
+    this.sink = {
+      get answer() { return answer; },
+      get answerUsage() { return answerUsage; },
+      delta: onDelta,
+      usage: (next) => { answerUsage = next; },
+      final: (next) => {
+        if (answer === undefined || next.trim()) answer = next;
+      },
+    };
     this.completion = new Promise<void>((resolve) => { this.complete = resolve; });
     this.result = new Promise<ParsedAnswer>((resolve, reject) => {
       this.resolve = resolve;

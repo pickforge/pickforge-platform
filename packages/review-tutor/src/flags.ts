@@ -2,7 +2,7 @@ import {
   createFlags,
   type FlagOverrideStore,
   type Flags,
-} from "@pickforge/flags";
+} from "../../flags/src/index.ts";
 
 const definitions = {
   reviewTutorHarnessConnectors: {

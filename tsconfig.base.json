@@ -13,9 +13,6 @@
     ],
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "paths": {
-      "@pickforge/flags": ["./packages/flags/src/index.ts"]
-    },
     "noUncheckedIndexedAccess": true,
     "resolveJsonModule": true,
     "skipLibCheck": true,

@@ -35,7 +35,6 @@ function parseEvent(line: string): PiEvent {
     return JSON.parse(line) as PiEvent;
   } catch {
     throw new ConnectorError(
-      "malformed_output",
       "Pi JSON parsing failed: expected one valid JSON object per LF-delimited line; inspect child output and retry",
     );
   }
@@ -56,8 +55,6 @@ function finalAnswer(messages: PiMessage[] | undefined): string | undefined {
 export class PiConnector implements HarnessConnector {
   readonly id = "pi" as const;
   readonly label = "Pi";
-  private answer?: string;
-  private answerUsage?: Record<string, number>;
 
   async discover(deps: DiscoveryDeps): Promise<Discovery> {
     return {
@@ -68,8 +65,6 @@ export class PiConnector implements HarnessConnector {
   }
 
   spawnSpec(request: ConnectorRequest): SpawnSpec {
-    this.answer = undefined;
-    this.answerUsage = undefined;
     const [provider, ...modelParts] = request.model.split("/");
     return {
       command: "pi",
@@ -88,54 +83,20 @@ export class PiConnector implements HarnessConnector {
       sink.delta(update.delta);
     }
     if (event.type === "message_end" && event.message?.usage && typeof event.message.usage === "object") {
-      this.answerUsage = event.message.usage as Record<string, number>;
-      sink.usage(this.answerUsage);
+      sink.usage(event.message.usage as Record<string, number>);
     }
     if (event.type === "agent_end" && Array.isArray(event.messages)) {
       const candidate = finalAnswer(event.messages);
-      if (this.answer === undefined || candidate?.trim()) {
-        this.answer = candidate;
-        if (candidate !== undefined) sink.final(candidate);
-      }
+      if (candidate !== undefined) sink.final(candidate);
     }
   }
 
-  finish(_sink: ParseSink): ParsedAnswer {
-    if (!this.answer?.trim()) {
+  finish(sink: ParseSink): ParsedAnswer {
+    if (!sink.answer?.trim()) {
       throw new ConnectorError(
-        "empty_answer",
         "Pi answer failed: expected a non-empty final assistant message in agent_end; choose another question or model and retry",
       );
     }
-    return { answer: this.answer, ...(this.answerUsage ? { usage: this.answerUsage } : {}) };
+    return { answer: sink.answer, ...(sink.answerUsage ? { usage: sink.answerUsage } : {}) };
   }
-}
-
-export function parsePiJson() {
-  const connector = new PiConnector();
-  let pending = "";
-  const sink = {
-    events: [] as Array<{ type: "delta"; text: string }>,
-    delta(text: string) { this.events.push({ type: "delta", text }); },
-    usage() {},
-    final() {},
-  };
-  return {
-    push(chunk: string) {
-      pending += chunk;
-      sink.events = [];
-      for (;;) {
-        const newline = pending.indexOf("\n");
-        if (newline < 0) break;
-        const line = pending.slice(0, newline);
-        pending = pending.slice(newline + 1);
-        if (line) connector.parseLine(line, sink);
-      }
-      return sink.events;
-    },
-    finish() {
-      if (pending.trim()) connector.parseLine(pending, sink);
-      return connector.finish(sink);
-    },
-  };
 }

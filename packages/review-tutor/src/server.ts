@@ -156,10 +156,7 @@ export async function startReviewTutorServer(options: ServerOptions): Promise<Re
   const token = randomBytes(32).toString("base64url");
   const paths = resolveStatePaths(options.canonicalRepo, options.home);
   await initProjectPaths(paths, options.canonicalRepo);
-  const discoveries = await Promise.all(options.registry.connectors().map(async (connector) => ({
-    connector,
-    discovery: await options.registry.discover(connector),
-  })));
+  const discoveries = await options.registry.discoveries();
   const models = discoveries.flatMap(({ discovery }) => discovery.available ? discovery.models : []);
   const harnesses = discoveries.map(({ connector, discovery }) => ({
     id: connector.id,

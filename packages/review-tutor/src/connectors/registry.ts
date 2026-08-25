@@ -12,7 +12,7 @@ export interface ConnectorRegistry {
   connectors(): HarnessConnector[];
   byId(id: string): HarnessConnector | undefined;
   resolve(modelId: string): { connector: HarnessConnector; model: string } | undefined;
-  discover(connector: HarnessConnector): Promise<Discovery>;
+  discoveries(): Promise<Array<{ connector: HarnessConnector; discovery: Discovery }>>;
 }
 
 export function createConnectorRegistry(options: {
@@ -39,13 +39,18 @@ export function createConnectorRegistry(options: {
     },
     resolve(modelId) {
       const separator = modelId.indexOf(":");
-      const harness = separator < 0 ? "pi" : modelId.slice(0, separator);
+      const slash = modelId.indexOf("/");
+      const namespaced = separator >= 0 && (slash < 0 || separator < slash);
+      const harness = namespaced ? modelId.slice(0, separator) : "pi";
       const connector = this.byId(harness as HarnessId);
       if (!connector) return undefined;
-      return { connector, model: separator < 0 ? modelId : modelId.slice(separator + 1) };
+      return { connector, model: namespaced ? modelId.slice(separator + 1) : modelId };
     },
-    discover(connector) {
-      return connector.discover(dependencies);
+    async discoveries() {
+      return Promise.all(connectors().map(async (connector) => ({
+        connector,
+        discovery: await connector.discover(dependencies),
+      })));
     },
   };
 }

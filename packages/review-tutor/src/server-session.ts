@@ -163,12 +163,7 @@ export class ReviewTutorSession {
       this.hub.emit("answer_delta", { id, text });
     });
     if (this.questions.get(id)?.state === "cancelled") return;
-    await this.answerQuestion(
-      view,
-      { ...ask, modelId: `${resolved.connector.id}:${resolved.model}` },
-      source,
-      result,
-    );
+    await this.answerQuestion(view, ask, source, result);
   }
 
   private async answerQuestion(view: QuestionView, ask: AskRequest, source: InputSnapshot, result: { answer: string; usage?: Record<string, number> }): Promise<void> {

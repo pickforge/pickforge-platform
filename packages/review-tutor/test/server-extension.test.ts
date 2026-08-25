@@ -22,7 +22,10 @@ const skillPath = fileURLToPath(
 );
 const temporaryRoots: string[] = [];
 
-function registry(models = [{ id: "provider/model", label: "Model", thinkingLevels: ["low"] }]) {
+function registry(models = [
+  { id: "provider/model", label: "Model", thinkingLevels: ["low"] },
+  { id: "ollama/qwen3:8b", label: "Qwen", thinkingLevels: ["low"] },
+]) {
   return createConnectorRegistry({ flags: createReviewTutorFlags(), piModels: models });
 }
 
@@ -324,7 +327,10 @@ describe("connector protocol boundary", () => {
         models: Array<{ id: string }>;
         harnesses: Array<{ id: string; label: string; available: boolean }>;
       };
-      expect(state.models.map((model) => model.id)).toEqual(["pi:provider/model"]);
+      expect(state.models.map((model) => model.id)).toEqual([
+        "pi:provider/model",
+        "pi:ollama/qwen3:8b",
+      ]);
       expect(state.harnesses).toEqual([{ id: "pi", label: "Pi", available: true }]);
 
       const source = await loadSource(server.port, server.token);
@@ -336,6 +342,16 @@ describe("connector protocol boundary", () => {
       });
       runner.calls[0]!.deferred.resolve({ answer: "answer" });
       await waitFor(() => runner.completedCalls === 1);
+
+      const namespaced = await call(server.port, server.token, "/api/ask", {
+        method: "POST",
+        body: JSON.stringify({ ...askBody(source.id), modelId: "pi:ollama/qwen3:8b" }),
+      });
+      expect(namespaced.status).toBe(202);
+      await waitFor(() => runner.calls.length === 2);
+      expect(runner.calls[1]).toMatchObject({ model: "ollama/qwen3:8b" });
+      runner.calls[1]!.deferred.resolve({ answer: "colon answer" });
+      await waitFor(() => runner.completedCalls === 2);
 
       const unknown = await call(server.port, server.token, "/api/ask", {
         method: "POST",
@@ -349,6 +365,12 @@ describe("connector protocol boundary", () => {
       const exported = await (await call(server.port, server.token, "/api/export")).text();
       expect(exported).toContain("<dt>Harness</dt><dd>Pi</dd>");
       expect(exported).toContain("<dt>Model</dt><dd>provider/model</dd>");
+      expect(exported).toContain("<dt>Model</dt><dd>ollama/qwen3:8b</dd>");
+      const log = await (await call(server.port, server.token, "/api/log")).json() as Array<{ modelId: string }>;
+      expect(log.map((entry) => entry.modelId)).toEqual([
+        "provider/model",
+        "pi:ollama/qwen3:8b",
+      ]);
     } finally {
       await server.close();
     }

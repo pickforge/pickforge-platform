@@ -17,17 +17,15 @@ function escapeHtml(value: unknown): string {
   })[character]!);
 }
 
-function modelDetails(entry: LearningEntry, registry?: ConnectorRegistry): { harness: string; model: string } {
-  const separator = entry.modelId.indexOf(":");
-  if (separator < 0) return { harness: "Pi", model: entry.modelId };
-  const harnessId = entry.modelId.slice(0, separator);
-  return {
-    harness: registry?.byId(harnessId)?.label ?? harnessId,
-    model: entry.modelId.slice(separator + 1),
-  };
+function modelDetails(entry: LearningEntry, registry: ConnectorRegistry): { harness: string; model: string } {
+  if (typeof entry.modelId !== "string") return { harness: "Pi", model: String(entry.modelId) };
+  const resolved = registry.resolve(entry.modelId);
+  return resolved
+    ? { harness: resolved.connector.label, model: resolved.model }
+    : { harness: "Pi", model: entry.modelId };
 }
 
-function card(entry: LearningEntry, registry?: ConnectorRegistry): string {
+function card(entry: LearningEntry, registry: ConnectorRegistry): string {
   const sourceUrl = entry.source.githubUrl
     ? `<dt>GitHub source URL</dt><dd>${escapeHtml(entry.source.githubUrl)}</dd>`
     : "";
@@ -70,7 +68,7 @@ ${entry.source.kind === "pr" ? "<p>GitHub is the source of truth.</p>" : ""}
 </article>`;
 }
 
-export function exportLearningHtml(entries: LearningEntry[], registry?: ConnectorRegistry): string {
+export function exportLearningHtml(entries: LearningEntry[], registry: ConnectorRegistry): string {
   const cards = entries.length ? entries.map((entry) => card(entry, registry)).join("") : "<p>No learning entries yet.</p>";
   return `<!doctype html>
 <html lang="en">

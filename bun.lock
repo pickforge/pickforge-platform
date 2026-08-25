@@ -46,9 +46,6 @@
     "packages/review-tutor": {
       "name": "@pickforge/review-tutor",
       "version": "0.0.0",
-      "dependencies": {
-        "@pickforge/flags": "workspace:*",
-      },
       "devDependencies": {
         "@earendil-works/pi-coding-agent": "^0.84.2",
       },

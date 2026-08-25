@@ -37,6 +37,8 @@ export interface SpawnSpec {
 }
 
 export interface ParseSink {
+  readonly answer?: string;
+  readonly answerUsage?: Record<string, number>;
   delta(text: string): void;
   usage(u: Record<string, number>): void;
   final(answer: string): void;
@@ -47,9 +49,4 @@ export interface ParsedAnswer {
   usage?: Record<string, number>;
 }
 
-export class ConnectorError extends Error {
-  constructor(readonly code: string, message: string) {
-    super(message);
-    this.name = "ConnectorError";
-  }
-}
+export class ConnectorError extends Error {}

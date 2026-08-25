@@ -88,6 +88,7 @@ export const pageScript = String.raw`
   const MAX_SELECTED_BYTES = 16 * 1024;
   const MAX_CONTEXT_BYTES = 32 * 1024;
   const MOBILE_BREAKPOINT = 860;
+  const COLLAPSED_RAIL_WIDTH = 44;
   const encoder = new TextEncoder();
   function readQuizEntryIds() {
     try {
@@ -2334,16 +2335,22 @@ export const pageScript = String.raw`
     railCollapsed = !railCollapsed;
     sessionStorage.setItem("reviewTutorRailCollapsed", railCollapsed ? "1" : "0");
     const rail = document.querySelector(".rail");
-    const before = rail.getBoundingClientRect().left;
-    applyRail();
-    slideRail(rail, before - rail.getBoundingClientRect().left);
+    if (railCollapsed) {
+      // Slide the panel out first, then relayout once; expanding relayouts first and slides the panel in.
+      const slide = slideRail(rail, "out");
+      if (slide) slide.onfinish = slide.oncancel = applyRail;
+      else applyRail();
+    } else {
+      applyRail();
+      slideRail(rail, "in");
+    }
   });
-  // One layout pass, then transforms only: the rail slides into place and the diff is unclipped in step with it.
-  function slideRail(rail, offset) {
-    if (!offset || typeof rail.animate !== "function" || typeof matchMedia !== "function" || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-    const timing = { duration: 200, easing: "ease" };
-    rail.animate([{ transform: "translateX(" + offset + "px)" }, { transform: "none" }], timing);
-    if (offset < 0) element("diff-pane").animate([{ clipPath: "inset(0 " + -offset + "px 0 0)" }, { clipPath: "inset(0)" }], timing);
+  function slideRail(rail, direction) {
+    if (typeof rail.animate !== "function" || typeof matchMedia !== "function" || matchMedia("(prefers-reduced-motion: reduce)").matches) return null;
+    const distance = rail.getBoundingClientRect().width - COLLAPSED_RAIL_WIDTH;
+    if (distance <= 0) return null;
+    const away = { transform: "translateX(" + distance + "px)" }, home = { transform: "none" };
+    return rail.animate(direction === "out" ? [home, away] : [away, home], { duration: 200, easing: "ease" });
   }
   element("jump-log").addEventListener("click", () => {
     if (innerWidth <= MOBILE_BREAKPOINT) closeConfig(false);

@@ -24,6 +24,14 @@ export const STRUCTURE_LIMITS = {
   externalNames: 8,
 } as const;
 
+export const NEIGHBOUR_LIMITS = {
+  maxFiles: 50,
+  maxFileBytes: 256 * 1024,
+  maxTotalBytes: 2 * 1024 * 1024,
+  timeoutMs: 5000,
+  maxProbes: 400,
+} as const;
+
 export type QuizOutcome = "got_it" | "almost" | "review_again";
 
 export type SourceRequest =
@@ -42,6 +50,10 @@ export interface InputSnapshot {
   content: string;
   githubUrl?: string;
   headSha?: string;
+  /** The exact Git revision a commit snapshot was read from; never parsed back out of `label`. */
+  revision?: string;
+  /** The `to` endpoint of a range snapshot. */
+  rangeTo?: string;
 }
 
 export interface ModelChoice {
@@ -116,7 +128,8 @@ export interface StructureComparison {
 
 export interface StructureFile {
   path: string;
-  status: "added" | "removed" | "modified" | "renamed";
+  /** `context` marks an unchanged one-hop neighbour, never a changed file. */
+  status: "added" | "removed" | "modified" | "renamed" | "context";
   renamedFrom?: string;
   additions: number;
   deletions: number;
@@ -133,7 +146,7 @@ export interface StructureEvidence {
 export interface StructureEdge {
   from: string;
   to: string;
-  kind: "import" | "reexport" | "require" | "dynamic-import";
+  kind: "import" | "reexport" | "require" | "dynamic-import" | "part" | "part-of" | "mod" | "use" | "include";
   typeOnly: boolean;
   status: "added" | "removed" | "modified" | "unchanged";
   specifier: string;
@@ -153,6 +166,12 @@ export interface StructureLimits {
   omitted: StructureOmission[];
 }
 
+export interface StructureNeighbours {
+  state: "off" | "on" | "unavailable";
+  count: number;
+  reason?: string;
+}
+
 export interface StructureSnapshot {
   protocol: "rt/1";
   inputId: string;
@@ -160,6 +179,7 @@ export interface StructureSnapshot {
   files: StructureFile[];
   edges: StructureEdge[];
   limits: StructureLimits;
+  neighbours: StructureNeighbours;
 }
 
 export type SseEventType = "hello" | "state" | "question" | "answer_delta" | "source" | "log_update" | "error" | "bye";

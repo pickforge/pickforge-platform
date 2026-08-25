@@ -7,7 +7,7 @@ import { buildTutorPrompt } from "./prompt.ts";
 import { LIMITS, validateAskRequest, validateLogPatch, validateSourceRequest, type AskRequest, type InputSnapshot, type LearningEntry, type ModelChoice, type QuestionView, type StructureSnapshot } from "./protocol.ts";
 import type { StatePaths } from "./paths.ts";
 import type { SseHub } from "./sse.ts";
-import { structureSnapshotFor } from "./structure.ts";
+import { structureSnapshotWithNeighbours } from "./structure.ts";
 
 export interface RunnerLike {
   run(request: { provider: string; model: string; thinking: string; cwd: string; prompt: string }, delta: (text: string) => void): Promise<{ answer: string; usage?: Record<string, number> }>;
@@ -46,6 +46,13 @@ function validateEmptyObject(value: unknown, name: string): void {
   }
 }
 
+/** `neighbours=1` turns the bounded one-hop neighbour read on; anything else is a typed error. */
+function parseNeighboursFlag(value: string | null): boolean {
+  if (value === null || value === "0") return false;
+  if (value === "1") return true;
+  throw new Error("neighbours query failed: expected 1, 0, or absent; correct it and retry");
+}
+
 function parseLogLimit(value: string | null): number {
   if (value === null) return 100;
   if (!/^(?:0|[1-9]\d*)$/.test(value)) throw new Error(
@@ -65,7 +72,7 @@ export class ReviewTutorSession {
   private readonly queue: string[] = [];
   private readonly threadHistory: LearningEntry[] = [];
   private currentInput?: InputSnapshot;
-  private structureCache?: { inputId: string; snapshot: StructureSnapshot };
+  private readonly structureCache = new Map<string, StructureSnapshot>();
   private running?: string;
   private lastHeartbeat = 0;
   private closing = false;
@@ -282,14 +289,20 @@ export class ReviewTutorSession {
     }
   }
 
-  structure(): SessionReply {
+  async structure(url: URL): Promise<SessionReply> {
     const input = this.currentInput;
     if (!input) return { status: 409, value: {
       error: "structure failed: expected a loaded input snapshot, received none; load a source and retry" } };
-    if (this.structureCache?.inputId !== input.id) {
-      this.structureCache = { inputId: input.id, snapshot: structureSnapshotFor(input) };
-    }
-    return { status: 200, value: this.structureCache.snapshot };
+    const neighbours = parseNeighboursFlag(url.searchParams.get("neighbours"));
+    const key = `${input.id} ${String(neighbours)}`;
+    const cached = this.structureCache.get(key);
+    if (cached) return { status: 200, value: cached };
+    const snapshot = await structureSnapshotWithNeighbours(input, {
+      neighbours, cwd: this.options.cwd, execFile: this.options.execFile,
+    });
+    if (this.structureCache.size >= 4) this.structureCache.clear();
+    this.structureCache.set(key, snapshot);
+    return { status: 200, value: snapshot };
   }
 
   async log(url: URL): Promise<SessionReply> {

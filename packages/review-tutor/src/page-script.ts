@@ -74,9 +74,12 @@ export const pageScript = String.raw`
     structureStatus = "idle",
     structureRequestSequence = 0,
     structureMode = readStructureMode(),
+    structureNeighbours = readStructureNeighbours(),
+    structureToggleAnnouncement = null,
     selectedConnection = null,
     graphSelection = null;
   const learningBadgeGroups = new Map();
+  const structureCache = new Map();
   const foreignActiveIds = new Set();
   let railCollapsed = sessionStorage.getItem("reviewTutorRailCollapsed") === "1";
   let restoreComposerOnDesktop = false;
@@ -388,8 +391,24 @@ export const pageScript = String.raw`
       return "list";
     }
   }
+  function readStructureNeighbours() {
+    try {
+      return sessionStorage.getItem("reviewTutorStructureNeighbours") === "1";
+    } catch {
+      return false;
+    }
+  }
   function structureKindLabel(kind) {
-    return kind === "reexport" ? "re-export" : kind === "dynamic-import" ? "dynamic" : kind;
+    return kind === "reexport" ? "re-export" : kind === "dynamic-import" ? "dynamic" : kind === "part-of" ? "part of" : kind;
+  }
+  function structureNeighboursAnnouncement() {
+    return structureNeighbours ? "Neighbours included." : "Neighbours hidden.";
+  }
+  function restoreStructureNeighboursFocus() {
+    if (document.activeElement === document.body) element("structure-neighbours").focus();
+  }
+  function structureCacheKey(inputId) {
+    return inputId + "|" + (structureNeighbours ? "neighbours" : "changed");
   }
   function resetStructure() {
     structureRequestSequence++;
@@ -397,9 +416,12 @@ export const pageScript = String.raw`
     structureError = null;
     structureInputId = null;
     structureStatus = "idle";
+    structureToggleAnnouncement = null;
     selectedConnection = null;
     graphSelection = null;
     element("structure-mode-switch").hidden = true;
+    element("structure-neighbours-label").hidden = true;
+    element("structure-neighbours").disabled = false;
     element("structure-shared").replaceChildren();
     element("structure-content").replaceChildren();
     element("structure-graph").replaceChildren();
@@ -411,7 +433,31 @@ export const pageScript = String.raw`
   function normalizedLine(text) {
     return String(text || "").trim().replace(/\s+/g, " ");
   }
-  function jumpToEvidence(evidence, edgeStatus, evidenceIndex, allEvidence) {
+  function tutorEvidenceIndex(edge, fallbackIndex) {
+    if (edge.status !== "modified" || edge.evidence.length < 2) return fallbackIndex;
+    function findAddedEvidence(exact) {
+      return edge.evidence.findIndex((evidence) => {
+        const file = files.find((candidate) => candidate.path === evidence.path);
+        const evidenceText = normalizedLine(evidence.text);
+        return file?.lines.some((line) => {
+          const lineText = normalizedLine(line.text);
+          return line.kind === "addition" && line.selectLine === evidence.line && evidenceText &&
+            (exact ? lineText === evidenceText : lineText.startsWith(evidenceText));
+        });
+      });
+    }
+    const exactIndex = findAddedEvidence(true);
+    if (exactIndex >= 0) return exactIndex;
+    const prefixIndex = findAddedEvidence(false);
+    return prefixIndex >= 0 ? prefixIndex : fallbackIndex;
+  }
+  function jumpToEvidence(evidence, edgeStatus, evidenceIndex, allEvidence, askTutor = false) {
+    if (askTutor && ["queued", "running"].includes(currentQuestionState)) {
+      const message = "cancel or wait for the current answer before asking about this connection";
+      showError(new Error(message), "Tutor");
+      announce("Cancel or wait for the current answer before asking about this connection.");
+      return;
+    }
     clearStructureLanding();
     const fileIndex = files.findIndex((file) => file.path === evidence.path);
     if (fileIndex < 0) {
@@ -447,9 +493,18 @@ export const pageScript = String.raw`
     }
     const control = rowControl({ fileIndex, rowIndex: target.rowIndex });
     const row = rowNode({ fileIndex, rowIndex: target.rowIndex });
+    if (askTutor) {
+      chooseRow(fileIndex, target.rowIndex, false, false);
+      element("mode").value = "explain";
+      composerSelectionKey = null;
+      openTutor(control);
+      element("question").value = "";
+      updateActions();
+    }
     row?.classList.add("structure-landing");
     row?.scrollIntoView({ block: "center" });
-    control?.focus({ preventScroll: true });
+    if (askTutor) element("question").focus();
+    else control?.focus({ preventScroll: true });
   }
   function createConnectionRow(edge, key, options = {}) {
     const evidenceId = "connection-evidence-" + key;
@@ -459,10 +514,12 @@ export const pageScript = String.raw`
     row.dataset.status = edge.status;
     row.setAttribute("aria-expanded", String(!!options.expanded));
     row.setAttribute("aria-controls", evidenceId);
-    row.append(
-      makeSpan("connection-kind", structureKindLabel(edge.kind)),
-      makeSpan("connection-target", edge.to),
-    );
+    const target = makeSpan("connection-target", edge.to);
+    const targetWrap = makeSpan("connection-target-wrap", "");
+    targetWrap.append(target);
+    const targetFile = structureSnapshot?.files.find((file) => file.path === edge.to);
+    if (targetFile?.status === "context") targetWrap.append(makeSpan("connection-context status-context", "CONTEXT"));
+    row.append(makeSpan("connection-kind", structureKindLabel(edge.kind)), targetWrap);
     if (edge.typeOnly) row.append(makeSpan("connection-type", "type"));
     row.append(makeSpan("connection-status status-chip status-" + edge.status, structureStatusLabel(edge.status)));
     const evidenceList = document.createElement("ul");
@@ -479,7 +536,15 @@ export const pageScript = String.raw`
       open.className = "ghost open-in-diff";
       open.textContent = "Open in Diff";
       open.addEventListener("click", () => jumpToEvidence(evidence, edge.status, evidenceIndex, edge.evidence));
-      item.append(code, open);
+      const askTutor = document.createElement("button");
+      askTutor.type = "button";
+      askTutor.className = "ghost ask-tutor-evidence";
+      askTutor.textContent = "Ask the tutor";
+      askTutor.addEventListener("click", () => {
+        const targetIndex = tutorEvidenceIndex(edge, evidenceIndex);
+        jumpToEvidence(edge.evidence[targetIndex], edge.status, targetIndex, edge.evidence, true);
+      });
+      item.append(code, askTutor, open);
       evidenceList.append(item);
     });
     row.addEventListener("click", () => {
@@ -809,11 +874,20 @@ export const pageScript = String.raw`
     selectedConnection = null;
     graphSelection = null;
     const shared = element("structure-shared"), container = element("structure-content"), graph = element("structure-graph"), modeSwitch = element("structure-mode-switch");
+    const neighboursLabel = element("structure-neighbours-label"), neighbours = element("structure-neighbours");
     shared.replaceChildren();
     container.replaceChildren();
     graph.replaceChildren();
     element("structure-graph-evidence")?.remove();
-    modeSwitch.hidden = true;
+    modeSwitch.hidden = !structureSnapshot || structureStatus === "error";
+    const neighboursState = structureSnapshot?.neighbours?.state;
+    neighboursLabel.hidden = !structureSnapshot;
+    neighbours.checked = neighboursState === "unavailable"
+      ? false
+      : structureStatus === "loading" || structureStatus === "error"
+        ? structureNeighbours
+        : neighboursState === "on";
+    neighbours.disabled = structureStatus === "loading" || neighboursState === "unavailable";
     container.hidden = false;
     graph.hidden = true;
     if (!currentSource || structureStatus === "loading") {
@@ -860,23 +934,27 @@ export const pageScript = String.raw`
       ...snapshot.comparison.reasons.map((reason) => ({ reason })),
       ...snapshot.limits.omitted,
     ];
-    if (snapshot.comparison.partial || snapshot.limits.truncated) {
+    const unavailableNeighbours = snapshot.neighbours?.state === "unavailable" ? snapshot.neighbours.reason : null;
+    if (snapshot.comparison.partial || snapshot.limits.truncated || unavailableNeighbours) {
       const notice = document.createElement("aside");
       notice.id = "structure-partial";
       notice.className = "structure-partial";
-      const sentence = document.createElement("p");
-      sentence.textContent = "Structure analysis is partial; some connections may be missing.";
-      const details = document.createElement("details");
-      const summary = document.createElement("summary");
-      summary.textContent = disclosureItems.length + " " + (disclosureItems.length === 1 ? "reason" : "reasons");
-      const reasons = document.createElement("ul");
-      for (const item of disclosureItems) {
-        const reason = document.createElement("li");
-        reason.textContent = (item.path ? item.path + ": " : "") + item.reason;
-        reasons.append(reason);
+      if (snapshot.comparison.partial || snapshot.limits.truncated) {
+        const sentence = document.createElement("p");
+        sentence.textContent = "Structure analysis is partial; some connections may be missing.";
+        const details = document.createElement("details");
+        const summary = document.createElement("summary");
+        summary.textContent = disclosureItems.length + " " + (disclosureItems.length === 1 ? "reason" : "reasons");
+        const reasons = document.createElement("ul");
+        for (const item of disclosureItems) {
+          const reason = document.createElement("li");
+          reason.textContent = (item.path ? item.path + ": " : "") + item.reason;
+          reasons.append(reason);
+        }
+        details.append(summary, reasons);
+        notice.append(sentence, details);
       }
-      details.append(summary, reasons);
-      notice.append(sentence, details);
+      if (unavailableNeighbours) notice.append(makeSpan("structure-neighbours-reason", unavailableNeighbours));
       shared.append(notice);
     }
     if (!snapshot.edges.length)
@@ -922,15 +1000,26 @@ export const pageScript = String.raw`
       renderStructure();
       return;
     }
-    if (structureInputId === currentSource.id && structureStatus !== "idle") return;
     const inputId = currentSource.id;
+    const cacheKey = structureCacheKey(inputId);
+    if (structureInputId === cacheKey && structureStatus !== "idle") return;
+    const cached = structureCache.get(cacheKey);
+    if (cached) {
+      structureInputId = cacheKey;
+      structureSnapshot = cached;
+      structureError = null;
+      structureStatus = "loaded";
+      renderStructure();
+      return;
+    }
     const sequence = ++structureRequestSequence;
-    structureInputId = inputId;
+    const toggleAnnouncement = structureToggleAnnouncement;
+    structureInputId = cacheKey;
     structureStatus = "loading";
     renderStructure();
     announce("Analyzing structure…");
-    api("/api/structure").then((snapshot) => {
-      if (sequence !== structureRequestSequence || currentSource?.id !== inputId) return;
+    api(structureNeighbours ? "/api/structure?neighbours=1" : "/api/structure").then((snapshot) => {
+      if (sequence !== structureRequestSequence || currentSource?.id !== inputId || structureCacheKey(inputId) !== cacheKey) return;
       if (snapshot?.inputId !== inputId) {
         structureError = "Structure analysis did not match the current source.";
         structureSnapshot = null;
@@ -939,19 +1028,39 @@ export const pageScript = String.raw`
         announce(structureError);
         return;
       }
+      structureCache.set(cacheKey, snapshot);
       structureSnapshot = snapshot;
       structureError = null;
       structureStatus = "loaded";
       renderStructure();
-      announce("Structure analysis complete.");
+      structureToggleAnnouncement = null;
+      announce("Structure analysis complete." + (toggleAnnouncement ? " " + toggleAnnouncement : ""));
+      restoreStructureNeighboursFocus();
     }).catch((error) => {
-      if (sequence !== structureRequestSequence || currentSource?.id !== inputId) return;
+      if (sequence !== structureRequestSequence || currentSource?.id !== inputId || structureCacheKey(inputId) !== cacheKey) return;
       structureError = error instanceof Error ? error.message : String(error);
-      structureSnapshot = null;
       structureStatus = "error";
       renderStructure();
+      structureToggleAnnouncement = null;
       announce("Structure analysis failed: " + structureError);
+      restoreStructureNeighboursFocus();
     });
+  }
+  function setStructureNeighbours() {
+    structureNeighbours = element("structure-neighbours").checked;
+    structureToggleAnnouncement = structureNeighboursAnnouncement();
+    try { sessionStorage.setItem("reviewTutorStructureNeighbours", structureNeighbours ? "1" : "0"); } catch {}
+    const cached = currentSource && structureCache.get(structureCacheKey(currentSource.id));
+    structureRequestSequence++;
+    structureInputId = currentSource ? structureCacheKey(currentSource.id) : null;
+    structureSnapshot = cached || structureSnapshot;
+    structureError = null;
+    structureStatus = cached ? "loaded" : "idle";
+    if (cached) {
+      renderStructure();
+      announce(structureToggleAnnouncement);
+      structureToggleAnnouncement = null;
+    } else ensureStructure();
   }
   function setStructureMode(mode) {
     structureMode = mode === "graph" ? "graph" : "list";
@@ -2145,6 +2254,7 @@ export const pageScript = String.raw`
     tab.addEventListener("click", () => setStructureMode(mode));
     tab.addEventListener("keydown", handleStructureModeKey);
   }
+  element("structure-neighbours").addEventListener("change", setStructureNeighbours);
   element("history-previous").addEventListener("click", () => renderHistoryEntry(Math.max(0, historyIndex - 1)));
   element("history-next").addEventListener("click", () => renderHistoryEntry(Math.min(historyEntries.length - 1, historyIndex + 1)));
   element("question").addEventListener("input", updateActions);

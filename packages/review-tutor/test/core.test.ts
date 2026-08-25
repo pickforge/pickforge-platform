@@ -10,6 +10,7 @@ import {
   validateLogPatch,
   validateSourceRequest,
   type LearningEntry,
+  type SourceRequest,
 } from "../src/protocol.ts";
 
 const dirs: string[] = [];
@@ -136,7 +137,7 @@ describe("input loading", () => {
     await loadInput({ protocol: "rt/1", kind: "worktree" }, "/repo", exec);
     expect(exec).toHaveBeenCalledWith(
       "git",
-      ["diff", "--no-ext-diff", "--no-color", "--"],
+      ["diff", "--no-ext-diff", "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "--"],
       expect.anything(),
     );
     await expect(loadInput({
@@ -234,26 +235,45 @@ describe("input loading", () => {
       content: "hello",
       label: "L",
     }, "/repo", exec)).toMatchObject({ kind: "paste", label: "L", byteCount: 5 });
-    await loadInput({
+    expect(await loadInput({
       protocol: "rt/1",
       kind: "commit",
       revision: "HEAD~1",
-    }, "/repo", exec);
+    }, "/repo", exec)).toMatchObject({ kind: "commit", revision: "HEAD~1" });
     expect(exec).toHaveBeenLastCalledWith(
       "git",
-      ["show", "--no-ext-diff", "--no-color", "--format=fuller", "HEAD~1", "--"],
+      ["show", "--no-ext-diff", "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "--format=fuller", "HEAD~1", "--"],
       expect.anything(),
     );
-    await loadInput({
+    expect(await loadInput({
       protocol: "rt/1",
       kind: "range",
       from: "main",
       to: "topic",
-    }, "/repo", exec);
+    }, "/repo", exec)).toMatchObject({ kind: "range", rangeTo: "topic" });
     expect(exec).toHaveBeenLastCalledWith(
       "git",
-      ["diff", "--no-ext-diff", "--no-color", "main...topic", "--"],
+      ["diff", "--no-ext-diff", "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "main...topic", "--"],
       expect.anything(),
+    );
+  });
+
+  it("pins the diff path prefixes for every Git-based source kind", async () => {
+    const exec = vi.fn(async (_command: string, _argv: string[]) => ({ stdout: "diff", stderr: "" }));
+    const requests: SourceRequest[] = [
+      { protocol: "rt/1", kind: "worktree" },
+      { protocol: "rt/1", kind: "staged" },
+      { protocol: "rt/1", kind: "commit", revision: "HEAD" },
+      { protocol: "rt/1", kind: "range", from: "main", to: "topic" },
+    ];
+    for (const request of requests) await loadInput(request, "/repo", exec);
+    expect(exec).toHaveBeenCalledTimes(4);
+    for (const call of exec.mock.calls) {
+      expect(call[1]).toContain("--src-prefix=a/");
+      expect(call[1]).toContain("--dst-prefix=b/");
+    }
+    expect(exec.mock.calls[1]![1]).toEqual(
+      ["diff", "--cached", "--no-ext-diff", "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "--"],
     );
   });
 

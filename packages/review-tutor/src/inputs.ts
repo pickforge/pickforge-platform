@@ -15,6 +15,13 @@ export type ExecFile = (
 
 const REVISION = /^[A-Za-z0-9][A-Za-z0-9._/~^{}@+-]{0,255}$/;
 
+/**
+ * Pins the diff format for every local Git read. Without the explicit prefixes,
+ * `diff.mnemonicPrefix` emits `i/` and `w/` and `diff.noprefix` emits none, so a
+ * user's Git config would change the paths in every snapshot.
+ */
+const DIFF_ARGS = ["--no-ext-diff", "--no-color", "--src-prefix=a/", "--dst-prefix=b/"];
+
 function revision(value: string): string {
   if (value.startsWith("-") || !REVISION.test(value)) {
     throw new Error(
@@ -133,7 +140,7 @@ export async function loadInput(
       await run(
         exec,
         "git",
-        ["diff", "--no-ext-diff", "--no-color", "--"],
+        ["diff", ...DIFF_ARGS, "--"],
         cwd,
         signal,
       ),
@@ -146,7 +153,7 @@ export async function loadInput(
       await run(
         exec,
         "git",
-        ["diff", "--cached", "--no-ext-diff", "--no-color", "--"],
+        ["diff", "--cached", ...DIFF_ARGS, "--"],
         cwd,
         signal,
       ),
@@ -160,10 +167,11 @@ export async function loadInput(
       await run(
         exec,
         "git",
-        ["show", "--no-ext-diff", "--no-color", "--format=fuller", rev, "--"],
+        ["show", ...DIFF_ARGS, "--format=fuller", rev, "--"],
         cwd,
         signal,
       ),
+      { revision: rev },
     );
   }
   if (request.kind === "range") {
@@ -175,15 +183,25 @@ export async function loadInput(
       await run(
         exec,
         "git",
-        ["diff", "--no-ext-diff", "--no-color", `${from}...${to}`, "--"],
+        ["diff", ...DIFF_ARGS, `${from}...${to}`, "--"],
         cwd,
         signal,
       ),
+      { rangeTo: to },
     );
   }
 
-  const pr = request as Extract<SourceRequest, { kind: "pr" }>;
-  const url = prUrl(pr.url).toString().replace(/\/$/, "");
+  return loadPullRequest(request as Extract<SourceRequest, { kind: "pr" }>, cwd, exec, signal);
+}
+
+/** Reads one exact PR head, re-checking the head SHA so a mid-read force-push cannot be mixed in. */
+async function loadPullRequest(
+  request: Extract<SourceRequest, { kind: "pr" }>,
+  cwd: string,
+  exec: ExecFile,
+  signal?: AbortSignal,
+): Promise<InputSnapshot> {
+  const url = prUrl(request.url).toString().replace(/\/$/, "");
   const viewArgs = ["pr", "view", url, "--json", "number,title,url,headRefOid,author"];
   const before = JSON.parse(await run(exec, "gh", viewArgs, cwd, signal)) as {
     number: number;

@@ -35,6 +35,7 @@ const state = {
 const structure = {
   protocol: "rt/1",
   inputId: source.id,
+  neighbours: { state: "off", count: 0 },
   comparison: {
     kind: "worktree",
     label: "Working tree",
@@ -110,6 +111,16 @@ function structureResponse(value: Promise<Response> | Response | unknown | Error
   return value instanceof Promise || value instanceof Response ? value : json(value);
 }
 
+function blockStructureStorageReads(window: Window, options: { throwStructureModeRead?: boolean; throwStructureNeighboursRead?: boolean }) {
+  if (!options.throwStructureModeRead && !options.throwStructureNeighboursRead) return;
+  const getItem = window.sessionStorage.getItem.bind(window.sessionStorage);
+  window.sessionStorage.getItem = vi.fn((key: string) => {
+    if (options.throwStructureModeRead && key === "reviewTutorStructureMode") throw new Error("storage blocked");
+    if (options.throwStructureNeighboursRead && key === "reviewTutorStructureNeighbours") throw new Error("storage blocked");
+    return getItem(key);
+  });
+}
+
 async function boot(options: {
   width?: number;
   askResponse?: Promise<Response> | Response;
@@ -121,6 +132,8 @@ async function boot(options: {
   storedQuizIds?: string;
   storedStructureMode?: string;
   throwStructureModeRead?: boolean;
+  storedStructureNeighbours?: string;
+  throwStructureNeighboursRead?: boolean;
   stateResponses?: unknown[];
   structureResponses?: Array<Promise<Response> | Response | unknown | Error>;
   failHeartbeat?: boolean;
@@ -132,14 +145,9 @@ async function boot(options: {
   if (options.storedPageId !== undefined) window.sessionStorage.setItem("reviewTutorPageId", options.storedPageId);
   if (options.storedQuizIds !== undefined) window.sessionStorage.setItem("reviewTutorQuizEntryIds", options.storedQuizIds);
   if (options.storedStructureMode !== undefined) window.sessionStorage.setItem("reviewTutorStructureMode", options.storedStructureMode);
+  if (options.storedStructureNeighbours !== undefined) window.sessionStorage.setItem("reviewTutorStructureNeighbours", options.storedStructureNeighbours);
   if (options.railCollapsed) window.sessionStorage.setItem("reviewTutorRailCollapsed", "1");
-  if (options.throwStructureModeRead) {
-    const getItem = window.sessionStorage.getItem.bind(window.sessionStorage);
-    window.sessionStorage.getItem = vi.fn((key: string) => {
-      if (key === "reviewTutorStructureMode") throw new Error("storage blocked");
-      return getItem(key);
-    });
-  }
+  blockStructureStorageReads(window, options);
   const script = pageHtml.match(/<script>([\s\S]*?)<\/script>/)?.[1];
   if (!script) throw new Error("Inline page script was not composed");
   window.document.documentElement.innerHTML = pageHtml
@@ -156,7 +164,7 @@ async function boot(options: {
     requests.push({ path, init });
     if (path === "/api/state") return stateResponse(stateResponses.shift() ?? bootState);
     if (path === "/api/log?limit=100") return logResponse(logResponses.shift(), options.entries ?? []);
-    if (path === "/api/structure") return structureResponse(structureResponses.shift() ?? structure);
+    if (path === "/api/structure" || path === "/api/structure?neighbours=1") return structureResponse(structureResponses.shift() ?? structure);
     if (path === "/api/heartbeat" && options.failHeartbeat) return Promise.reject(new Error("heartbeat down"));
     if (path === "/api/ask") return options.askResponse ?? json({ id: "q-1", state: "queued", answer: "", createdAt: new Date().toISOString() });
     if (path.startsWith("/api/log/")) return json({});
@@ -452,6 +460,194 @@ describe("Review Tutor composed page", () => {
     expect(() => byId(writeFailure.document, "structure-mode-graph").click()).not.toThrow();
     expect(byId(writeFailure.document, "structure-graph").hidden).toBe(false);
     writeFailure.window.sessionStorage.setItem = setItem;
+  });
+
+  it.each([
+    ["off", false, false],
+    ["on", true, false],
+    ["unavailable", false, true],
+  ])("keeps the labelled neighbours checkbox visible for snapshot state %s", async (neighbourState, checked, disabled) => {
+    const reason = "Comparison cannot read neighbouring files.";
+    const snapshot = {
+      ...structure,
+      comparison: { ...structure.comparison, partial: false, reasons: [] },
+      limits: { ...structure.limits, truncated: false, omitted: [] },
+      neighbours: neighbourState === "unavailable"
+        ? { state: neighbourState, count: 0, reason }
+        : { state: neighbourState, count: neighbourState === "on" ? 2 : 0 },
+    };
+    const { document } = await boot({ structureResponses: [snapshot] });
+    byId(document, "view-structure").click();
+    await flush();
+    const label = byId(document, "structure-neighbours-label");
+    const checkbox = byId(document, "structure-neighbours");
+    expect(label.hidden).toBe(false);
+    expect(label.textContent).toContain("Include unchanged neighbours");
+    expect(label.parentElement).toBe(byId(document, "structure-mode-switch").parentElement);
+    expect(checkbox.checked).toBe(checked);
+    expect(checkbox.disabled).toBe(disabled);
+    if (neighbourState === "unavailable") expect(byId(document, "structure-partial").textContent).toContain(reason);
+  });
+
+  it("refetches and caches structure per neighbours flag while persisting the choice", async () => {
+    const withNeighbours = { ...structure, neighbours: { state: "on", count: 1 } };
+    const loaded = await boot({ structureResponses: [structure, withNeighbours] });
+    byId(loaded.document, "view-structure").click();
+    await flush();
+    const checkbox = byId(loaded.document, "structure-neighbours");
+    checkbox.click();
+    await flush();
+    expect(loaded.requests.filter((request) => request.path.startsWith("/api/structure"))).toHaveLength(2);
+    expect(loaded.requests.at(-1)?.path).toBe("/api/structure?neighbours=1");
+    expect(loaded.window.sessionStorage.getItem("reviewTutorStructureNeighbours")).toBe("1");
+    expect(byId(loaded.document, "lifecycle").textContent).toBe("Structure analysis complete. Neighbours included.");
+
+    checkbox.click();
+    await flush();
+    expect(loaded.requests.filter((request) => request.path.startsWith("/api/structure"))).toHaveLength(2);
+    expect(loaded.window.sessionStorage.getItem("reviewTutorStructureNeighbours")).toBe("0");
+    expect(byId(loaded.document, "lifecycle").textContent).toBe("Neighbours hidden.");
+
+    const restored = await boot({ storedStructureNeighbours: "1", structureResponses: [withNeighbours] });
+    byId(restored.document, "view-structure").click();
+    await flush();
+    expect(restored.requests.find((request) => request.path.startsWith("/api/structure"))?.path).toBe("/api/structure?neighbours=1");
+    expect(byId(restored.document, "structure-neighbours").checked).toBe(true);
+  });
+
+  it("disables the neighbours checkbox in flight and restores body focus after loading", async () => {
+    let resolveNeighbours!: (response: Response) => void;
+    const pending = new Promise<Response>((resolve) => { resolveNeighbours = resolve; });
+    const loaded = await boot({ structureResponses: [structure, pending] });
+    byId(loaded.document, "view-structure").click();
+    await flush();
+    const checkbox = byId(loaded.document, "structure-neighbours");
+    checkbox.click();
+    expect(checkbox.disabled).toBe(true);
+    byId(loaded.document, "structure-title").focus();
+    byId(loaded.document, "structure-title").blur();
+    expect(loaded.document.activeElement).toBe(loaded.document.body);
+    resolveNeighbours(json({ ...structure, neighbours: { state: "on", count: 1 } }));
+    await flush();
+    expect(checkbox.disabled).toBe(false);
+    expect(checkbox.checked).toBe(true);
+    expect(loaded.document.activeElement).toBe(checkbox);
+  });
+
+  it("keeps the requested neighbours control recoverable and restores body focus after a toggle error", async () => {
+    let rejectNeighbours!: (error: Error) => void;
+    const pending = new Promise<Response>((_resolve, reject) => { rejectNeighbours = reject; });
+    const loaded = await boot({ structureResponses: [structure, pending] });
+    byId(loaded.document, "view-structure").click();
+    await flush();
+    const checkbox = byId(loaded.document, "structure-neighbours");
+    checkbox.click();
+    byId(loaded.document, "structure-title").focus();
+    byId(loaded.document, "structure-title").blur();
+    expect(loaded.document.activeElement).toBe(loaded.document.body);
+    rejectNeighbours(new Error("neighbour read failed"));
+    await flush();
+    expect(byId(loaded.document, "structure-error").textContent).toContain("neighbour read failed");
+    expect(byId(loaded.document, "structure-mode-switch").hidden).toBe(true);
+    expect(byId(loaded.document, "structure-neighbours-label").hidden).toBe(false);
+    expect(checkbox.checked).toBe(true);
+    expect(checkbox.disabled).toBe(false);
+    expect(loaded.document.activeElement).toBe(checkbox);
+    checkbox.click();
+    await flush();
+    expect(byId(loaded.document, "structure-comparison").textContent).toBe("index → working tree");
+  });
+
+  it("drops a pending toggle announcement when the source switches", async () => {
+    let resolveNeighbours!: (response: Response) => void;
+    const pending = new Promise<Response>((resolve) => { resolveNeighbours = resolve; });
+    const next = { ...structure, inputId: "input-2", comparison: { ...structure.comparison, from: "main", to: "feature" } };
+    const loaded = await boot({ structureResponses: [structure, pending, next] });
+    byId(loaded.document, "view-structure").click();
+    await flush();
+    byId(loaded.document, "structure-neighbours").click();
+    loaded.events?.emit("source", { ...source, id: "input-2" });
+    await flush();
+    resolveNeighbours(json({ ...structure, neighbours: { state: "on", count: 1 } }));
+    await flush();
+    byId(loaded.document, "view-structure").click();
+    await flush();
+    expect(byId(loaded.document, "structure-comparison").textContent).toBe("main → feature");
+    expect(byId(loaded.document, "lifecycle").textContent).not.toContain("Neighbours");
+  });
+
+  it("appends the hidden announcement after an uncached toggle", async () => {
+    const on = { ...structure, neighbours: { state: "on", count: 1 } };
+    const loaded = await boot({ storedStructureNeighbours: "1", structureResponses: [on, structure] });
+    byId(loaded.document, "view-structure").click();
+    await flush();
+    byId(loaded.document, "structure-neighbours").click();
+    await flush();
+    expect(loaded.requests.at(-1)?.path).toBe("/api/structure");
+    expect(byId(loaded.document, "lifecycle").textContent).toBe("Structure analysis complete. Neighbours hidden.");
+  });
+
+  it("tolerates blocked neighbours storage reads and writes without blocking refetch", async () => {
+    const readFailure = await boot({ throwStructureNeighboursRead: true });
+    byId(readFailure.document, "view-structure").click();
+    await flush();
+    expect(byId(readFailure.document, "structure-neighbours").checked).toBe(false);
+
+    const writeFailure = await boot({ structureResponses: [structure, { ...structure, neighbours: { state: "on", count: 1 } }] });
+    byId(writeFailure.document, "view-structure").click();
+    await flush();
+    writeFailure.window.sessionStorage.setItem = vi.fn(() => { throw new Error("storage blocked"); });
+    expect(() => byId(writeFailure.document, "structure-neighbours").click()).not.toThrow();
+    await flush();
+    expect(writeFailure.requests.at(-1)?.path).toBe("/api/structure?neighbours=1");
+    expect(byId(writeFailure.document, "structure-neighbours").checked).toBe(true);
+  });
+
+  it("renders context targets inline, omits empty context groups, and keeps outgoing context groups", async () => {
+    const contextSnapshot = {
+      ...structure,
+      files: [
+        { path: "src/a.ts", status: "modified", analyzed: true },
+        { path: "lib/target.dart", status: "context", analyzed: true },
+        { path: "lib/outgoing.dart", status: "context", analyzed: true },
+      ],
+      edges: [
+        { from: "src/a.ts", to: "lib/target.dart", kind: "part", typeOnly: false, status: "unchanged", evidence: [] },
+        { from: "lib/outgoing.dart", to: "src/a.ts", kind: "part-of", typeOnly: false, status: "unchanged", evidence: [] },
+      ],
+    };
+    const { document } = await boot({ structureResponses: [contextSnapshot] });
+    byId(document, "view-structure").click();
+    await flush();
+    const groups = Array.from(document.querySelectorAll(".structure-file") as any) as any[];
+    expect(groups.some((group) => group.querySelector(".structure-file-path")?.textContent === "lib/target.dart")).toBe(false);
+    const outgoing = groups.find((group) => group.querySelector(".structure-file-path")?.textContent === "lib/outgoing.dart") as any;
+    expect(outgoing.querySelector(".structure-file-status")?.textContent).toBe("context");
+    expect(outgoing.querySelector(".structure-file-status")?.classList.contains("status-context")).toBe(true);
+    const targetRow = groups.find((group) => group.querySelector(".structure-file-path")?.textContent === "src/a.ts")?.querySelector(".connection-row") as any;
+    expect(targetRow.querySelector(".connection-target")?.textContent).toBe("lib/target.dart");
+    expect(targetRow.querySelector(".connection-context")?.textContent).toBe("CONTEXT");
+    expect(targetRow.querySelector(".connection-target")?.nextElementSibling).toBe(targetRow.querySelector(".connection-context"));
+    byId(document, "structure-mode-graph").click();
+    const node = document.querySelector('.structure-graph-node[data-path="lib/outgoing.dart"]') as any;
+    expect(node.getAttribute("aria-label")).toBe("lib/outgoing.dart, context");
+    expect(node.classList.contains("status-context")).toBe(true);
+  });
+
+  it("labels Dart and Rust connection kinds through the existing kind chip", async () => {
+    const kinds = ["part", "part-of", "mod", "use", "include"];
+    const kindSnapshot = {
+      ...structure,
+      files: [{ path: "src/a.ts", status: "modified", analyzed: true }],
+      edges: kinds.map((kind, index) => ({ from: "src/a.ts", to: `target-${index}`, kind, typeOnly: false, status: "unchanged", evidence: [] })),
+    };
+    const { document } = await boot({ structureResponses: [kindSnapshot] });
+    byId(document, "view-structure").click();
+    await flush();
+    expect(Array.from(document.querySelectorAll(".connection-kind")).map((chip: any) => chip.textContent)).toEqual([
+      "part", "part of", "mod", "use", "include",
+    ]);
+    expect(pageHtml).toMatch(/\.status-chip,\.connection-kind,\.connection-type,\.connection-context \{\n[^}]*text-transform:uppercase/);
   });
 
   it("lays out DAGs and cycles deterministically with directory ordering", async () => {
@@ -770,6 +966,7 @@ describe("Review Tutor composed page", () => {
     expect(graphPanel.parentElement).toBe(byId(graphPage.document, "structure-section"));
     expect(graphPanel.querySelector(".connection-row")?.getAttribute("aria-expanded")).toBe("true");
     expect(graphPanel.querySelector(".evidence-code")?.textContent).toContain("import type");
+    expect(graphPanel.querySelector(".ask-tutor-evidence")?.textContent).toBe("Ask the tutor");
     (graphPanel.querySelector(".open-in-diff") as any).click();
     const graphLanding = graphPage.document.querySelector(".diff-row.structure-landing") as any;
 
@@ -974,7 +1171,7 @@ describe("Review Tutor composed page", () => {
     expect(rows[0].classList.contains("selected")).toBe(false);
     expect(rows[1].getAttribute("aria-expanded")).toBe("true");
     rows[0].click();
-    const open = byId(document, rows[0].getAttribute("aria-controls")).querySelector("button") as any;
+    const open = byId(document, rows[0].getAttribute("aria-controls")).querySelector(".open-in-diff") as any;
     open.click();
     expect(byId(document, "diff").hidden).toBe(false);
     expect(byId(document, "structure-section").hidden).toBe(true);
@@ -982,6 +1179,124 @@ describe("Review Tutor composed page", () => {
     expect(document.querySelectorAll(".diff-row.structure-landing")).toHaveLength(1);
     lineControl(selectableRows(document)[0]).dispatchEvent(new document.defaultView!.Event("pointerdown", { bubbles: true }));
     expect(document.querySelectorAll(".diff-row.structure-landing")).toHaveLength(0);
+  });
+
+  it("asks from graph evidence through the existing list selection path", async () => {
+    const { document } = await boot();
+    byId(document, "view-structure").click();
+    await flush();
+    expect(byId(document, "structure-neighbours-label").textContent).toContain("Include unchanged neighbours");
+    byId(document, "structure-mode-graph").click();
+    const edge = Array.from(document.querySelectorAll(".structure-graph-edge") as any).find((item: any) => item.dataset.from === "src/b.ts" && item.dataset.to === "src/a.ts") as any;
+    edge.dispatchEvent(new document.defaultView!.MouseEvent("click", { bubbles: true }));
+    input(document, "question", "replace this draft");
+    input(document, "mode", "quiz");
+    const panel = byId(document, "structure-graph-evidence");
+    const askTutor = panel.querySelector(".ask-tutor-evidence") as any;
+    expect(askTutor.textContent).toBe("Ask the tutor");
+    expect(askTutor.nextElementSibling?.textContent).toBe("Open in Diff");
+    askTutor.click();
+
+    expect(byId(document, "diff").hidden).toBe(false);
+    expect(byId(document, "structure-section").hidden).toBe(true);
+    expect(byId(document, "selection-summary").textContent).toBe("src/b.ts · lines 1-1");
+    const selected = document.querySelector(".diff-row.selected") as any;
+    expect(selected?.classList.contains("addition")).toBe(true);
+    expect(selected?.textContent).toContain("import type");
+    expect(byId(document, "tutor").classList.contains("open")).toBe(true);
+    expect(byId(document, "question").value).toBe("");
+    expect(byId(document, "mode").value).toBe("explain");
+    expect(document.activeElement).toBe(byId(document, "question"));
+  });
+
+  it("opens the evidence tutor dialog and focuses its textarea at the stacked breakpoint", async () => {
+    const { document } = await boot({ width: 860 });
+    byId(document, "view-structure").click();
+    await flush();
+    byId(document, "structure-mode-graph").click();
+    const edge = Array.from(document.querySelectorAll(".structure-graph-edge") as any).find((item: any) => item.dataset.from === "src/b.ts" && item.dataset.to === "src/a.ts") as any;
+    edge.dispatchEvent(new document.defaultView!.MouseEvent("click", { bubbles: true }));
+    (byId(document, "structure-graph-evidence").querySelector(".ask-tutor-evidence") as any).click();
+    expect(byId(document, "tutor").getAttribute("role")).toBe("dialog");
+    expect(byId(document, "tutor").classList.contains("open")).toBe(true);
+    expect(document.activeElement).toBe(byId(document, "question"));
+  });
+
+  it.each([1440, 860])("refuses evidence Ask without changing view or selection while this tab is running (%dpx)", async (width) => {
+    const { document, window, events } = await boot({ width });
+    byId(document, "view-structure").click();
+    await flush();
+    const row = document.querySelector(".connection-row") as any;
+    row.click();
+    const pageId = window.sessionStorage.getItem("reviewTutorPageId");
+    events?.emit("state", { input: source, questions: [{ id: "q-own", ownerPageId: pageId, state: "running", answer: "Working" }] });
+    const beforeSelection = byId(document, "selection-summary").textContent;
+    (row.nextElementSibling.querySelector(".ask-tutor-evidence") as any).click();
+    expect(byId(document, "structure-section").hidden).toBe(false);
+    expect(byId(document, "diff").hidden).toBe(true);
+    expect(byId(document, "selection-summary").textContent).toBe(beforeSelection);
+    expect(document.querySelector(".diff-row.selected")).toBeNull();
+    expect(byId(document, "tutor").classList.contains("open")).toBe(false);
+    expect(byId(document, "error").textContent).toContain("cancel or wait for the current answer");
+    expect(byId(document, "lifecycle").textContent).toContain("Cancel or wait for the current answer");
+  });
+
+  it("allows foreign-tab activity to open an empty evidence draft while Ask stays disabled", async () => {
+    const { document, events } = await boot();
+    byId(document, "view-structure").click();
+    await flush();
+    const row = document.querySelector(".connection-row") as any;
+    row.click();
+    events?.emit("state", { input: source, questions: [{ id: "q-foreign", ownerPageId: "another-page", state: "running", answer: "Working" }] });
+    (row.nextElementSibling.querySelector(".ask-tutor-evidence") as any).click();
+    expect(byId(document, "tutor").classList.contains("open")).toBe(true);
+    expect(byId(document, "question").value).toBe("");
+    expect(byId(document, "ask").disabled).toBe(true);
+  });
+
+  it("resolves exact added evidence before a deletion-prefix match", async () => {
+    const modifiedSource = {
+      ...source,
+      content: "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-import value\n+import value from './new.js'",
+    };
+    const modifiedStructure = {
+      ...structure,
+      files: [{ path: "a.ts", status: "modified", analyzed: true }],
+      edges: [{
+        from: "a.ts", to: "b.ts", kind: "use", typeOnly: false, status: "modified", specifier: "b",
+        evidence: [{ path: "a.ts", line: 1, text: "import value" }, { path: "a.ts", line: 1, text: "import value from './new.js'" }],
+      }],
+    };
+    const { document } = await boot({ source: modifiedSource, structureResponses: [modifiedStructure] });
+    byId(document, "view-structure").click();
+    await flush();
+    (document.querySelector(".connection-row") as any).click();
+    (document.querySelector(".ask-tutor-evidence") as any).click();
+    const selected = document.querySelector(".diff-row.selected") as any;
+    expect(selected?.classList.contains("addition")).toBe(true);
+    expect(selected?.textContent).toContain("import value from './new.js'");
+    expect(byId(document, "selection-preview").textContent).toBe("import value from './new.js'");
+  });
+
+  it("uses Open in Diff's fallback when tutor evidence cannot be anchored", async () => {
+    const unavailable = {
+      ...structure,
+      files: [{ path: "src/a.ts", status: "modified", analyzed: true }],
+      edges: [{
+        from: "src/a.ts", to: "line.ts", kind: "include", typeOnly: false, status: "added", specifier: "line",
+        evidence: [{ path: "src/a.ts", line: 99, text: "missing();" }],
+      }],
+    };
+    const { document } = await boot({ structureResponses: [unavailable] });
+    byId(document, "view-structure").click();
+    await flush();
+    (document.querySelector(".connection-row") as any).click();
+    (document.querySelector(".ask-tutor-evidence") as any).click();
+    expect(byId(document, "diff").hidden).toBe(false);
+    expect(byId(document, "lifecycle").textContent).toBe("Line 99 is not in the diff view.");
+    expect(document.activeElement).toBe(document.querySelector("#file-0 .file-head"));
+    expect(byId(document, "tutor").classList.contains("open")).toBe(false);
+    expect(byId(document, "selection-summary").textContent).toBe("No code selected");
   });
 
   it("anchors modified evidence to its old and new sides, preferring additions for identical text", async () => {
@@ -1130,10 +1445,13 @@ describe("Review Tutor composed page", () => {
 
   it("uses touch targets and compact chips without making structure heads sticky", async () => {
     expect(pageHtml).toContain("button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-visible,[tabindex]:focus-visible");
-    expect(pageHtml).toMatch(/\.status-chip,\.connection-kind,\.connection-type \{\n[^}]*font:600 10px/);
-    expect(pageHtml).toMatch(/@media\(max-width:860px\)[\s\S]*\.structure-error-card button,\.structure-partial summary,\.open-in-diff \{\nmin-height:var\(--control-h-touch\)/);
+    expect(pageHtml).toMatch(/\.status-chip,\.connection-kind,\.connection-type,\.connection-context \{\n[^}]*font:600 10px/);
+    expect(pageHtml).toMatch(/@media\(max-width:860px\)[\s\S]*\.structure-error-card button,\.structure-partial summary,\.open-in-diff,\.ask-tutor-evidence \{\nmin-height:var\(--control-h-touch\)/);
     expect(pageHtml).toMatch(/@media\(max-width:520px\)[\s\S]*\.structure-file-path \{\n[^}]*white-space:normal[^}]*overflow-wrap:anywhere/);
     expect(pageHtml).toContain('grid-template-areas:"kind type status ." "target target target target"');
+    expect(pageHtml).toContain(".structure-head:has(> :not([hidden]))");
+    expect(pageHtml).not.toMatch(/\n\.ask-tutor-evidence \{/);
+    expect(pageHtml).not.toContain('file.status === "context"');
 
     const mobileStyles = pageHtml.slice(pageHtml.indexOf("@media(max-width:860px)"));
     expect(mobileStyles).toMatch(/\.structure-partial summary \{\npadding:8px 4px\}/);

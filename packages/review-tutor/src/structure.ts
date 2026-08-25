@@ -1,4 +1,5 @@
 import { posix } from "node:path";
+import type { ExecFile } from "./inputs.ts";
 import {
   STRUCTURE_LIMITS,
   type InputSnapshot,
@@ -7,9 +8,25 @@ import {
   type StructureEvidence,
   type StructureFile,
   type StructureLimits,
+  type StructureNeighbours,
   type StructureOmission,
   type StructureSnapshot,
 } from "./protocol.ts";
+import {
+  CLAUSE_LIMIT,
+  extensionOf,
+  languageForExtension,
+  maskLiterals,
+  pubspecPackageName,
+  scanFor,
+  targetFor,
+  type LanguageId,
+  type ResolutionTarget,
+  type Statement,
+} from "./structure-languages.ts";
+import { NeighbourReader, neighbourSourceFor, type NeighbourSource } from "./structure-neighbours.ts";
+
+export { maskLiterals };
 
 type LineOrigin = "add" | "del" | "context";
 type Side = "new" | "old";
@@ -34,64 +51,58 @@ interface ParsedDiff {
 
 interface DocLine { number: number; origin: LineOrigin; text: string; start: number }
 interface Doc { text: string; lines: DocLine[] }
-interface Statement {
-  kind: StructureEdge["kind"];
-  specifier: string;
-  typeOnly: boolean;
-  offset: number;
-  specifierOffset: number;
-}
 
 interface ResolutionIndex { current: Map<string, string>; previous: Map<string, string> }
+
+/** One specifier that matched no changed file, kept for the optional neighbour pass. */
+interface PendingLink {
+  from: string;
+  target: ResolutionTarget;
+  statement: Statement;
+  status: StructureEdge["status"];
+  evidence: StructureEvidence[];
+  line: number;
+  omission?: StructureOmission;
+  suppressed: boolean;
+}
 
 interface Collector {
   edges: Map<string, StructureEdge>;
   omitted: StructureOmission[];
   external: Map<string, Set<string>>;
+  pending: PendingLink[];
+  packageRoots: Map<string, string>;
   unresolved: boolean;
+  unresolvedLinks: number;
   truncated: boolean;
   suppressed: number;
   droppedEdges: number;
 }
 
-const ANALYZED_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"];
-const EXTENSIONLESS_CANDIDATES = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"];
-const JS_TO_TS: Record<string, string[]> = {
-  ".js": [".ts", ".tsx"],
-  ".jsx": [".tsx"],
-  ".mjs": [".mts"],
-  ".cjs": [".cts"],
-};
-/** Statement keywords, ignoring member access such as `foo.import`. */
-const STATEMENT_KEYWORD = /(?<![.$\w])(import|export)(?![\w$])/g;
-/**
- * Import-clause characters only: identifiers, `*`, `,`, braces and whitespace.
- * Anything else (`=`, `(`, an operator) means this is not an import statement,
- * so semicolon-free code cannot bind to a later `from "…"`.
- */
-const FROM_TAIL = /(import|export)([\w$*,{}\s]{0,2000}?)\bfrom\s*(['"])[^'"\n]*\3/y;
-const CLAUSE_CHARACTER = /[\w$*,{}\s]/;
-const CLAUSE_LIMIT = 2000;
-const CLAUSE_SCAN = 20_000;
-const BARE_TAIL = /import\s+(['"])[^'"\n]*\1/y;
-const CALL_IMPORT = /(?<![.$\w])(require|import)\s*\(\s*/g;
-const NESTED_KEYWORD = /(?<![.$\w])(import|export)(?![\w$])/;
+interface AnalysisContext { packageRoots: Map<string, string>; neighbours: boolean }
+
+interface Analysis {
+  input: InputSnapshot;
+  reasons: string[];
+  files: StructureFile[];
+  parsed: ParsedDiff;
+  collector: Collector;
+}
+
+export interface NeighbourRequest {
+  neighbours: boolean;
+  execFile: ExecFile;
+  cwd: string;
+  now?: () => number;
+  signal?: AbortSignal;
+  deadline?: AbortSignal;
+}
+
+const PUBSPEC_DEPTH = 6;
 const CONTROL_CHARACTERS = /[\u0000-\u0008\u000A-\u001F\u007F]/g;
-const REGEX_START = new Set(["(", ",", "=", ":", "[", "!", "&", "|", "?", "{", "}", ";"]);
-const EXPRESSION_KEYWORDS = new Set([
-  "return", "typeof", "case", "in", "of", "delete", "void", "throw",
-  "do", "else", "yield", "await", "instanceof", "new",
-]);
-const WORD_CHARACTER = /[\w$]/;
 
 function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
-}
-
-function extensionOf(path: string): string {
-  const name = path.slice(path.lastIndexOf("/") + 1);
-  const match = /\.[A-Za-z0-9]+$/.exec(name);
-  return match ? match[0].toLowerCase() : "";
 }
 
 function unquotePath(value: string): string {
@@ -99,6 +110,7 @@ function unquotePath(value: string): string {
   return value.slice(1, -1).replace(/\\(["\\])/g, "$1");
 }
 
+/** `inputs.ts` pins `--src-prefix=a/ --dst-prefix=b/`, so only those two ever arrive. */
 function stripSidePrefix(value: string): string {
   const path = unquotePath(value.trim());
   return path.replace(/^[ab]\//, "");
@@ -246,110 +258,6 @@ export function parseUnifiedDiff(content: string): ParsedDiff {
   return { files, reasons: state.reasons, extraFiles: state.extraFiles, longLines: state.longLines };
 }
 
-function maskString(text: string, out: string[], start: number): number {
-  const quote = text[start]!;
-  let index = start + 1;
-  while (index < text.length) {
-    const character = text[index]!;
-    if (character === "\\") {
-      out[index] = " ";
-      if (text[index + 1] !== undefined && text[index + 1] !== "\n") out[index + 1] = " ";
-      index += 2;
-      continue;
-    }
-    if (character === quote) return index + 1;
-    if (character === "\n" && quote !== "`") return index;
-    if (character !== "\n") out[index] = " ";
-    index += 1;
-  }
-  return index;
-}
-
-function maskLineComment(text: string, out: string[], start: number): number {
-  let index = start;
-  while (index < text.length && text[index] !== "\n") { out[index] = " "; index += 1; }
-  return index;
-}
-
-function maskBlockComment(text: string, out: string[], start: number): number {
-  out[start] = " ";
-  out[start + 1] = " ";
-  let index = start + 2;
-  while (index < text.length && !(text[index] === "*" && text[index + 1] === "/")) {
-    if (text[index] !== "\n") out[index] = " ";
-    index += 1;
-  }
-  if (index < text.length) { out[index] = " "; out[index + 1] = " "; }
-  return index + 2;
-}
-
-function skipBackWhitespace(text: ArrayLike<string>, from: number): number {
-  let cursor = from;
-  while (cursor >= 0 && (text[cursor] === " " || text[cursor] === "\t" || text[cursor] === "\n")) cursor -= 1;
-  return cursor;
-}
-
-/** The identifier ending at `cursor`, or "" when it is longer than an operator keyword. */
-function wordBefore(text: string[], cursor: number): string {
-  let start = cursor;
-  while (start >= 0 && WORD_CHARACTER.test(text[start]!)) {
-    if (cursor - start > 12) return "";
-    start -= 1;
-  }
-  return text.slice(start + 1, cursor + 1).join("");
-}
-
-/** True when a `/` at `start` opens a regex literal rather than a division. */
-function opensRegex(out: string[], start: number): boolean {
-  const cursor = skipBackWhitespace(out, start - 1);
-  if (cursor < 0) return true;
-  const previous = out[cursor]!;
-  if (REGEX_START.has(previous)) return true;
-  if (previous === ">" && cursor > 0 && out[cursor - 1] === "=") return true;
-  if (!WORD_CHARACTER.test(previous)) return false;
-  const word = wordBefore(out, cursor);
-  if (!EXPRESSION_KEYWORDS.has(word)) return false;
-  const beforeWord = skipBackWhitespace(out, cursor - word.length);
-  return beforeWord < 0 || out[beforeWord] !== ".";
-}
-
-function regexEnd(text: string, start: number): number | undefined {
-  let index = start + 1;
-  while (index < text.length && text[index] !== "\n") {
-    if (text[index] === "\\") { index += 2; continue; }
-    if (text[index] === "/") return index;
-    index += 1;
-  }
-  return undefined;
-}
-
-function maskRegexLiteral(text: string, out: string[], start: number): number | undefined {
-  if (!opensRegex(out, start)) return undefined;
-  const end = regexEnd(text, start);
-  if (end === undefined) return undefined;
-  for (let index = start; index <= end; index += 1) out[index] = " ";
-  return end + 1;
-}
-
-/**
- * Blanks comment, string, and regex-literal bodies while preserving every UTF-16
- * offset, so no keyword inside them can be read as an import statement.
- */
-export function maskLiterals(text: string): string {
-  const out = text.split("");
-  let index = 0;
-  while (index < text.length) {
-    const character = text[index]!;
-    const next = text[index + 1];
-    if (character === "/" && next === "/") index = maskLineComment(text, out, index);
-    else if (character === "/" && next === "*") index = maskBlockComment(text, out, index);
-    else if (character === "'" || character === "\"" || character === "`") index = maskString(text, out, index);
-    else if (character === "/") index = maskRegexLiteral(text, out, index) ?? index + 1;
-    else index += 1;
-  }
-  return out.join("");
-}
-
 function buildDoc(file: DiffFile, side: Side): Doc {
   const lines: DocLine[] = [];
   const parts: string[] = [];
@@ -368,6 +276,17 @@ function buildDoc(file: DiffFile, side: Side): Doc {
     }
   });
   return { text: parts.join("\n"), lines };
+}
+
+/** A whole neighbour file reads as unchanged context, one document line per source line. */
+function contentDoc(content: string): Doc {
+  const lines: DocLine[] = [];
+  let offset = 0;
+  content.split("\n").forEach((text, index) => {
+    lines.push({ number: index + 1, origin: "context", text, start: offset });
+    offset += text.length + 1;
+  });
+  return { text: content, lines };
 }
 
 function lineAt(doc: Doc, offset: number): DocLine | undefined {
@@ -394,119 +313,17 @@ function specifierLineFor(doc: Doc, offset: number, side: Side): DocLine | undef
   return line;
 }
 
-function pushFromStatement(doc: Doc, mask: string, at: number, statements: Statement[]): boolean {
-  FROM_TAIL.lastIndex = at;
-  const match = FROM_TAIL.exec(mask);
-  if (!match || NESTED_KEYWORD.test(match[2]!)) return false;
-  const whole = match[0];
-  const open = whole.lastIndexOf(match[3]!, whole.length - 2);
-  if (open < 0) return false;
-  statements.push({
-    kind: match[1] === "export" ? "reexport" : "import",
-    specifier: doc.text.slice(at + open + 1, at + whole.length - 1),
-    typeOnly: /^\s*type\b/.test(match[2]!),
-    offset: at,
-    specifierOffset: at + open,
-  });
-  return true;
-}
-
-function pushBareImport(doc: Doc, mask: string, at: number, statements: Statement[]): void {
-  BARE_TAIL.lastIndex = at;
-  const match = BARE_TAIL.exec(mask);
-  if (!match) return;
-  const whole = match[0];
-  const open = whole.indexOf(match[1]!);
-  statements.push({
-    kind: "import",
-    specifier: doc.text.slice(at + open + 1, at + whole.length - 1),
-    typeOnly: false,
-    offset: at,
-    specifierOffset: at + open,
-  });
+function languageOf(path: string): LanguageId | undefined {
+  return languageForExtension(extensionOf(path));
 }
 
 /**
- * True when an import clause runs past the work bound before its module string,
- * which is a statement the scanner must report rather than silently drop.
- */
-function overlongClause(mask: string, at: number, keyword: string): boolean {
-  let index = at + keyword.length;
-  const stop = Math.min(mask.length, index + CLAUSE_SCAN);
-  while (index < stop && CLAUSE_CHARACTER.test(mask[index]!)) index += 1;
-  if (index - (at + keyword.length) <= CLAUSE_LIMIT) return false;
-  return mask[index] === "'" || mask[index] === "\"";
-}
-
-function scanStatementKeywords(doc: Doc, mask: string, statements: Statement[], overlong: number[]): void {
-  for (const keyword of mask.matchAll(STATEMENT_KEYWORD)) {
-    if (pushFromStatement(doc, mask, keyword.index, statements)) continue;
-    if (overlongClause(mask, keyword.index, keyword[1]!)) {
-      overlong.push(keyword.index);
-      continue;
-    }
-    pushBareImport(doc, mask, keyword.index, statements);
-  }
-}
-
-/** `shim . require("x")` and `shim ?. import("x")` are member calls, not module loads. */
-function memberCall(mask: string, at: number): boolean {
-  const cursor = skipBackWhitespace(mask, at - 1);
-  return cursor >= 0 && mask[cursor] === ".";
-}
-
-function scanCallStatements(doc: Doc, mask: string, statements: Statement[], nonLiteral: number[]): void {
-  for (const match of mask.matchAll(CALL_IMPORT)) {
-    if (memberCall(mask, match.index)) continue;
-    const start = match.index + match[0].length;
-    const quote = mask[start];
-    const close = quote === "'" || quote === "\"" ? mask.indexOf(quote, start + 1) : -1;
-    if (close < 0 || !/^\s*\)/.test(mask.slice(close + 1, close + 8))) {
-      nonLiteral.push(match.index);
-      continue;
-    }
-    statements.push({
-      kind: match[1] === "require" ? "require" : "dynamic-import",
-      specifier: doc.text.slice(start + 1, close),
-      typeOnly: false,
-      offset: match.index,
-      specifierOffset: start,
-    });
-  }
-}
-
-/** Lexical, non-executing scan of one reconstructed document side. */
-function scanDoc(doc: Doc): { statements: Statement[]; nonLiteral: number[]; overlong: number[] } {
-  const mask = maskLiterals(doc.text);
-  const statements: Statement[] = [];
-  const nonLiteral: number[] = [];
-  const overlong: number[] = [];
-  scanStatementKeywords(doc, mask, statements, overlong);
-  scanCallStatements(doc, mask, statements, nonLiteral);
-  return { statements, nonLiteral, overlong };
-}
-
-function candidatePaths(base: string): string[] {
-  const list = [base];
-  const extension = extensionOf(base);
-  for (const replacement of JS_TO_TS[extension] ?? []) {
-    list.push(`${base.slice(0, -extension.length)}${replacement}`);
-  }
-  if (!extension) {
-    for (const candidate of EXTENSIONLESS_CANDIDATES) list.push(`${base}${candidate}`);
-    for (const candidate of EXTENSIONLESS_CANDIDATES) list.push(`${base}/index${candidate}`);
-  }
-  return list;
-}
-
-/**
- * Candidate-path matching against the changed-file set only; no Node resolution,
+ * Candidate-path matching against the known file set only; no Node resolution,
  * no filesystem access. Old-side lookups consult pre-rename paths first because the
  * pre-change tree still held them; new-side lookups never do.
  */
-function resolveSpecifier(from: string, specifier: string, index: ResolutionIndex, side: Side): string | undefined {
-  const base = posix.normalize(posix.join(posix.dirname(from), specifier.replace(/\\/g, "/"))).replace(/\/+$/, "");
-  for (const candidate of candidatePaths(base)) {
+function lookup(paths: string[], index: ResolutionIndex, side: Side): string | undefined {
+  for (const candidate of paths) {
     const resolved = side === "old" ? index.previous.get(candidate) ?? index.current.get(candidate) : index.current.get(candidate);
     if (resolved) return resolved;
   }
@@ -519,13 +336,28 @@ function trimText(text: string): string {
   return clean.length > STRUCTURE_LIMITS.evidenceText ? clean.slice(0, STRUCTURE_LIMITS.evidenceText) : clean;
 }
 
-function omit(collector: Collector, omission: StructureOmission): void {
-  if (collector.omitted.some((existing) => existing.path === omission.path && existing.reason === omission.reason)) return;
+function omit(collector: Collector, omission: StructureOmission): StructureOmission | undefined {
+  if (collector.omitted.some((existing) => existing.path === omission.path && existing.reason === omission.reason)) return undefined;
   if (collector.omitted.length >= STRUCTURE_LIMITS.omittedRows) {
     collector.suppressed += 1;
-    return;
+    return undefined;
   }
   collector.omitted.push(omission);
+  return omission;
+}
+
+/** Withdraws a pending link's omission, including one the row cap had only counted. */
+function drop(collector: Collector, link: PendingLink): void {
+  if (link.suppressed) { collector.suppressed -= 1; return; }
+  if (!link.omission) return;
+  const index = collector.omitted.indexOf(link.omission);
+  if (index >= 0) collector.omitted.splice(index, 1);
+}
+
+function omitPending(collector: Collector, omission: StructureOmission): Pick<PendingLink, "omission" | "suppressed"> {
+  const before = collector.suppressed;
+  const created = omit(collector, omission);
+  return { ...(created ? { omission: created } : {}), suppressed: collector.suppressed > before };
 }
 
 function addEvidence(edge: StructureEdge, evidence: StructureEvidence[]): void {
@@ -550,46 +382,59 @@ function addEdge(collector: Collector, edge: StructureEdge, evidence: StructureE
   addEvidence(created, evidence);
 }
 
-function evidenceFor(file: StructureFile, doc: Doc, statement: Statement, specifier: DocLine): StructureEvidence[] {
+function evidenceFor(path: string, doc: Doc, statement: Statement, specifier: DocLine): StructureEvidence[] {
   const first = lineAt(doc, statement.offset);
   const lines = first && first.number !== specifier.number ? [first, specifier] : [specifier];
-  return lines.map((line) => ({ path: file.path, line: line.number, text: trimText(line.text) }));
+  return lines.map((line) => ({ path, line: line.number, text: trimText(line.text) }));
+}
+
+function addExternal(collector: Collector, path: string, name: string): void {
+  const bucket = collector.external.get(path) ?? new Set<string>();
+  bucket.add(name);
+  collector.external.set(path, bucket);
 }
 
 function recordStatement(
   collector: Collector, file: StructureFile, doc: Doc, side: Side,
-  statement: Statement, index: ResolutionIndex,
+  statement: Statement, index: ResolutionIndex, context: AnalysisContext, language: LanguageId,
 ): void {
   const specifier = specifierLineFor(doc, statement.specifierOffset, side);
   if (!specifier) return;
-  if (!statement.specifier.startsWith(".")) {
-    const bucket = collector.external.get(file.path) ?? new Set<string>();
-    bucket.add(statement.specifier);
-    collector.external.set(file.path, bucket);
-    return;
-  }
   const base = side === "old" ? file.renamedFrom ?? file.path : file.path;
-  const target = resolveSpecifier(base, statement.specifier, index, side);
-  if (!target) {
-    collector.unresolved = true;
-    omit(collector, { path: file.path, reason: trimText(
-      `specifier '${statement.specifier}' at line ${specifier.number} matches no changed file: no import data outside the changed set`) });
-    return;
+  const target = targetFor(language, base, statement, context.packageRoots);
+  if (target.kind === "external") return addExternal(collector, file.path, target.name);
+  if (target.kind === "package" && !context.neighbours) {
+    return addExternal(collector, file.path, statement.specifier);
   }
   const status = specifier.origin === "add" ? "added" : specifier.origin === "del" ? "removed" : "unchanged";
-  addEdge(collector, {
-    from: file.path, to: target, kind: statement.kind, typeOnly: statement.typeOnly,
-    status, specifier: statement.specifier, evidence: [],
-  }, evidenceFor(file, doc, statement, specifier));
+  const evidence = evidenceFor(file.path, doc, statement, specifier);
+  const resolved = target.kind === "candidates" ? lookup(target.paths, index, side) : undefined;
+  if (resolved) {
+    return addEdge(collector, {
+      from: file.path, to: resolved, kind: statement.kind, typeOnly: statement.typeOnly,
+      status, specifier: statement.specifier, evidence: [],
+    }, evidence);
+  }
+  /** A `package:` URI is only unresolved once a pubspec has named its package; until then it is external. */
+  if (target.kind === "package") {
+    collector.pending.push({ from: file.path, target, statement, status, evidence, suppressed: false, line: specifier.number });
+    return;
+  }
+  collector.unresolvedLinks += 1;
+  const omission = omitPending(collector, { path: file.path, reason: trimText(
+    `specifier '${statement.specifier}' at line ${specifier.number} matches no changed file: no import data outside the changed set`) });
+  if (context.neighbours) {
+    collector.pending.push({ from: file.path, target, statement, status, evidence, line: specifier.number, ...omission });
+  }
 }
 
 function analyzeSide(
   collector: Collector, file: StructureFile, diff: DiffFile, side: Side,
-  index: ResolutionIndex, budget: { left: number },
+  index: ResolutionIndex, budget: { left: number }, context: AnalysisContext, language: LanguageId,
 ): void {
   const doc = buildDoc(diff, side);
   if (!doc.text) return;
-  const { statements, nonLiteral, overlong } = scanDoc(doc);
+  const { statements, nonLiteral, overlong, unsupported } = scanFor(language, doc.text);
   const allowed = statements.slice(0, Math.max(0, budget.left));
   budget.left -= statements.length;
   if (budget.left < 0) {
@@ -597,7 +442,12 @@ function analyzeSide(
     omit(collector, { path: file.path, reason:
       `statement cap reached: expected at most ${STRUCTURE_LIMITS.statementsPerFile} import statements in this file, received more; later statements are not analyzed` });
   }
-  for (const statement of allowed) recordStatement(collector, file, doc, side, statement, index);
+  for (const statement of allowed) recordStatement(collector, file, doc, side, statement, index, context, language);
+  for (const note of unsupported) {
+    if (!specifierLineFor(doc, note.offset, side)) continue;
+    collector.unresolved = true;
+    omit(collector, { path: file.path, reason: trimText(note.reason) });
+  }
   for (const offset of nonLiteral) {
     const line = specifierLineFor(doc, offset, side);
     if (!line) continue;
@@ -625,7 +475,7 @@ function describeFile(diff: DiffFile): StructureFile {
     analyzed: false,
   };
   if (diff.binary) return { ...base, reason: "binary content: no import data" };
-  if (!ANALYZED_EXTENSIONS.includes(extension)) {
+  if (!languageForExtension(extension)) {
     return { ...base, reason: `unsupported file type '${extension || "none"}': no import data` };
   }
   if (!diff.hunks.length) return { ...base, reason: "no diff content for this file: no import data" };
@@ -704,6 +554,8 @@ function limitsOf(truncated: boolean, omitted: StructureOmission[]): StructureLi
   };
 }
 
+const NEIGHBOURS_OFF: StructureNeighbours = { state: "off", count: 0 };
+
 function emptySnapshot(input: InputSnapshot, reasons: string[]): StructureSnapshot {
   return {
     protocol: "rt/1",
@@ -712,6 +564,7 @@ function emptySnapshot(input: InputSnapshot, reasons: string[]): StructureSnapsh
     files: [],
     edges: [],
     limits: limitsOf(false, []),
+    neighbours: NEIGHBOURS_OFF,
   };
 }
 
@@ -724,25 +577,44 @@ function collectExternal(collector: Collector): void {
   }
 }
 
-function analyzeFiles(files: StructureFile[], diffs: Map<string, DiffFile>): Collector {
+/** Dart package names declared by a pubspec.yaml inside the changed set. */
+function pubspecRoots(diffs: Map<string, DiffFile>): Map<string, string> {
+  const roots = new Map<string, string>();
+  for (const [path, diff] of diffs) {
+    if (path !== "pubspec.yaml" && !path.endsWith("/pubspec.yaml")) continue;
+    const name = pubspecPackageName(buildDoc(diff, "new").text);
+    if (name) roots.set(name, posix.dirname(path));
+  }
+  return roots;
+}
+
+function indexOf(files: StructureFile[]): ResolutionIndex {
   const index: ResolutionIndex = { current: new Map(), previous: new Map() };
   for (const file of files) {
     index.current.set(file.path, file.path);
     if (file.renamedFrom) index.previous.set(file.renamedFrom, file.path);
   }
+  return index;
+}
+
+function analyzeFiles(
+  files: StructureFile[], diffs: Map<string, DiffFile>, neighbours: boolean,
+): { collector: Collector; index: ResolutionIndex } {
+  const index = indexOf(files);
   const collector: Collector = {
-    edges: new Map(), omitted: [], external: new Map(),
-    unresolved: false, truncated: false, suppressed: 0, droppedEdges: 0,
+    edges: new Map(), omitted: [], external: new Map(), pending: [], packageRoots: pubspecRoots(diffs),
+    unresolved: false, unresolvedLinks: 0, truncated: false, suppressed: 0, droppedEdges: 0,
   };
+  const context: AnalysisContext = { packageRoots: collector.packageRoots, neighbours };
   for (const file of files) {
     if (!file.analyzed) continue;
+    const language = languageOf(file.path)!;
     const diff = diffs.get(file.path)!;
     const budget = { left: STRUCTURE_LIMITS.statementsPerFile };
-    analyzeSide(collector, file, diff, "new", index, budget);
-    analyzeSide(collector, file, diff, "old", index, budget);
+    analyzeSide(collector, file, diff, "new", index, budget, context, language);
+    analyzeSide(collector, file, diff, "old", index, budget, context, language);
   }
-  collectExternal(collector);
-  return collector;
+  return { collector, index };
 }
 
 function sourceReasons(kind: InputSnapshot["kind"]): string[] {
@@ -770,24 +642,26 @@ function capOmissions(collector: Collector, parsed: ParsedDiff, kept: number): v
   }
 }
 
-/**
- * Builds the deterministic Structure snapshot for one immutable input snapshot.
- * Pure and lexical: no file reads, no child processes, no Git access, no execution.
- */
-export function buildStructureSnapshot(input: InputSnapshot): StructureSnapshot {
+function analyze(input: InputSnapshot, neighbours: boolean): { analysis: Analysis; index: ResolutionIndex } {
   const reasons = sourceReasons(input.kind);
-  if (input.kind === "paste") return emptySnapshot(input, reasons);
   const parsed = parseUnifiedDiff(input.content);
   reasons.push(...parsed.reasons);
   const files = parsed.files.map(describeFile).sort((left, right) => compareText(left.path, right.path));
-  const collector = analyzeFiles(files, new Map(parsed.files.map((file) => [displayPath(file), file] as const)));
+  const diffs = new Map(parsed.files.map((file) => [displayPath(file), file] as const));
+  const { collector, index } = analyzeFiles(files, diffs, neighbours);
+  return { analysis: { input, reasons, files, parsed, collector }, index };
+}
+
+function finish(analysis: Analysis, neighbours: StructureNeighbours): StructureSnapshot {
+  const { input, reasons, files, parsed, collector } = analysis;
   for (const edge of collector.edges.values()) {
     edge.evidence.sort((left, right) => left.line - right.line || compareText(left.path, right.path));
   }
   const edges = sortEdges(collapseModified([...collector.edges.values()]));
+  collectExternal(collector);
   capOmissions(collector, parsed, files.length);
   if (collector.truncated) reasons.push("bounded analysis: some changed files, statements, or connections exceed the resource caps and are omitted");
-  if (collector.unresolved) reasons.push("some specifiers match no changed file: no import data for those statements");
+  if (collector.unresolved || collector.unresolvedLinks > 0) reasons.push("some specifiers match no changed file: no import data for those statements");
   return {
     protocol: "rt/1",
     inputId: input.id,
@@ -795,7 +669,17 @@ export function buildStructureSnapshot(input: InputSnapshot): StructureSnapshot 
     files,
     edges,
     limits: limitsOf(collector.truncated, collector.omitted),
+    neighbours,
   };
+}
+
+/**
+ * Builds the deterministic Structure snapshot for one immutable input snapshot.
+ * Pure and lexical: no file reads, no child processes, no Git access, no execution.
+ */
+export function buildStructureSnapshot(input: InputSnapshot): StructureSnapshot {
+  if (input.kind === "paste") return emptySnapshot(input, sourceReasons(input.kind));
+  return finish(analyze(input, false).analysis, NEIGHBOURS_OFF);
 }
 
 /** Route-safe wrapper: a malformed input degrades to a partial snapshot instead of throwing. */
@@ -803,9 +687,170 @@ export function structureSnapshotFor(input: InputSnapshot): StructureSnapshot {
   try {
     return buildStructureSnapshot(input);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return emptySnapshot(input, [
-      `structure analysis failed: expected a parsable unified diff, received content this analyzer could not process (${message}); reload the source or switch to the Diff view`,
-    ]);
+    return failedSnapshot(input, error);
+  }
+}
+
+function failedSnapshot(input: InputSnapshot, error: unknown): StructureSnapshot {
+  const message = error instanceof Error ? error.message : String(error);
+  return emptySnapshot(input, [
+    `structure analysis failed: expected a parsable unified diff, received content this analyzer could not process (${message}); reload the source or switch to the Diff view`,
+  ]);
+}
+
+interface NeighbourState {
+  reader: NeighbourReader;
+  found: Map<string, string>;
+  index: ResolutionIndex;
+  analysis: Analysis;
+}
+
+/** Bounded ancestor directories of each importing file, repository root last. */
+function pubspecDirectories(links: PendingLink[]): string[] {
+  const seen = new Set<string>();
+  const directories: string[] = [];
+  for (const link of links) {
+    let directory = posix.dirname(link.from);
+    for (let depth = 0; depth < PUBSPEC_DEPTH && directory !== "." && directory !== "/"; depth += 1) {
+      if (!seen.has(directory)) { seen.add(directory); directories.push(directory); }
+      directory = posix.dirname(directory);
+    }
+  }
+  directories.push("");
+  return directories;
+}
+
+/** Reads the pubspec that names each deferred `package:` URI; absence is expected and silent. */
+async function loadPubspecs(state: NeighbourState): Promise<void> {
+  const collector = state.analysis.collector;
+  const links = collector.pending.filter((link) => link.target.kind === "package");
+  if (!links.length) return;
+  const wanted = new Set(links.map((link) => (link.target as { name: string }).name));
+  for (const directory of pubspecDirectories(links)) {
+    if ([...wanted].every((name) => collector.packageRoots.has(name))) return;
+    const content = await state.reader.support(posix.join(directory, "pubspec.yaml"));
+    const name = content === undefined ? undefined : pubspecPackageName(content);
+    if (name && !collector.packageRoots.has(name)) collector.packageRoots.set(name, directory);
+  }
+}
+
+function candidatesOf(link: PendingLink, packageRoots: Map<string, string>): string[] {
+  if (link.target.kind === "candidates") return link.target.paths;
+  if (link.target.kind !== "package") return [];
+  const root = packageRoots.get(link.target.name);
+  return root === undefined ? [] : [posix.join(root, "lib", link.target.path)];
+}
+
+function attachNeighbourFile(state: NeighbourState, path: string, content: string): void {
+  if (state.found.has(path)) return;
+  state.found.set(path, content);
+  state.index.current.set(path, path);
+  state.analysis.files.push({ path, status: "context", additions: 0, deletions: 0, analyzed: true });
+}
+
+function resolveLink(state: NeighbourState, link: PendingLink, to: string): void {
+  const collector = state.analysis.collector;
+  if (link.target.kind === "package") collector.unresolvedLinks += 1;
+  drop(collector, link);
+  collector.unresolvedLinks -= 1;
+  addEdge(collector, {
+    from: link.from, to, kind: link.statement.kind, typeOnly: link.statement.typeOnly,
+    status: link.status, specifier: link.statement.specifier, evidence: [],
+  }, link.evidence);
+}
+
+/**
+ * A deferred `package:` URI whose package no pubspec named is an external module,
+ * not a missing file; one whose package is known but whose file is absent is unresolved.
+ */
+function settlePackage(state: NeighbourState, link: PendingLink): void {
+  const collector = state.analysis.collector;
+  if (link.target.kind !== "package") return;
+  if (!collector.packageRoots.has(link.target.name)) {
+    return addExternal(collector, link.from, link.statement.specifier);
+  }
+  collector.unresolvedLinks += 1;
+  omit(collector, { path: link.from, reason: trimText(
+    `specifier '${link.statement.specifier}' at line ${link.line} matches no changed file: no import data outside the changed set`) });
+}
+
+async function resolvePending(state: NeighbourState): Promise<void> {
+  const collector = state.analysis.collector;
+  for (const link of collector.pending) {
+    const paths = candidatesOf(link, collector.packageRoots);
+    const known = paths.length ? lookup(paths, state.index, "new") : undefined;
+    if (known) {
+      resolveLink(state, link, known);
+      continue;
+    }
+    const read = paths.length ? await state.reader.find(paths) : undefined;
+    if (!read) {
+      settlePackage(state, link);
+      continue;
+    }
+    attachNeighbourFile(state, read.path, read.content);
+    resolveLink(state, link, read.path);
+  }
+}
+
+/** A neighbour's own outgoing connections, bounded to the already-known file set. */
+function analyzeNeighbour(state: NeighbourState, path: string, content: string): void {
+  const language = languageOf(path);
+  if (!language) return;
+  const collector = state.analysis.collector;
+  const doc = contentDoc(content);
+  const { statements } = scanFor(language, doc.text);
+  for (const statement of statements.slice(0, STRUCTURE_LIMITS.statementsPerFile)) {
+    const specifier = specifierLineFor(doc, statement.specifierOffset, "new");
+    if (!specifier) continue;
+    const target = targetFor(language, path, statement, collector.packageRoots);
+    if (target.kind !== "candidates") continue;
+    const resolved = lookup(target.paths, state.index, "new");
+    if (!resolved || resolved === path) continue;
+    addEdge(collector, {
+      from: path, to: resolved, kind: statement.kind, typeOnly: statement.typeOnly,
+      status: "unchanged", specifier: statement.specifier, evidence: [],
+    }, evidenceFor(path, doc, statement, specifier));
+  }
+}
+
+async function attachNeighbours(
+  analysis: Analysis, index: ResolutionIndex, source: NeighbourSource, request: NeighbourRequest,
+): Promise<StructureNeighbours> {
+  const state: NeighbourState = {
+    reader: new NeighbourReader({
+      execFile: request.execFile, cwd: request.cwd, prefix: source.prefix,
+      ...(request.now ? { now: request.now } : {}), ...(request.signal ? { signal: request.signal } : {}),
+      ...(request.deadline ? { deadline: request.deadline } : {}),
+    }),
+    found: new Map(), index, analysis,
+  };
+  await loadPubspecs(state);
+  await resolvePending(state);
+  for (const path of [...state.found.keys()].sort(compareText)) analyzeNeighbour(state, path, state.found.get(path)!);
+  for (const omission of state.reader.omissions) omit(analysis.collector, omission);
+  if (state.reader.truncated) analysis.collector.truncated = true;
+  analysis.files.sort((left, right) => compareText(left.path, right.path));
+  if (state.found.size && source.reason) analysis.reasons.push(source.reason);
+  return { state: "on", count: state.found.size };
+}
+
+/**
+ * Route-safe Structure snapshot with optional one-hop neighbours. Neighbour content
+ * is read only through Git, only for Git-based sources, and only within the caps.
+ */
+export async function structureSnapshotWithNeighbours(
+  input: InputSnapshot, request: NeighbourRequest,
+): Promise<StructureSnapshot> {
+  try {
+    if (!request.neighbours) return buildStructureSnapshot(input);
+    const source = neighbourSourceFor(input);
+    if ("unavailable" in source) {
+      return { ...buildStructureSnapshot(input), neighbours: { state: "unavailable", count: 0, reason: source.unavailable } };
+    }
+    const { analysis, index } = analyze(input, true);
+    return finish(analysis, await attachNeighbours(analysis, index, source, request));
+  } catch (error) {
+    return failedSnapshot(input, error);
   }
 }

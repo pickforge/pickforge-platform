@@ -51,11 +51,11 @@ color:var(--rose)}
 .ghost {
 background:transparent}
 .workbench {
-height:calc(100vh - var(--topbar-h));display:grid;grid-template-columns:minmax(0,1fr) clamp(320px,30vw,400px)}
+height:calc(100vh - var(--topbar-h));display:grid;grid-template-columns:minmax(0,1fr) clamp(320px,30vw,400px);transition:grid-template-columns 200ms ease}
 .workbench.rail-collapsed {
 grid-template-columns:minmax(0,1fr) 44px}
 .diff-pane {
-min-width:0;min-height:0;display:flex;flex-direction:column;border-right:1px solid var(--hairline)}
+min-width:0;min-height:0;display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--hairline)}
 .source-setup {
 min-height:0;max-height:100%;overflow:auto;flex:0 1 auto;margin:20px;border:1px solid var(--hairline-strong);border-radius:var(--radius-card);background:var(--surface-1);padding:20px}
 .source-setup[hidden] {
@@ -122,6 +122,8 @@ font:12px var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:no
 margin-left:auto;flex:none;font:12px var(--font-mono);font-variant-numeric:tabular-nums}
 .rows {
 min-width:0}
+.rows-chunk {
+content-visibility:auto;contain-intrinsic-block-size:auto 3000px}
 .diff-row {
 display:grid;grid-template-columns:52px 52px 24px minmax(0,1fr);min-height:25px;align-items:stretch;font:12.5px/25px var(--font-mono);position:relative}
 .diff-row.meta {
@@ -165,7 +167,7 @@ color:var(--text)}
 .code {
 white-space:pre-wrap;overflow-wrap:anywhere;padding:0 14px}
 .rail {
-min-height:0;overflow-y:auto;background:var(--surface-1)}
+position:relative;min-height:0;overflow:hidden auto;background:var(--surface-1)}
 .tutor {
 display:none;margin:8px 14px 16px;max-width:760px;border:1px solid var(--hairline-strong);border-radius:var(--radius-card);background:var(--surface-1);padding:16px 18px}
 .tutor.open {
@@ -173,17 +175,17 @@ display:block}
 .diff-pane>.tutor.open {
 min-height:0;max-height:100%;overflow:auto;flex:0 1 auto}
 .rail-head {
-display:flex;align-items:center;justify-content:space-between;gap:8px;padding:14px var(--rail-pad) 0}
+display:flex;align-items:center;gap:8px;padding:14px 44px 0 var(--rail-pad)}
 .rail-toggle {
-width:28px;min-height:28px;padding:0;border:0;background:transparent;color:var(--muted);font-size:14px}
+position:absolute;top:14px;right:8px;width:28px;min-height:28px;padding:0;border:0;background:transparent;color:var(--muted);font-size:14px}
 .rail-toggle:hover {
 color:var(--text)}
 .rail-collapsed .rail-head {
-flex-direction:column;justify-content:flex-start;gap:12px;padding:10px 0}
+justify-content:center;padding:50px 0 0}
 .rail-collapsed .rail-eyebrow {
 writing-mode:vertical-rl}
 .config-section {
-padding:14px var(--rail-pad) 28px}
+width:clamp(320px,30vw,400px);padding:14px var(--rail-pad) 28px}
 .config-section .field,.config-section .two {
 margin-bottom:var(--field-gap)}
 .config-actions {
@@ -523,9 +525,9 @@ display:block;position:fixed;inset:0;z-index:50;overflow-x:hidden;overflow-y:scr
 .rail-head {
 display:flex;padding:0;flex-direction:row}
 .rail-toggle {
-width:auto;min-height:44px;padding:0 14px}
+position:static;width:auto;min-height:44px;padding:0 14px}
 .config-section {
-padding:16px 0 28px}
+width:auto;padding:16px 0 28px}
 .config-actions button {
 min-height:44px}
 .tutor.open {

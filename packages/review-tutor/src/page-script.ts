@@ -88,6 +88,9 @@ export const pageScript = String.raw`
   const MAX_SELECTED_BYTES = 16 * 1024;
   const MAX_CONTEXT_BYTES = 32 * 1024;
   const MOBILE_BREAKPOINT = 860;
+  const RAIL_TRANSITION_MS = 200;
+  const COLLAPSED_RAIL_WIDTH = 44;
+  const ROWS_PER_CHUNK = 120;
   const encoder = new TextEncoder();
   function readQuizEntryIds() {
     try {
@@ -531,6 +534,10 @@ export const pageScript = String.raw`
       const code = document.createElement("span");
       code.className = "evidence-code";
       code.textContent = evidence.line + "  " + evidence.text;
+      item.append(code);
+      evidenceList.append(item);
+      // Evidence inside an unchanged neighbour has no diff row to land on, so it gets no actions.
+      if (!files.some((file) => file.path === evidence.path)) return;
       const open = document.createElement("button");
       open.type = "button";
       open.className = "ghost open-in-diff";
@@ -544,8 +551,7 @@ export const pageScript = String.raw`
         const targetIndex = tutorEvidenceIndex(edge, evidenceIndex);
         jumpToEvidence(edge.evidence[targetIndex], edge.status, targetIndex, edge.evidence, true);
       });
-      item.append(code, askTutor, open);
-      evidenceList.append(item);
+      item.append(askTutor, open);
     });
     row.addEventListener("click", () => {
       const expanded = row.getAttribute("aria-expanded") === "true";
@@ -1559,12 +1565,19 @@ export const pageScript = String.raw`
       rows.className = "rows";
       rows.setAttribute("role", "group");
       rows.setAttribute("aria-label", file.path + " selectable lines");
+      // Rows are grouped into chunks that skip layout while off-screen, so large diffs stay cheap to resize and scroll.
+      let chunk = null;
       file.lines.forEach((data, rowIndex) => {
+        if (rowIndex % ROWS_PER_CHUNK === 0) {
+          chunk = document.createElement("div");
+          chunk.className = "rows-chunk";
+          rows.append(chunk);
+        }
         const row = document.createElement("div");
         row.className = "diff-row " + data.kind;
         if (data.kind === "hunk" || data.kind === "meta") {
           row.textContent = data.text;
-          rows.append(row);
+          chunk.append(row);
           return;
         }
         row.dataset.file = String(fileIndex);
@@ -1596,7 +1609,7 @@ export const pageScript = String.raw`
           ),
           makeSpan("code", data.text),
         );
-        rows.append(row);
+        chunk.append(row);
       });
       rows.addEventListener("pointerdown", (event) => {
         const row = event.target.closest(".diff-row[data-row]");
@@ -2330,8 +2343,20 @@ export const pageScript = String.raw`
     if (innerWidth <= MOBILE_BREAKPOINT) { closeConfig(); return; }
     railCollapsed = !railCollapsed;
     sessionStorage.setItem("reviewTutorRailCollapsed", railCollapsed ? "1" : "0");
+    holdDiffWidth();
     applyRail();
   });
+  // While the rail width transitions, the diff holds its final width so its rows lay out once, not every frame.
+  function holdDiffWidth() {
+    if (typeof matchMedia !== "function" || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const scroll = element("diff-scroll");
+    scroll.style.width = "";
+    const width = scroll.getBoundingClientRect().width;
+    const railWidth = document.querySelector(".rail").getBoundingClientRect().width;
+    scroll.style.width = (railCollapsed ? width + railWidth - COLLAPSED_RAIL_WIDTH : width) + "px";
+    clearTimeout(holdDiffWidth.timer);
+    holdDiffWidth.timer = setTimeout(() => { scroll.style.width = ""; }, RAIL_TRANSITION_MS + 20);
+  }
   element("jump-log").addEventListener("click", () => {
     if (innerWidth <= MOBILE_BREAKPOINT) closeConfig(false);
     setView("log", true);

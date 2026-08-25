@@ -290,7 +290,7 @@ describe("Review Tutor composed page", () => {
     expect(pageHtml).toContain("@media(max-width:860px)");
     expect(pageHtml).toContain(".diff-pane {\nmin-width:0;min-height:0;");
     expect(pageHtml).toContain(".toolbar select {\nwidth:auto;flex:1 1 120px;min-width:120px;max-width:280px}");
-    expect(pageHtml).toContain(".rail {\nmin-height:0;overflow-y:auto;");
+    expect(pageHtml).toContain(".rail {\nposition:relative;min-height:0;overflow:hidden auto;");
     expect(pageHtml).toContain('role="region" aria-labelledby="tutor-title"');
     expect(pageHtml).toContain(".diff-pane>.tutor.open");
     expect(pageHtml).toContain("max-height:100%;overflow:auto");
@@ -1181,6 +1181,31 @@ describe("Review Tutor composed page", () => {
     expect(document.querySelectorAll(".diff-row.structure-landing")).toHaveLength(0);
   });
 
+  it("offers no diff actions on evidence that lives in an unchanged neighbour", async () => {
+    const withNeighbour = {
+      ...structure,
+      neighbours: { state: "on", count: 1 },
+      files: [...structure.files, { path: "src/ctx.ts", status: "context", additions: 0, deletions: 0, analyzed: true }],
+      edges: [
+        ...structure.edges,
+        { from: "src/ctx.ts", to: "src/a.ts", kind: "import", typeOnly: false, status: "unchanged", specifier: "./a.js", evidence: [{ path: "src/ctx.ts", line: 3, text: "import { a } from './a.js';" }] },
+      ],
+    };
+    const { document } = await boot({ structureResponses: [withNeighbour] });
+    byId(document, "view-structure").click();
+    await flush();
+    const rows = [...document.querySelectorAll(".connection-row")] as any[];
+    const contextRow = rows.find((row) => row.querySelector(".connection-target")?.textContent === "src/a.ts" && row.closest("[data-path='src/ctx.ts']"))
+      ?? rows.find((row) => byId(document, row.getAttribute("aria-controls")).textContent?.includes("import { a } from './a.js';"));
+    expect(contextRow).toBeDefined();
+    const evidence = byId(document, contextRow.getAttribute("aria-controls"));
+    expect(evidence.querySelector(".evidence-code")?.textContent).toBe("3  import { a } from './a.js';");
+    expect(evidence.querySelector(".ask-tutor-evidence")).toBeNull();
+    expect(evidence.querySelector(".open-in-diff")).toBeNull();
+    const changedRow = rows.find((row) => byId(document, row.getAttribute("aria-controls")).textContent?.includes("import type { a }"));
+    expect(byId(document, changedRow.getAttribute("aria-controls")).querySelector(".ask-tutor-evidence")).not.toBeNull();
+  });
+
   it("asks from graph evidence through the existing list selection path", async () => {
     const { document } = await boot();
     byId(document, "view-structure").click();
@@ -1438,9 +1463,9 @@ describe("Review Tutor composed page", () => {
 
     byId(document, "view-structure").click();
     rows[1].click();
-    (rows[1].nextElementSibling.querySelector(".open-in-diff") as any).click();
-    expect(byId(document, "structure-section").hidden).toBe(false);
-    expect(byId(document, "lifecycle").textContent).toBe("not-rendered.ts is not in the diff view.");
+    expect(rows[1].nextElementSibling.querySelector(".evidence-code")).not.toBeNull();
+    expect(rows[1].nextElementSibling.querySelector(".open-in-diff")).toBeNull();
+    expect(rows[1].nextElementSibling.querySelector(".ask-tutor-evidence")).toBeNull();
   });
 
   it("uses touch targets and compact chips without making structure heads sticky", async () => {
@@ -1625,6 +1650,21 @@ describe("Review Tutor composed page", () => {
     expect(byId(document, "answer-text").textContent).toBe("");
     expect(byId(document, "answer").hidden).toBe(true);
     expect(byId(document, "history-pager").hidden).toBe(true);
+  });
+
+  it("animates the rail width cheaply: off-screen rows skip layout and rail text never rewraps", async () => {
+    const { document } = await boot();
+    const css = document.querySelector("style")?.textContent ?? "";
+    expect(css).toContain("transition:grid-template-columns 200ms ease");
+    expect(css).toContain(".rows-chunk {\ncontent-visibility:auto;contain-intrinsic-block-size:auto 3000px}");
+    expect(document.querySelectorAll(".rows-chunk .diff-row").length).toBe(document.querySelectorAll(".diff-row").length);
+    expect(css).toContain(".rail {\nposition:relative;min-height:0;overflow:hidden auto;");
+    expect(css).toContain(".config-section {\nwidth:clamp(320px,30vw,400px);");
+    expect(css).toContain(".rail-toggle {\nposition:absolute;top:14px;right:8px;");
+    byId(document, "toggle-rail").click();
+    expect(document.querySelector(".workbench")?.classList.contains("rail-collapsed")).toBe(true);
+    byId(document, "toggle-rail").click();
+    expect(document.querySelector(".workbench")?.classList.contains("rail-collapsed")).toBe(false);
   });
 
   it("opens mobile configuration as the sole dialog and restores the desktop collapse preference", async () => {

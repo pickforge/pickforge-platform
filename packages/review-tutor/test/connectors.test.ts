@@ -98,6 +98,11 @@ describe("connector failure boundary", () => {
     ["token=value", "[redacted]"],
     ["ghp_abcdefgh", "[redacted]"],
     ["gho_abcdefgh", "[redacted]"],
+    ["url: https://provider.invalid/path", "[redacted]"],
+    ["cf-ray: ray_fixture", "[redacted]"],
+    ["request id: req_fixture", "[redacted]"],
+    ["thread_id: thread_fixture", "[redacted]"],
+    ["thread id thread_fixture", "[redacted]"],
   ])("redacts %s", (input, expected) => {
     expect(redact(input)).toBe(expected);
   });

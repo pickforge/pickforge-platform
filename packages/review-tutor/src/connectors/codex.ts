@@ -55,21 +55,10 @@ function versionAtLeast(version: readonly number[]): boolean {
   return true;
 }
 
-function validReasoningLevels(value: unknown): boolean {
-  return value === undefined || (Array.isArray(value)
-    && value.every((level) => level && typeof level === "object"
-      && typeof (level as { effort?: unknown }).effort === "string"));
-}
-
-function validModel(value: unknown): value is CodexModel {
+function validListedModel(value: unknown): value is CodexModel & { slug: string; visibility: "list" } {
   if (!value || typeof value !== "object") return false;
   const model = value as CodexModel;
-  return typeof model.slug === "string"
-    && typeof model.visibility === "string"
-    && typeof model.priority === "number"
-    && Number.isFinite(model.priority)
-    && (model.display_name === undefined || typeof model.display_name === "string")
-    && validReasoningLevels(model.supported_reasoning_levels);
+  return typeof model.slug === "string" && model.visibility === "list";
 }
 
 function parseModels(value: string): CodexModel[] {
@@ -79,27 +68,41 @@ function parseModels(value: string): CodexModel[] {
     : parsed && typeof parsed === "object" && Array.isArray((parsed as { models?: unknown }).models)
       ? (parsed as { models: unknown[] }).models
       : undefined;
-  if (!models || !models.every(validModel)) throw new Error("invalid catalog");
-  return models;
+  if (!models) throw new Error("invalid catalog");
+  const listed = models.filter(validListedModel);
+  if (listed.length === 0) throw new Error("invalid catalog");
+  return listed;
+}
+
+function priority(model: CodexModel): number {
+  return typeof model.priority === "number" && Number.isFinite(model.priority)
+    ? model.priority
+    : Number.POSITIVE_INFINITY;
 }
 
 function modelChoices(models: CodexModel[]) {
   return models
-    .filter((model) => model.visibility === "list")
-    .sort((left, right) => (left.priority as number) - (right.priority as number)
+    .sort((left, right) => priority(left) - priority(right)
       || (left.slug as string).localeCompare(right.slug as string))
-    .map((model) => {
+    .flatMap((model) => {
       const slug = model.slug as string;
       const levels = model.supported_reasoning_levels === undefined
         ? FALLBACK_LEVELS
-        : (model.supported_reasoning_levels as Array<{ effort: string }>)
-          .map(({ effort }) => effort)
-          .filter((effort) => effort !== "max" && effort !== "ultra");
-      return {
+        : Array.isArray(model.supported_reasoning_levels)
+          ? model.supported_reasoning_levels
+            .flatMap((level) => level && typeof level === "object"
+              && typeof (level as { effort?: unknown }).effort === "string"
+              ? [(level as { effort: string }).effort]
+              : [])
+            .filter((effort) => effort !== "max"
+              && effort !== "ultra"
+              && /^[a-z][a-z0-9_-]*$/.test(effort))
+          : [];
+      return levels.length === 0 ? [] : [{
         id: `codex:${slug}`,
-        label: (model.display_name as string | undefined) || slug,
+        label: typeof model.display_name === "string" && model.display_name || slug,
         thinkingLevels: [...levels],
-      };
+      }];
     });
 }
 
@@ -139,7 +142,6 @@ export class CodexConnector implements HarnessConnector {
   readonly id = "codex" as const;
   readonly label = "Codex";
   readonly envKeys = ["CODEX_HOME"] as const;
-  private answer?: string;
   private completed = false;
   private lastError?: string;
   private model = "unknown";
@@ -148,11 +150,13 @@ export class CodexConnector implements HarnessConnector {
     const execFile = deps.execFile ?? defaultExecFile;
     let versionOutput: string;
     try {
-      ({ stdout: versionOutput } = await execFile("codex", ["--version"], {
-        encoding: "utf8",
+      const options = {
+        encoding: "utf8" as const,
         maxBuffer: MAX_CATALOG_BYTES,
+        signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
         timeout: DISCOVERY_TIMEOUT_MS,
-      }));
+      };
+      ({ stdout: versionOutput } = await execFile("codex", ["--version"], options));
     } catch (error) {
       return (error as NodeJS.ErrnoException).code === "ENOENT"
         ? { available: false, reason: "Codex is not installed (codex not found on PATH)." }
@@ -171,11 +175,13 @@ export class CodexConnector implements HarnessConnector {
       };
     }
     try {
-      const { stdout } = await execFile("codex", ["debug", "models"], {
-        encoding: "utf8",
+      const options = {
+        encoding: "utf8" as const,
         maxBuffer: MAX_CATALOG_BYTES,
+        signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
         timeout: DISCOVERY_TIMEOUT_MS,
-      });
+      };
+      const { stdout } = await execFile("codex", ["debug", "models"], options);
       return { available: true, version: versionLabel, models: modelChoices(parseModels(stdout)) };
     } catch {
       return { available: false, reason: "Codex could not list its models." };
@@ -183,9 +189,6 @@ export class CodexConnector implements HarnessConnector {
   }
 
   spawnSpec(request: ConnectorRequest): SpawnSpec {
-    this.answer = undefined;
-    this.completed = false;
-    this.lastError = undefined;
     this.model = request.model;
     return {
       command: "codex",
@@ -205,8 +208,8 @@ export class CodexConnector implements HarnessConnector {
     if (event.type === "item.completed"
       && event.item?.type === "agent_message"
       && typeof event.item.text === "string") {
-      this.answer = event.item.text;
       sink.delta(event.item.text);
+      sink.final(event.item.text);
       return;
     }
     if (event.type === "error" && typeof event.message === "string") {
@@ -223,18 +226,23 @@ export class CodexConnector implements HarnessConnector {
       this.completed = true;
       const usage = numericUsage(event.usage);
       if (usage) sink.usage(usage);
-      sink.final(this.answer ?? "");
     }
   }
 
   finish(sink: ParseSink): ParsedAnswer {
-    if (!this.completed) {
-      if (this.lastError) throw providerMessage(this.lastError, this.model);
-      throw new ConnectorError("Codex exited without completing the turn.");
+    try {
+      if (!this.completed) {
+        if (this.lastError) throw providerMessage(this.lastError, this.model);
+        throw new ConnectorError("Codex exited without completing the turn.");
+      }
+      if (!sink.answer?.trim()) {
+        throw new ConnectorError("Codex returned an empty answer.");
+      }
+      return { answer: sink.answer, ...(sink.answerUsage ? { usage: sink.answerUsage } : {}) };
+    } finally {
+      this.completed = false;
+      this.lastError = undefined;
+      this.model = "unknown";
     }
-    if (!this.answer?.trim()) {
-      throw new ConnectorError("Codex returned an empty answer.");
-    }
-    return { answer: this.answer, ...(sink.answerUsage ? { usage: sink.answerUsage } : {}) };
   }
 }

@@ -24,6 +24,7 @@ const piModels = [{ id: "provider/model", label: "Model", thinkingLevels: ["low"
 function fakeDiscovery(outputs: Record<string, string | Error>): DiscoveryDeps {
   return {
     piModels,
+    which: async () => undefined,
     execFile: vi.fn(async (_file, args) => {
       const key = args.join(" ");
       const output = outputs[key];
@@ -128,11 +129,13 @@ describe("Codex discovery", () => {
     expect(deps.execFile).toHaveBeenNthCalledWith(1, "codex", ["--version"], {
       encoding: "utf8",
       maxBuffer: 1024 * 1024,
+      signal: expect.any(AbortSignal),
       timeout: 10_000,
     });
     expect(deps.execFile).toHaveBeenNthCalledWith(2, "codex", ["debug", "models"], {
       encoding: "utf8",
       maxBuffer: 1024 * 1024,
+      signal: expect.any(AbortSignal),
       timeout: 10_000,
     });
     expect(deps.execFile).toHaveBeenCalledTimes(2);
@@ -149,7 +152,73 @@ describe("Codex discovery", () => {
     ]) });
   });
 
-  it.each(["not json", new Error("timed out")])("reports malformed or failing catalogs as unavailable", async (failure) => {
+  it("keeps valid listed models while skipping malformed entries and sorting absent priorities last", async () => {
+    const mixed = JSON.stringify({ models: [
+      null,
+      { slug: 42, visibility: "list", priority: 1 },
+      { slug: "hidden", visibility: "hidden", priority: 0 },
+      { slug: "z-last", visibility: "list" },
+      { slug: "first", visibility: "list", priority: 2 },
+      { slug: "a-last", visibility: "list", priority: Number.NaN },
+    ] });
+    const connector = new CodexConnector();
+    await expect(connector.discover(fakeDiscovery({
+      "--version": "codex-cli 0.147.0\n",
+      "debug models": mixed,
+    }))).resolves.toEqual({
+      available: true,
+      version: "0.147.0",
+      models: [
+        { id: "codex:first", label: "first", thinkingLevels: ["low", "medium", "high"] },
+        { id: "codex:a-last", label: "a-last", thinkingLevels: ["low", "medium", "high"] },
+        { id: "codex:z-last", label: "z-last", thinkingLevels: ["low", "medium", "high"] },
+      ],
+    });
+  });
+
+  it("excludes models with no safe usable thinking levels", async () => {
+    const levels = JSON.stringify({ models: [
+      { slug: "only-prohibited", visibility: "list", supported_reasoning_levels: [
+        { effort: "max" }, { effort: "ultra" },
+      ] },
+      { slug: "empty", visibility: "list", supported_reasoning_levels: [] },
+      { slug: "unsafe", visibility: "list", supported_reasoning_levels: [
+        { effort: "low\"" }, { effort: "x\ny" },
+      ] },
+      { slug: "safe", visibility: "list", supported_reasoning_levels: [
+        { effort: "low" }, { effort: "xhigh" }, { effort: "medium-fast" },
+      ] },
+    ] });
+    const connector = new CodexConnector();
+    await expect(connector.discover(fakeDiscovery({
+      "--version": "codex-cli 0.147.0\n",
+      "debug models": levels,
+    }))).resolves.toMatchObject({ models: [{
+      id: "codex:safe",
+      thinkingLevels: ["low", "xhigh", "medium-fast"],
+    }] });
+  });
+
+  it("keeps a valid catalog available when all listed models have no usable levels", async () => {
+    const connector = new CodexConnector();
+    await expect(connector.discover(fakeDiscovery({
+      "--version": "codex-cli 0.147.0\n",
+      "debug models": JSON.stringify({ models: [
+        { slug: "only-prohibited", visibility: "list", supported_reasoning_levels: [
+          { effort: "max" }, { effort: "ultra" },
+        ] },
+        { slug: "empty", visibility: "list", supported_reasoning_levels: [] },
+      ] }),
+    }))).resolves.toEqual({ available: true, version: "0.147.0", models: [] });
+  });
+
+  it.each([
+    "not json",
+    JSON.stringify({ models: "not an array" }),
+    JSON.stringify({ models: [] }),
+    JSON.stringify({ models: [{ slug: 42, visibility: "list" }] }),
+    new Error("timed out"),
+  ])("reports malformed or failing catalogs as unavailable", async (failure) => {
     const connector = new CodexConnector();
     await expect(connector.discover(fakeDiscovery({
       "--version": "codex-cli 0.147.0\n",
@@ -220,6 +289,7 @@ describe("Codex parsing", () => {
     expect(() => connector.finish(output)).toThrow(
       "Codex is not logged in. Run `codex login`, then ask again.",
     );
+    expect(() => connector.finish(sink())).toThrow("Codex exited without completing the turn.");
   });
 
   it("strips provider internals from fallback errors", () => {
@@ -291,6 +361,27 @@ describe("Codex runner integration", () => {
     expect(terminate).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps answers per run on a shared connector", async () => {
+    const connector = new CodexConnector();
+    const firstChild = new FakeChild();
+    const secondChild = new FakeChild();
+    const children = [firstChild, secondChild];
+    const runner = new TutorRunner({ spawn: () => children.shift() as never });
+
+    const first = runner.run({ ...request, connector }, () => {});
+    firstChild.stdout.end(`${JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", text: "first" },
+    })}\n${JSON.stringify({ type: "turn.completed" })}\n`);
+    firstChild.emit("close", 0, null);
+    await expect(first).resolves.toEqual({ answer: "first" });
+
+    const second = runner.run({ ...request, connector }, () => {});
+    secondChild.stdout.end(`${JSON.stringify({ type: "turn.completed" })}\n`);
+    secondChild.emit("close", 0, null);
+    await expect(second).rejects.toThrow("Codex returned an empty answer.");
+  });
+
   it("redacts Codex stderr failures", async () => {
     const child = new FakeChild();
     const connector = new CodexConnector();
@@ -317,7 +408,7 @@ describe("Codex registry", () => {
       }).execFile,
     });
     expect(off.connectors().map(({ id }) => id)).toEqual(["pi"]);
-    expect(on.connectors().map(({ id }) => id)).toEqual(["pi", "codex"]);
+    expect(on.connectors().map(({ id }) => id)).toEqual(["pi", "claude-code", "codex"]);
     const discoveries = await on.discoveries();
     expect(discoveries.find(({ connector }) => connector.id === "codex")).toEqual({
       connector: on.byId("codex"),

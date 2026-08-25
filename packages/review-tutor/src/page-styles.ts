@@ -290,6 +290,40 @@ position:fixed;top:calc(var(--topbar-h) + 10px);left:50%;translate:-50% 0;z-inde
 display:none}
 .structure-section {
 contain:layout;min-width:0;padding:14px 14px 100px;overflow-x:hidden}
+.structure-mode-switch {
+width:max-content;margin:0 0 10px}
+#structure-graph {
+max-width:100%;overflow-x:auto;overflow-y:hidden}
+.structure-graph-svg {
+display:block;max-width:none}
+.structure-graph-node,.structure-graph-edge {
+cursor:pointer}
+.structure-graph-node rect {
+fill:var(--surface-1);stroke:var(--hairline);stroke-width:1}
+.structure-graph-node text {
+fill:currentColor;font:12px var(--font-mono)}
+.structure-graph-node.status-added,.structure-graph-edge.status-added,.structure-graph-marker.status-added {
+color:var(--green)}
+.structure-graph-node.status-removed,.structure-graph-edge.status-removed,.structure-graph-marker.status-removed {
+color:var(--rose)}
+.structure-graph-node.status-modified,.structure-graph-edge.status-modified,.structure-graph-marker.status-modified {
+color:var(--amber)}
+.structure-graph-node.status-unchanged,.structure-graph-node.status-renamed,.structure-graph-edge.status-unchanged,.structure-graph-marker.status-unchanged {
+color:var(--muted)}
+.structure-graph-marker.status-selected {
+color:var(--ember)}
+.structure-graph-edge .structure-graph-line {
+stroke:currentColor;stroke-width:1;vector-effect:non-scaling-stroke}
+.structure-graph-edge.status-removed .structure-graph-line {
+stroke-dasharray:4 3}
+.structure-graph-edge.type-only {
+opacity:.7}
+.structure-graph-marker path {
+fill:currentColor}
+.structure-graph-node.graph-selected rect,.structure-graph-edge.graph-selected .structure-graph-line {
+stroke:var(--ember);stroke-width:2}
+.structure-graph-evidence {
+margin-top:12px;border-top:1px solid var(--hairline)}
 .structure-comparison {
 margin:0 0 10px;color:var(--subtle);font:12px var(--font-mono)}
 .structure-partial {

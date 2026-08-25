@@ -73,7 +73,9 @@ export const pageScript = String.raw`
     structureInputId = null,
     structureStatus = "idle",
     structureRequestSequence = 0,
-    selectedConnection = null;
+    structureMode = readStructureMode(),
+    selectedConnection = null,
+    graphSelection = null;
   const learningBadgeGroups = new Map();
   const foreignActiveIds = new Set();
   let railCollapsed = sessionStorage.getItem("reviewTutorRailCollapsed") === "1";
@@ -379,6 +381,13 @@ export const pageScript = String.raw`
   function structureStatusLabel(status) {
     return status === "modified" ? "edited" : status;
   }
+  function readStructureMode() {
+    try {
+      return sessionStorage.getItem("reviewTutorStructureMode") === "graph" ? "graph" : "list";
+    } catch {
+      return "list";
+    }
+  }
   function structureKindLabel(kind) {
     return kind === "reexport" ? "re-export" : kind === "dynamic-import" ? "dynamic" : kind;
   }
@@ -389,7 +398,12 @@ export const pageScript = String.raw`
     structureInputId = null;
     structureStatus = "idle";
     selectedConnection = null;
+    graphSelection = null;
+    element("structure-mode-switch").hidden = true;
+    element("structure-shared").replaceChildren();
     element("structure-content").replaceChildren();
+    element("structure-graph").replaceChildren();
+    element("structure-graph-evidence")?.remove();
   }
   function clearStructureLanding() {
     document.querySelector(".diff-row.structure-landing")?.classList.remove("structure-landing");
@@ -437,10 +451,371 @@ export const pageScript = String.raw`
     row?.scrollIntoView({ block: "center" });
     control?.focus({ preventScroll: true });
   }
+  function createConnectionRow(edge, key, options = {}) {
+    const evidenceId = "connection-evidence-" + key;
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "connection-row";
+    row.dataset.status = edge.status;
+    row.setAttribute("aria-expanded", String(!!options.expanded));
+    row.setAttribute("aria-controls", evidenceId);
+    row.append(
+      makeSpan("connection-kind", structureKindLabel(edge.kind)),
+      makeSpan("connection-target", edge.to),
+    );
+    if (edge.typeOnly) row.append(makeSpan("connection-type", "type"));
+    row.append(makeSpan("connection-status status-chip status-" + edge.status, structureStatusLabel(edge.status)));
+    const evidenceList = document.createElement("ul");
+    evidenceList.id = evidenceId;
+    evidenceList.className = "connection-evidence";
+    evidenceList.hidden = !options.expanded;
+    edge.evidence.forEach((evidence, evidenceIndex) => {
+      const item = document.createElement("li");
+      const code = document.createElement("span");
+      code.className = "evidence-code";
+      code.textContent = evidence.line + "  " + evidence.text;
+      const open = document.createElement("button");
+      open.type = "button";
+      open.className = "ghost open-in-diff";
+      open.textContent = "Open in Diff";
+      open.addEventListener("click", () => jumpToEvidence(evidence, edge.status, evidenceIndex, edge.evidence));
+      item.append(code, open);
+      evidenceList.append(item);
+    });
+    row.addEventListener("click", () => {
+      const expanded = row.getAttribute("aria-expanded") === "true";
+      if (options.listSelection) {
+        if (selectedConnection && selectedConnection !== row) {
+          selectedConnection.classList.remove("selected");
+          selectedConnection.setAttribute("aria-expanded", "false");
+          element(selectedConnection.getAttribute("aria-controls")).hidden = true;
+        }
+        selectedConnection = row;
+        row.classList.add("selected");
+      }
+      row.setAttribute("aria-expanded", String(!expanded));
+      evidenceList.hidden = expanded;
+    });
+    return { row, evidenceList };
+  }
+  function graphTextOrder(left, right) {
+    return left < right ? -1 : left > right ? 1 : 0;
+  }
+  function graphPathOrder(left, right) {
+    const leftSlash = left.lastIndexOf("/");
+    const rightSlash = right.lastIndexOf("/");
+    const directory = graphTextOrder(left.slice(0, Math.max(0, leftSlash)), right.slice(0, Math.max(0, rightSlash)));
+    return directory || graphTextOrder(left, right);
+  }
+  function graphLabel(path) {
+    return path.length <= 40 ? path : path.slice(0, 19) + "…" + path.slice(-20);
+  }
+  function graphNumber(value) {
+    return String(Math.round(value * 100) / 100);
+  }
+  function graphPath(points) {
+    return points.map((point, index) => (index ? "L" : "M") + graphNumber(point.x) + " " + graphNumber(point.y)).join(" ");
+  }
+  function layoutStructureGraph(snapshot) {
+    const endpoints = new Set(snapshot.edges.flatMap((edge) => [edge.from, edge.to]));
+    const filesByPath = new Map(snapshot.files.filter((file) => file.analyzed && endpoints.has(file.path)).map((file) => [file.path, file]));
+    const paths = [...filesByPath.keys()].sort(graphPathOrder);
+    const edges = snapshot.edges
+      .filter((edge) => filesByPath.has(edge.from) && filesByPath.has(edge.to))
+      .map((edge, index) => ({ ...edge, graphIndex: index }))
+      .sort((left, right) => graphTextOrder(left.from, right.from) || graphTextOrder(left.to, right.to) || graphTextOrder(left.kind, right.kind) || left.graphIndex - right.graphIndex);
+    if (!paths.length) return { nodes: [], edges, width: 0, height: 0, coordinates: "" };
+    const adjacency = new Map(paths.map((path) => [path, []]));
+    const retained = [];
+    function reaches(start, target) {
+      const pending = [start], seen = new Set();
+      while (pending.length) {
+        const path = pending.pop();
+        if (path === target) return true;
+        if (seen.has(path)) continue;
+        seen.add(path);
+        pending.push(...adjacency.get(path));
+      }
+      return false;
+    }
+    // Layout edges are considered by path order; rejecting an edge that closes a cycle removes the back-edge whose from path is lexicographically later.
+    for (const edge of edges) {
+      if (reaches(edge.to, edge.from)) continue;
+      adjacency.get(edge.from).push(edge.to);
+      adjacency.get(edge.from).sort(graphTextOrder);
+      retained.push(edge);
+    }
+    const incoming = new Map(paths.map((path) => [path, 0]));
+    for (const edge of retained) incoming.set(edge.to, incoming.get(edge.to) + 1);
+    const layers = new Map(paths.map((path) => [path, 0]));
+    const pending = paths.filter((path) => incoming.get(path) === 0).sort(graphTextOrder);
+    while (pending.length) {
+      const path = pending.shift();
+      for (const target of adjacency.get(path)) {
+        layers.set(target, Math.max(layers.get(target), layers.get(path) + 1));
+        incoming.set(target, incoming.get(target) - 1);
+        if (incoming.get(target) === 0) {
+          pending.push(target);
+          pending.sort(graphTextOrder);
+        }
+      }
+    }
+    const NODE_HEIGHT = 28, COLUMN_GAP = 72, ROW_GAP = 12, CH_WIDTH = 7.2, HORIZONTAL_PADDING = 20, OUTER_PADDING = 12;
+    const layerPaths = [];
+    for (const path of paths) {
+      const layer = layers.get(path);
+      if (!layerPaths[layer]) layerPaths[layer] = [];
+      layerPaths[layer].push(path);
+    }
+    layerPaths.forEach((items) => items.sort(graphPathOrder));
+    const positions = new Map();
+    let x = OUTER_PADDING;
+    for (let layer = 0; layer < layerPaths.length; layer++) {
+      const items = layerPaths[layer] || [];
+      const widths = items.map((path) => Math.round((graphLabel(path).length * CH_WIDTH + HORIZONTAL_PADDING) * 10) / 10);
+      const columnWidth = Math.max(...widths);
+      items.forEach((path, row) => positions.set(path, {
+        path,
+        file: filesByPath.get(path),
+        label: graphLabel(path),
+        layer,
+        x,
+        y: OUTER_PADDING + row * (NODE_HEIGHT + ROW_GAP),
+        width: widths[row],
+        height: NODE_HEIGHT,
+      }));
+      x += columnWidth + COLUMN_GAP;
+    }
+    const nodes = [...positions.values()].sort((left, right) => left.layer - right.layer || graphPathOrder(left.path, right.path));
+    const drawingBottom = Math.max(...nodes.map((node) => node.y + node.height)) + OUTER_PADDING;
+    const layerBounds = new Map();
+    for (const node of nodes) {
+      const bounds = layerBounds.get(node.layer) || { x: node.x, right: node.x + node.width, bottom: 0 };
+      bounds.x = Math.min(bounds.x, node.x);
+      bounds.right = Math.max(bounds.right, node.x + node.width);
+      bounds.bottom = Math.max(bounds.bottom, node.y + node.height);
+      layerBounds.set(node.layer, bounds);
+    }
+    const routeKinds = new Map(), portGroups = new Map(), ports = new Map();
+    function addPort(key, edge, endpoint) {
+      const group = portGroups.get(key) || [];
+      group.push({ edge, endpoint });
+      portGroups.set(key, group);
+    }
+    for (const edge of edges) {
+      const from = positions.get(edge.from), to = positions.get(edge.to);
+      const route = to.layer <= from.layer ? "back" : to.layer - from.layer > 1 ? "long" : "adjacent";
+      routeKinds.set(edge, route);
+      addPort("out:right:" + edge.from, edge, "from");
+      addPort("in:" + (route === "back" ? "right:" : "left:") + edge.to, edge, "to");
+    }
+    for (const group of portGroups.values())
+      group.forEach(({ edge, endpoint }, index) => {
+        const port = ports.get(edge) || { from: 0, to: 0 };
+        port[endpoint] = (index - (group.length - 1) / 2) * 6;
+        ports.set(edge, port);
+      });
+    const longEdgeLanes = new Map(), backEdges = [];
+    const routedEdges = edges.map((edge) => {
+      const from = positions.get(edge.from), to = positions.get(edge.to), port = ports.get(edge), route = routeKinds.get(edge);
+      const fromY = from.y + from.height / 2 + port.from, toY = to.y + to.height / 2 + port.to;
+      if (route === "long") {
+        const points = [{ x: from.x + from.width, y: fromY }];
+        for (let layer = from.layer + 1; layer < to.layer; layer++) {
+          const bounds = layerBounds.get(layer), lane = longEdgeLanes.get(layer) || 0;
+          const y = bounds.bottom + ROW_GAP / 2 + lane * ROW_GAP;
+          longEdgeLanes.set(layer, lane + 1);
+          points.push({ x: bounds.x, y }, { x: bounds.right, y });
+        }
+        points.push({ x: to.x, y: toY });
+        return { ...edge, route, points };
+      }
+      if (route === "back") {
+        const lane = backEdges.length;
+        backEdges.push(edge);
+        const y = drawingBottom + ROW_GAP * (1 + lane);
+        const fromGutter = layerBounds.get(from.layer).right + COLUMN_GAP / 2;
+        const toGutter = layerBounds.get(to.layer).right + COLUMN_GAP / 2;
+        return { ...edge, route, points: [
+          { x: from.x + from.width, y: fromY },
+          { x: fromGutter, y: fromY },
+          { x: fromGutter, y },
+          { x: toGutter, y },
+          { x: toGutter, y: toY },
+          { x: to.x + to.width, y: toY },
+        ] };
+      }
+      return { ...edge, route, points: [
+        { x: from.x + from.width, y: fromY },
+        { x: to.x, y: toY },
+      ] };
+    });
+    const width = Math.max(
+      ...nodes.map((node) => node.x + node.width),
+      ...layerBounds.values().map((bounds) => bounds.right + COLUMN_GAP / 2),
+    ) + OUTER_PADDING;
+    const routeBottom = Math.max(drawingBottom, ...routedEdges.flatMap((edge) => edge.points.map((point) => point.y)));
+    const height = routeBottom + OUTER_PADDING;
+    const coordinates = nodes.map((node) => [node.path, node.layer, node.x, node.y, node.width, node.height].join("@")).join("|");
+    return { nodes, edges: routedEdges, width, height, coordinates };
+  }
+  function renderGraphEvidence(edges, expand) {
+    const graph = element("structure-graph");
+    element("structure-graph-evidence")?.remove();
+    if (!edges.length) return;
+    const panel = document.createElement("div");
+    panel.id = "structure-graph-evidence";
+    panel.className = "connection-list structure-graph-evidence";
+    edges.forEach((edge, index) => {
+      const rendered = createConnectionRow(edge, "graph-" + index, { expanded: expand });
+      panel.append(rendered.row, rendered.evidenceList);
+    });
+    graph.after(panel);
+  }
+  function clearGraphSelection(restoreFocus = false) {
+    graphSelection = null;
+    element("structure-graph")?.querySelectorAll(".structure-graph-edge.graph-selected .structure-graph-line").forEach((path) =>
+      path.setAttribute("marker-end", "url(#structure-arrow-" + path.dataset.marker + ")"));
+    element("structure-graph")?.querySelectorAll(".graph-selected").forEach((node) => node.classList.remove("graph-selected"));
+    element("structure-graph-evidence")?.remove();
+    if (restoreFocus) element("structure-mode-graph").focus();
+  }
+  function selectGraphItem(type, item, control) {
+    clearGraphSelection();
+    graphSelection = { type, item };
+    control.classList.add("graph-selected");
+    if (type === "edge") {
+      control.querySelector(".structure-graph-line").setAttribute("marker-end", "url(#structure-arrow-selected)");
+      renderGraphEvidence([item], true);
+      announce(item.from + " to " + item.to + " connection selected.");
+    } else {
+      const outgoing = structureSnapshot.edges.filter((edge) => edge.from === item.path).sort((left, right) => graphTextOrder(left.to, right.to) || graphTextOrder(left.kind, right.kind));
+      renderGraphEvidence(outgoing, false);
+      announce(item.path + ", " + structureStatusLabel(item.file.status) + " selected.");
+    }
+  }
+  function graphControlEvents(control, type, item) {
+    control.addEventListener("click", () => selectGraphItem(type, item, control));
+    control.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        clearGraphSelection(true);
+        announce("Selection cleared.");
+        event.preventDefault();
+      } else if (event.key === "Enter" || event.key === " ") {
+        selectGraphItem(type, item, control);
+        event.preventDefault();
+      }
+    });
+  }
+  function renderStructureGraph(snapshot) {
+    const container = element("structure-graph");
+    container.replaceChildren();
+    const layout = layoutStructureGraph(snapshot);
+    if (layout.nodes.length > 60 || layout.edges.length > 200) {
+      const note = document.createElement("p");
+      note.className = "empty";
+      note.textContent = "Graph is too large for this view (" + layout.nodes.length + " files, " + layout.edges.length + " connections). Use the list.";
+      container.append(note);
+      return;
+    }
+    if (!layout.nodes.length) {
+      const empty = document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = "No connections to draw.";
+      container.append(empty);
+      return;
+    }
+    const NS = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(NS, "svg");
+    svg.classList.add("structure-graph-svg");
+    svg.setAttribute("role", "group");
+    svg.setAttribute("aria-label", "Structure graph, " + layout.nodes.length + " files, " + layout.edges.length + " connections");
+    svg.setAttribute("viewBox", "0 0 " + layout.width + " " + layout.height);
+    svg.setAttribute("width", String(layout.width));
+    svg.setAttribute("height", String(layout.height));
+    svg.dataset.layout = layout.coordinates;
+    const defs = document.createElementNS(NS, "defs");
+    for (const status of ["added", "removed", "modified", "unchanged", "selected"]) {
+      const marker = document.createElementNS(NS, "marker");
+      marker.id = "structure-arrow-" + status;
+      marker.classList.add("structure-graph-marker", "status-" + status);
+      marker.setAttribute("viewBox", "0 0 6 6");
+      marker.setAttribute("refX", "5");
+      marker.setAttribute("refY", "3");
+      marker.setAttribute("markerWidth", "5");
+      marker.setAttribute("markerHeight", "5");
+      marker.setAttribute("orient", "auto");
+      const arrow = document.createElementNS(NS, "path");
+      arrow.setAttribute("d", "M0 0 L6 3 L0 6 Z");
+      marker.append(arrow);
+      defs.append(marker);
+    }
+    svg.append(defs);
+    for (const node of layout.nodes) {
+      const group = document.createElementNS(NS, "g");
+      group.classList.add("structure-graph-node", "status-" + node.file.status);
+      group.dataset.path = node.path;
+      group.dataset.layer = String(node.layer);
+      group.setAttribute("tabindex", "0");
+      group.setAttribute("role", "button");
+      group.setAttribute("aria-label", node.path + ", " + structureStatusLabel(node.file.status));
+      const rect = document.createElementNS(NS, "rect");
+      rect.setAttribute("x", String(node.x));
+      rect.setAttribute("y", String(node.y));
+      rect.setAttribute("width", String(node.width));
+      rect.setAttribute("height", String(node.height));
+      rect.setAttribute("rx", "5");
+      const label = document.createElementNS(NS, "text");
+      label.setAttribute("x", String(node.x + 10));
+      label.setAttribute("y", String(node.y + 18));
+      label.textContent = node.label;
+      if (node.path.length > 40) {
+        const title = document.createElementNS(NS, "title");
+        title.textContent = node.path;
+        group.append(title);
+      }
+      group.append(rect, label);
+      graphControlEvents(group, "node", node);
+      svg.append(group);
+    }
+    for (const edge of layout.edges) {
+      const group = document.createElementNS(NS, "g");
+      group.classList.add("structure-graph-edge", "status-" + edge.status);
+      if (edge.typeOnly) group.classList.add("type-only");
+      group.dataset.from = edge.from;
+      group.dataset.to = edge.to;
+      group.dataset.status = edge.status;
+      group.setAttribute("tabindex", "0");
+      group.setAttribute("role", "button");
+      group.setAttribute("aria-label", edge.from + " → " + edge.to + ", " + structureKindLabel(edge.kind) + ", " + structureStatusLabel(edge.status));
+      const d = graphPath(edge.points);
+      const hit = document.createElementNS(NS, "path");
+      hit.classList.add("structure-graph-hit");
+      hit.setAttribute("d", d);
+      hit.setAttribute("style", "fill:none;stroke:transparent;stroke-width:14;pointer-events:stroke");
+      const path = document.createElementNS(NS, "path");
+      path.classList.add("structure-graph-line");
+      path.dataset.marker = edge.status;
+      path.setAttribute("d", d);
+      path.setAttribute("fill", "none");
+      path.setAttribute("marker-end", "url(#structure-arrow-" + edge.status + ")");
+      group.append(hit, path);
+      graphControlEvents(group, "edge", edge);
+      svg.append(group);
+    }
+    container.append(svg);
+  }
   function renderStructure() {
     selectedConnection = null;
-    const container = element("structure-content");
+    graphSelection = null;
+    const shared = element("structure-shared"), container = element("structure-content"), graph = element("structure-graph"), modeSwitch = element("structure-mode-switch");
+    shared.replaceChildren();
     container.replaceChildren();
+    graph.replaceChildren();
+    element("structure-graph-evidence")?.remove();
+    modeSwitch.hidden = true;
+    container.hidden = false;
+    graph.hidden = true;
     if (!currentSource || structureStatus === "loading") {
       const empty = document.createElement("p");
       empty.className = "empty";
@@ -470,11 +845,17 @@ export const pageScript = String.raw`
     }
     if (!structureSnapshot) return;
     const snapshot = structureSnapshot;
+    modeSwitch.hidden = false;
+    for (const mode of ["list", "graph"]) {
+      const tab = element("structure-mode-" + mode), selected = mode === structureMode;
+      tab.setAttribute("aria-selected", String(selected));
+      tab.tabIndex = selected ? 0 : -1;
+    }
     const comparison = document.createElement("p");
     comparison.id = "structure-comparison";
     comparison.className = "structure-comparison";
     comparison.textContent = snapshot.comparison.from + " → " + snapshot.comparison.to;
-    container.append(comparison);
+    shared.append(comparison);
     const disclosureItems = [
       ...snapshot.comparison.reasons.map((reason) => ({ reason })),
       ...snapshot.limits.omitted,
@@ -496,7 +877,7 @@ export const pageScript = String.raw`
       }
       details.append(summary, reasons);
       notice.append(sentence, details);
-      container.append(notice);
+      shared.append(notice);
     }
     if (!snapshot.edges.length)
       container.append(makeSpan("structure-zero", "No connections among changed files. Unchanged neighbours are outside this view."));
@@ -524,54 +905,17 @@ export const pageScript = String.raw`
       const list = document.createElement("div");
       list.className = "connection-list";
       connections.forEach((edge, edgeIndex) => {
-        const key = fileIndex + "-" + edgeIndex;
-        const evidenceId = "connection-evidence-" + key;
-        const row = document.createElement("button");
-        row.type = "button";
-        row.className = "connection-row";
-        row.dataset.status = edge.status;
-        row.setAttribute("aria-expanded", "false");
-        row.setAttribute("aria-controls", evidenceId);
-        row.append(
-          makeSpan("connection-kind", structureKindLabel(edge.kind)),
-          makeSpan("connection-target", edge.to),
-        );
-        if (edge.typeOnly) row.append(makeSpan("connection-type", "type"));
-        row.append(makeSpan("connection-status status-chip status-" + edge.status, structureStatusLabel(edge.status)));
-        const evidenceList = document.createElement("ul");
-        evidenceList.id = evidenceId;
-        evidenceList.className = "connection-evidence";
-        evidenceList.hidden = true;
-        edge.evidence.forEach((evidence, evidenceIndex) => {
-          const item = document.createElement("li");
-          const code = document.createElement("span");
-          code.className = "evidence-code";
-          code.textContent = evidence.line + "  " + evidence.text;
-          const open = document.createElement("button");
-          open.type = "button";
-          open.className = "ghost open-in-diff";
-          open.textContent = "Open in Diff";
-          open.addEventListener("click", () => jumpToEvidence(evidence, edge.status, evidenceIndex, edge.evidence));
-          item.append(code, open);
-          evidenceList.append(item);
-        });
-        row.addEventListener("click", () => {
-          const expanded = row.getAttribute("aria-expanded") === "true";
-          if (selectedConnection && selectedConnection !== row) {
-            selectedConnection.classList.remove("selected");
-            selectedConnection.setAttribute("aria-expanded", "false");
-            element(selectedConnection.getAttribute("aria-controls")).hidden = true;
-          }
-          selectedConnection = row;
-          row.classList.add("selected");
-          row.setAttribute("aria-expanded", String(!expanded));
-          evidenceList.hidden = expanded;
-        });
-        list.append(row, evidenceList);
+        const rendered = createConnectionRow(edge, fileIndex + "-" + edgeIndex, { listSelection: true });
+        list.append(rendered.row, rendered.evidenceList);
       });
       if (connections.length) group.append(list);
       container.append(group);
     });
+    if (structureMode === "graph") {
+      container.hidden = true;
+      graph.hidden = false;
+      renderStructureGraph(snapshot);
+    }
   }
   function ensureStructure() {
     if (!currentSource) {
@@ -608,6 +952,23 @@ export const pageScript = String.raw`
       renderStructure();
       announce("Structure analysis failed: " + structureError);
     });
+  }
+  function setStructureMode(mode) {
+    structureMode = mode === "graph" ? "graph" : "list";
+    try { sessionStorage.setItem("reviewTutorStructureMode", structureMode); } catch {}
+    renderStructure();
+    announce(structureMode === "graph" ? "Structure graph mode." : "Structure list mode.");
+  }
+  function handleStructureModeKey(event) {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End", "Enter", " "].includes(event.key)) return;
+    const tabs = [element("structure-mode-list"), element("structure-mode-graph")];
+    if (event.key === "Enter" || event.key === " ") setStructureMode(event.currentTarget.id.endsWith("graph") ? "graph" : "list");
+    else {
+      const target = event.key === "ArrowLeft" || event.key === "Home" ? tabs[0] : tabs[1];
+      tabs.forEach((tab) => { tab.tabIndex = tab === target ? 0 : -1; });
+      target.focus();
+    }
+    event.preventDefault();
   }
   function setView(view, focusPanel = false) {
     activeView = ["diff", "structure", "log"].includes(view) ? view : "diff";
@@ -1778,6 +2139,11 @@ export const pageScript = String.raw`
   for (const id of ["view-diff", "view-structure", "view-log"]) {
     element(id).addEventListener("click", () => setView(id.replace("view-", "")));
     element(id).addEventListener("keydown", handleViewKey);
+  }
+  for (const mode of ["list", "graph"]) {
+    const tab = element("structure-mode-" + mode);
+    tab.addEventListener("click", () => setStructureMode(mode));
+    tab.addEventListener("keydown", handleStructureModeKey);
   }
   element("history-previous").addEventListener("click", () => renderHistoryEntry(Math.max(0, historyIndex - 1)));
   element("history-next").addEventListener("click", () => renderHistoryEntry(Math.min(historyEntries.length - 1, historyIndex + 1)));

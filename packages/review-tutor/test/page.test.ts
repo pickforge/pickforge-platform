@@ -25,12 +25,32 @@ const source = {
   ].join("\n"),
 };
 
+const piModels = [{ id: "model-1", label: "Model One", thinkingLevels: ["low"] }];
+
 const state = {
   protocol: "rt/1",
   input: source,
-  models: [{ id: "model-1", label: "Model One", thinkingLevels: ["low"] }],
+  models: piModels,
+  harnesses: [{ id: "pi", label: "Pi", available: true, models: piModels }],
   questions: [],
 };
+
+const claudeModels = [
+  { id: "claude-code:sonnet", label: "Sonnet", thinkingLevels: ["low", "high"] },
+  { id: "claude-code:opus", label: "Opus", thinkingLevels: ["medium"] },
+];
+
+const threeHarnesses = [
+  state.harnesses[0],
+  { id: "claude-code", label: "Claude Code", available: true, models: claudeModels },
+  { id: "codex", label: "Codex", available: true, models: [{ id: "codex:gpt", label: "GPT", thinkingLevels: ["low", "high"] }] },
+];
+
+const unavailableHarnesses = [
+  state.harnesses[0],
+  { id: "claude-code", label: "Claude Code", available: false, models: [], reason: "Claude Code is not installed (claude not found on PATH)." },
+  { id: "codex", label: "Codex", available: false, models: [], reason: "Codex 0.120.0 is too old; version 0.140.0 or newer is required." },
+];
 
 const structure = {
   protocol: "rt/1",
@@ -111,6 +131,27 @@ function structureResponse(value: Promise<Response> | Response | unknown | Error
   return value instanceof Promise || value instanceof Response ? value : json(value);
 }
 
+function seedStorage(window: Window, options: {
+  storedPageId?: string;
+  storedQuizIds?: string;
+  storedStructureMode?: string;
+  storedStructureNeighbours?: string;
+  storedHarness?: string;
+  storedModelByHarness?: string;
+  railCollapsed?: boolean;
+}) {
+  const seeds: Array<[string, string | undefined]> = [
+    ["reviewTutorPageId", options.storedPageId],
+    ["reviewTutorQuizEntryIds", options.storedQuizIds],
+    ["reviewTutorStructureMode", options.storedStructureMode],
+    ["reviewTutorStructureNeighbours", options.storedStructureNeighbours],
+    ["reviewTutorHarness", options.storedHarness],
+    ["reviewTutorModelByHarness", options.storedModelByHarness],
+    ["reviewTutorRailCollapsed", options.railCollapsed ? "1" : undefined],
+  ];
+  for (const [key, value] of seeds) if (value !== undefined) window.sessionStorage.setItem(key, value);
+}
+
 function blockStructureStorageReads(window: Window, options: { throwStructureModeRead?: boolean; throwStructureNeighboursRead?: boolean }) {
   if (!options.throwStructureModeRead && !options.throwStructureNeighboursRead) return;
   const getItem = window.sessionStorage.getItem.bind(window.sessionStorage);
@@ -134,6 +175,9 @@ async function boot(options: {
   throwStructureModeRead?: boolean;
   storedStructureNeighbours?: string;
   throwStructureNeighboursRead?: boolean;
+  harnesses?: unknown[];
+  storedHarness?: string;
+  storedModelByHarness?: string;
   stateResponses?: unknown[];
   structureResponses?: Array<Promise<Response> | Response | unknown | Error>;
   failHeartbeat?: boolean;
@@ -142,11 +186,7 @@ async function boot(options: {
   FakeEventSource.instances = [];
   const window = new Window({ url: "http://127.0.0.1:43123/?session=secret-token" });
   Object.defineProperty(window, "innerWidth", { value: options.width ?? 1440, writable: true, configurable: true });
-  if (options.storedPageId !== undefined) window.sessionStorage.setItem("reviewTutorPageId", options.storedPageId);
-  if (options.storedQuizIds !== undefined) window.sessionStorage.setItem("reviewTutorQuizEntryIds", options.storedQuizIds);
-  if (options.storedStructureMode !== undefined) window.sessionStorage.setItem("reviewTutorStructureMode", options.storedStructureMode);
-  if (options.storedStructureNeighbours !== undefined) window.sessionStorage.setItem("reviewTutorStructureNeighbours", options.storedStructureNeighbours);
-  if (options.railCollapsed) window.sessionStorage.setItem("reviewTutorRailCollapsed", "1");
+  seedStorage(window, options);
   blockStructureStorageReads(window, options);
   const script = pageHtml.match(/<script>([\s\S]*?)<\/script>/)?.[1];
   if (!script) throw new Error("Inline page script was not composed");
@@ -159,7 +199,11 @@ async function boot(options: {
   const stateResponses = [...(options.stateResponses ?? [])];
   const logResponses = [...(options.logResponses ?? [])];
   const structureResponses = [...(options.structureResponses ?? [structure])];
-  const bootState = { ...state, input: options.source ?? source };
+  const bootState = {
+    ...state,
+    input: options.source ?? source,
+    ...(options.harnesses ? { harnesses: options.harnesses } : {}),
+  };
   const fetch = vi.fn(async (path: string, init?: RequestInit) => {
     requests.push({ path, init });
     if (path === "/api/state") return stateResponse(stateResponses.shift() ?? bootState);
@@ -403,6 +447,110 @@ describe("Review Tutor composed page", () => {
     expect(byId(document, "view-diff").getAttribute("aria-selected")).toBe("true");
     expect(byId(document, "view-log").getAttribute("aria-selected")).toBe("false");
     expect(Array.from(byId(document, "harness").options).map((item: any) => [item.value, item.textContent])).toEqual([["pi", "Pi"]]);
+  });
+
+  function options(document: TestDocument, id: string) {
+    return Array.from(byId(document, id).options).map((item: any) => [item.value, item.textContent]);
+  }
+
+  it("keeps the single-harness rendering when only Pi is connected", async () => {
+    const { document } = await boot();
+    expect(options(document, "harness")).toEqual([["pi", "Pi"]]);
+    expect(byId(document, "harness-helper").textContent).toBe("Pi is the only connected harness.");
+    expect(byId(document, "harness").getAttribute("aria-describedby")).toBe("harness-helper");
+    expect(options(document, "model")).toEqual([["model-1", "Model One"]]);
+    expect(options(document, "thinking")).toEqual([["low", "low"]]);
+    expect(byId(document, "thinking").value).toBe("low");
+  });
+
+  it("lists every available harness with Pi first and counts them in the helper", async () => {
+    const { document } = await boot({ harnesses: threeHarnesses });
+    expect(options(document, "harness")).toEqual([["pi", "Pi"], ["claude-code", "Claude Code"], ["codex", "Codex"]]);
+    expect(byId(document, "harness").value).toBe("pi");
+    expect(byId(document, "harness-helper").textContent).toBe("3 harnesses available.");
+    expect(options(document, "model")).toEqual([["model-1", "Model One"]]);
+  });
+
+  it("hides unavailable harnesses and explains each one once", async () => {
+    const { document } = await boot({ harnesses: unavailableHarnesses });
+    expect(options(document, "harness")).toEqual([["pi", "Pi"]]);
+    expect(byId(document, "harness-helper").textContent).toBe(
+      "Claude Code is not installed (claude not found on PATH)."
+        + " Codex 0.120.0 is too old; version 0.140.0 or newer is required."
+        + " Restart Pi to re-discover.",
+    );
+    expect(document.querySelectorAll("#harness option[disabled]")).toHaveLength(0);
+  });
+
+  it("refills model and thinking per harness, remembers the choice, and announces the switch", async () => {
+    const { window, document } = await boot({ harnesses: threeHarnesses });
+    input(document, "harness", "claude-code");
+    expect(options(document, "model")).toEqual([["claude-code:sonnet", "Sonnet"], ["claude-code:opus", "Opus"]]);
+    expect(byId(document, "model").value).toBe("claude-code:sonnet");
+    expect(options(document, "thinking")).toEqual([["low", "low"], ["high", "high"]]);
+    expect(byId(document, "lifecycle").textContent).toBe("Harness: Claude Code");
+
+    input(document, "thinking", "high");
+    input(document, "harness", "codex");
+    expect(byId(document, "model").value).toBe("codex:gpt");
+    expect(byId(document, "thinking").value).toBe("high");
+
+    input(document, "harness", "claude-code");
+    input(document, "model", "claude-code:opus");
+    expect(options(document, "thinking")).toEqual([["medium", "medium"]]);
+
+    input(document, "harness", "pi");
+    expect(byId(document, "model").value).toBe("model-1");
+    expect(byId(document, "thinking").value).toBe("low");
+
+    input(document, "harness", "claude-code");
+    expect(byId(document, "model").value).toBe("claude-code:opus");
+    expect(JSON.parse(window.sessionStorage.getItem("reviewTutorModelByHarness")!)).toEqual({
+      "claude-code": "claude-code:opus",
+      codex: "codex:gpt",
+      pi: "model-1",
+    });
+    expect(window.sessionStorage.getItem("reviewTutorHarness")).toBe("claude-code");
+  });
+
+  it("restores the remembered harness on reload and falls back when it is gone", async () => {
+    const stored = JSON.stringify({ "claude-code": "claude-code:opus" });
+    const restored = await boot({ harnesses: threeHarnesses, storedHarness: "claude-code", storedModelByHarness: stored });
+    expect(byId(restored.document, "harness").value).toBe("claude-code");
+    expect(byId(restored.document, "model").value).toBe("claude-code:opus");
+    expect(byId(restored.document, "thinking").value).toBe("medium");
+
+    const fallback = await boot({ harnesses: unavailableHarnesses, storedHarness: "claude-code", storedModelByHarness: stored });
+    expect(byId(fallback.document, "harness").value).toBe("pi");
+    expect(byId(fallback.document, "model").value).toBe("model-1");
+  });
+
+  it("submits only the selected harness's model and keeps the answer identity it started with", async () => {
+    const { document, requests, events } = await boot({ harnesses: threeHarnesses });
+    input(document, "harness", "claude-code");
+    input(document, "model", "claude-code:opus");
+    input(document, "question", "Explain this");
+    byId(document, "ask").click();
+    await flush();
+    const payload = JSON.parse(requests.find((request) => request.path === "/api/ask")?.init?.body as string);
+    expect(payload.modelId).toBe("claude-code:opus");
+    expect(payload.thinkingLevel).toBe("medium");
+    expect(payload).not.toHaveProperty("harness");
+    expect(byId(document, "answer-attribution").textContent).toBe("Claude Code · Opus");
+
+    events?.emit("question", { id: "q-1", state: "running", answer: "" });
+    input(document, "harness", "pi");
+    expect(byId(document, "answer-attribution").textContent).toBe("Claude Code · Opus");
+  });
+
+  it("attributes learning log entries to their harness and model", async () => {
+    const entry = {
+      id: "entry-attribution", inputId: source.id, source, selection: { text: "" },
+      question: "Saved", answer: "Answer", modelId: "model-1", preferences: {}, note: "", reviewLater: false,
+      createdAt: new Date().toISOString(),
+    };
+    const { document } = await boot({ harnesses: threeHarnesses, entries: [entry] });
+    expect(document.querySelector(".log-entry .metadata")?.textContent).toContain("Pi · Model One");
   });
 
   it("adds Structure to the peer tablist with roving keyboard focus", async () => {

@@ -244,6 +244,10 @@ margin-top:12px;padding-top:10px;border-top:1px solid var(--hairline)}
 display:flex;align-items:center;gap:8px;margin-bottom:8px}
 .answer-label {
 display:block;font:600 10px var(--font-mono);letter-spacing:.18em;text-transform:uppercase;color:var(--muted)}
+.answer-attribution {
+font:11px var(--font-mono);color:var(--subtle)}
+.answer-attribution:empty {
+display:none}
 .history-pager {
 display:flex;align-items:center;gap:5px;margin-left:auto;color:var(--muted);font:10px var(--font-mono)}
 .history-pager button {

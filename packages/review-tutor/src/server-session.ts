@@ -24,7 +24,7 @@ interface SessionOptions {
   canonicalRepo: string;
   registry: ConnectorRegistry;
   models: ModelChoice[];
-  harnesses: Array<{ id: string; label: string; available: boolean; reason?: string }>;
+  harnesses: Array<{ id: string; label: string; available: boolean; models: ModelChoice[]; reason?: string }>;
   execFile: ExecFile;
 }
 

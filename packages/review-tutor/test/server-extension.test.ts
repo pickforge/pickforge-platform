@@ -331,14 +331,17 @@ describe("connector protocol boundary", () => {
     try {
       const state = await (await call(server.port, server.token, "/api/state")).json() as {
         models: Array<{ id: string }>;
-        harnesses: Array<{ id: string; available: boolean; reason?: string }>;
+        harnesses: Array<{ id: string; available: boolean; models: Array<{ id: string }>; reason?: string }>;
       };
       expect(state.harnesses).toContainEqual({
         id: "claude-code",
         label: "Claude Code",
         available: false,
+        models: [],
         reason: "Claude Code is not installed (claude not found on PATH).",
       });
+      expect(state.harnesses.find((harness) => harness.id === "pi")?.models.map((model) => model.id))
+        .toEqual(["pi:provider/model"]);
       expect(state.models.some((model) => model.id.startsWith("claude-code:"))).toBe(false);
     } finally {
       await server.close();
@@ -350,13 +353,13 @@ describe("connector protocol boundary", () => {
     try {
       const state = await (await call(server.port, server.token, "/api/state")).json() as {
         models: Array<{ id: string }>;
-        harnesses: Array<{ id: string; label: string; available: boolean }>;
+        harnesses: Array<{ id: string; label: string; available: boolean; models: Array<{ id: string }> }>;
       };
       expect(state.models.map((model) => model.id)).toEqual([
         "pi:provider/model",
         "pi:ollama/qwen3:8b",
       ]);
-      expect(state.harnesses).toEqual([{ id: "pi", label: "Pi", available: true }]);
+      expect(state.harnesses).toEqual([{ id: "pi", label: "Pi", available: true, models: state.models }]);
 
       const source = await loadSource(server.port, server.token);
       expect((await ask(server.port, server.token, source.id)).status).toBe(202);

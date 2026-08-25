@@ -55,9 +55,9 @@ describe("connector registry", () => {
     }
   });
 
-  it("registers Claude Code only when the connector flag is on", () => {
+  it("registers optional connectors only when the flag is on", () => {
     expect(registry(false).connectors().map((connector) => connector.id)).toEqual(["pi"]);
-    expect(registry(true).connectors().map((connector) => connector.id)).toEqual(["pi", "claude-code"]);
+    expect(registry(true).connectors().map((connector) => connector.id)).toEqual(["pi", "claude-code", "codex"]);
   });
 
   it("resolves namespaced and legacy Pi ids and rejects unknown harnesses", () => {
@@ -72,6 +72,8 @@ describe("connector registry", () => {
       model: "ollama/qwen3:8b",
     });
     expect(registry().resolve("codex:x")).toBeUndefined();
+    expect(registry(true).resolve("codex:x")).toMatchObject({ model: "x" });
+    expect(registry().resolve("unknown:x")).toBeUndefined();
   });
 
   it("namespaces Pi discovery without spawning a process", async () => {

@@ -89,6 +89,7 @@ export const pageScript = String.raw`
   const MAX_CONTEXT_BYTES = 32 * 1024;
   const MOBILE_BREAKPOINT = 860;
   const COLLAPSED_RAIL_WIDTH = 44;
+  const RAIL_TRANSITION_MS = 200;
   const encoder = new TextEncoder();
   function readQuizEntryIds() {
     try {
@@ -2334,23 +2335,18 @@ export const pageScript = String.raw`
     if (innerWidth <= MOBILE_BREAKPOINT) { closeConfig(); return; }
     railCollapsed = !railCollapsed;
     sessionStorage.setItem("reviewTutorRailCollapsed", railCollapsed ? "1" : "0");
-    const rail = document.querySelector(".rail");
-    if (railCollapsed) {
-      // Slide the panel out first, then relayout once; expanding relayouts first and slides the panel in.
-      const slide = slideRail(rail, "out");
-      if (slide) slide.onfinish = slide.oncancel = applyRail;
-      else applyRail();
-    } else {
-      applyRail();
-      slideRail(rail, "in");
-    }
+    holdDiffWidth();
+    applyRail();
   });
-  function slideRail(rail, direction) {
-    if (typeof rail.animate !== "function" || typeof matchMedia !== "function" || matchMedia("(prefers-reduced-motion: reduce)").matches) return null;
-    const distance = rail.getBoundingClientRect().width - COLLAPSED_RAIL_WIDTH;
-    if (distance <= 0) return null;
-    const away = { transform: "translateX(" + distance + "px)" }, home = { transform: "none" };
-    return rail.animate(direction === "out" ? [home, away] : [away, home], { duration: 200, easing: "ease" });
+  // While the rail width transitions, the diff keeps its final width so its rows lay out once, not every frame.
+  function holdDiffWidth() {
+    if (typeof matchMedia !== "function" || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const scroll = element("diff-scroll");
+    const width = element("diff-pane").getBoundingClientRect().width;
+    const railWidth = document.querySelector(".rail").getBoundingClientRect().width;
+    scroll.style.width = (railCollapsed ? width + railWidth - COLLAPSED_RAIL_WIDTH : width) + "px";
+    clearTimeout(holdDiffWidth.timer);
+    holdDiffWidth.timer = setTimeout(() => { scroll.style.width = ""; }, RAIL_TRANSITION_MS + 20);
   }
   element("jump-log").addEventListener("click", () => {
     if (innerWidth <= MOBILE_BREAKPOINT) closeConfig(false);

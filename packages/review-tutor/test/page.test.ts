@@ -290,7 +290,7 @@ describe("Review Tutor composed page", () => {
     expect(pageHtml).toContain("@media(max-width:860px)");
     expect(pageHtml).toContain(".diff-pane {\nmin-width:0;min-height:0;");
     expect(pageHtml).toContain(".toolbar select {\nwidth:auto;flex:1 1 120px;min-width:120px;max-width:280px}");
-    expect(pageHtml).toContain(".rail {\nposition:relative;min-height:0;overflow-y:auto;");
+    expect(pageHtml).toContain(".rail {\nposition:relative;min-height:0;overflow:hidden auto;");
     expect(pageHtml).toContain('role="region" aria-labelledby="tutor-title"');
     expect(pageHtml).toContain(".diff-pane>.tutor.open");
     expect(pageHtml).toContain("max-height:100%;overflow:auto");
@@ -1652,34 +1652,18 @@ describe("Review Tutor composed page", () => {
     expect(byId(document, "history-pager").hidden).toBe(true);
   });
 
-  it("slides the expanded rail with transforms around a single layout pass", async () => {
-    const { window, document } = await boot();
-    const rail = document.querySelector(".rail") as any;
-    const workbench = document.querySelector(".workbench")!;
-    const calls: any[][] = [];
-    let animation: any;
-    rail.animate = (keyframes: any[]) => { calls.push(keyframes); animation = {}; return animation; };
-    rail.getBoundingClientRect = () => ({ width: 400 });
-    let reduced = false;
-    (window as any).matchMedia = () => ({ matches: reduced });
-
+  it("animates the rail width cheaply: off-screen rows skip layout and rail text never rewraps", async () => {
+    const { document } = await boot();
+    const css = document.querySelector("style")?.textContent ?? "";
+    expect(css).toContain("transition:grid-template-columns 200ms ease");
+    expect(css).toContain(".diff-row {\ncontent-visibility:auto;contain-intrinsic-block-size:auto 25px;");
+    expect(css).toContain(".rail {\nposition:relative;min-height:0;overflow:hidden auto;");
+    expect(css).toContain(".config-section {\nwidth:clamp(320px,30vw,400px);");
+    expect(css).toContain(".rail-toggle {\nposition:absolute;top:14px;right:8px;");
     byId(document, "toggle-rail").click();
-    expect(calls).toEqual([[{ transform: "none" }, { transform: "translateX(356px)" }]]);
-    expect(workbench.classList.contains("rail-collapsed")).toBe(false);
-    animation.onfinish();
-    expect(workbench.classList.contains("rail-collapsed")).toBe(true);
-    expect(byId(document, "config-section").hidden).toBe(true);
-
-    calls.length = 0;
+    expect(document.querySelector(".workbench")?.classList.contains("rail-collapsed")).toBe(true);
     byId(document, "toggle-rail").click();
-    expect(workbench.classList.contains("rail-collapsed")).toBe(false);
-    expect(calls).toEqual([[{ transform: "translateX(356px)" }, { transform: "none" }]]);
-
-    calls.length = 0;
-    reduced = true;
-    byId(document, "toggle-rail").click();
-    expect(calls).toEqual([]);
-    expect(workbench.classList.contains("rail-collapsed")).toBe(true);
+    expect(document.querySelector(".workbench")?.classList.contains("rail-collapsed")).toBe(false);
   });
 
   it("opens mobile configuration as the sole dialog and restores the desktop collapse preference", async () => {

@@ -51,11 +51,11 @@ color:var(--rose)}
 .ghost {
 background:transparent}
 .workbench {
-height:calc(100vh - var(--topbar-h));display:grid;grid-template-columns:minmax(0,1fr) clamp(320px,30vw,400px)}
+height:calc(100vh - var(--topbar-h));display:grid;grid-template-columns:minmax(0,1fr) clamp(320px,30vw,400px);transition:grid-template-columns 200ms ease}
 .workbench.rail-collapsed {
 grid-template-columns:minmax(0,1fr) 44px}
 .diff-pane {
-min-width:0;min-height:0;display:flex;flex-direction:column;border-right:1px solid var(--hairline)}
+min-width:0;min-height:0;display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--hairline)}
 .source-setup {
 min-height:0;max-height:100%;overflow:auto;flex:0 1 auto;margin:20px;border:1px solid var(--hairline-strong);border-radius:var(--radius-card);background:var(--surface-1);padding:20px}
 .source-setup[hidden] {
@@ -123,7 +123,7 @@ margin-left:auto;flex:none;font:12px var(--font-mono);font-variant-numeric:tabul
 .rows {
 min-width:0}
 .diff-row {
-display:grid;grid-template-columns:52px 52px 24px minmax(0,1fr);min-height:25px;align-items:stretch;font:12.5px/25px var(--font-mono);position:relative}
+content-visibility:auto;contain-intrinsic-block-size:auto 25px;display:grid;grid-template-columns:52px 52px 24px minmax(0,1fr);min-height:25px;align-items:stretch;font:12.5px/25px var(--font-mono);position:relative}
 .diff-row.meta {
 display:block;padding:3px 14px;min-height:0;color:var(--muted);background:transparent;font:10.5px/1.5 var(--font-mono);white-space:pre-wrap}
 .diff-row.hunk {
@@ -165,7 +165,7 @@ color:var(--text)}
 .code {
 white-space:pre-wrap;overflow-wrap:anywhere;padding:0 14px}
 .rail {
-position:relative;min-height:0;overflow-y:auto;background:var(--surface-1)}
+position:relative;min-height:0;overflow:hidden auto;background:var(--surface-1)}
 .tutor {
 display:none;margin:8px 14px 16px;max-width:760px;border:1px solid var(--hairline-strong);border-radius:var(--radius-card);background:var(--surface-1);padding:16px 18px}
 .tutor.open {
@@ -183,7 +183,7 @@ justify-content:center;padding:50px 0 0}
 .rail-collapsed .rail-eyebrow {
 writing-mode:vertical-rl}
 .config-section {
-padding:14px var(--rail-pad) 28px}
+width:clamp(320px,30vw,400px);padding:14px var(--rail-pad) 28px}
 .config-section .field,.config-section .two {
 margin-bottom:var(--field-gap)}
 .config-actions {
@@ -525,7 +525,7 @@ display:flex;padding:0;flex-direction:row}
 .rail-toggle {
 position:static;width:auto;min-height:44px;padding:0 14px}
 .config-section {
-padding:16px 0 28px}
+width:auto;padding:16px 0 28px}
 .config-actions button {
 min-height:44px}
 .tutor.open {

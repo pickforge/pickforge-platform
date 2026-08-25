@@ -1,0 +1,726 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { afterEach, describe, expect, it } from "vitest";
+import type { InputSnapshot, StructureEdge, StructureSnapshot } from "../src/protocol.ts";
+import { startReviewTutorServer } from "../src/server.ts";
+import { buildStructureSnapshot, maskLiterals, parseUnifiedDiff, structureSnapshotFor } from "../src/structure.ts";
+
+const skillPath = fileURLToPath(new URL("../skills/review-tutor/SKILL.md", import.meta.url));
+const temporaryRoots: string[] = [];
+
+afterEach(async () => {
+  while (temporaryRoots.length) {
+    await rm(temporaryRoots.pop()!, { recursive: true, force: true });
+  }
+});
+
+function input(content: string, kind: InputSnapshot["kind"] = "worktree"): InputSnapshot {
+  return {
+    id: "input-1",
+    kind,
+    label: kind === "pr" ? "#7 Example by dev" : "Local worktree diff",
+    digest: "digest",
+    byteCount: Buffer.byteLength(content),
+    content,
+  };
+}
+
+function edgesFrom(snapshot: StructureSnapshot, from: string): StructureEdge[] {
+  return snapshot.edges.filter((edge) => edge.from === from);
+}
+
+function edge(snapshot: StructureSnapshot, from: string, to: string): StructureEdge | undefined {
+  return snapshot.edges.find((candidate) => candidate.from === from && candidate.to === to);
+}
+
+const RENAME_DIFF = `diff --git a/src/helper.ts b/src/helper.ts
+index 1111111..2222222 100644
+--- a/src/helper.ts
++++ b/src/helper.ts
+@@ -1,2 +1,2 @@
+-export const helper = (value: number) => value;
++export const helper = (value: number): number => value;
+
+diff --git a/src/config/index.ts b/src/config/index.ts
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/src/config/index.ts
+@@ -0,0 +1,2 @@
++export interface Config { name: string }
++export const defaults: Config = { name: "review" };
+diff --git a/src/mixed.ts b/src/mixed.ts
+index 4444444..5555555 100644
+--- a/src/mixed.ts
++++ b/src/mixed.ts
+@@ -1,2 +1,2 @@
+-export type Mixed = string;
++export type Mixed = string | number;
+ export const value = 1;
+diff --git a/src/old-name.ts b/src/renamed.ts
+similarity index 88%
+rename from src/old-name.ts
+rename to src/renamed.ts
+index 6666666..7777777 100644
+--- a/src/old-name.ts
++++ b/src/renamed.ts
+@@ -1,4 +1,5 @@
+ import { helper } from "./helper.js";
++import type { Config } from "./config";
+ import { type Mixed, value } from "./mixed.ts";
+
+ export const total = helper(value);
+`;
+
+describe("diff parsing", () => {
+  it("tracks renames, statuses, and line counts", () => {
+    const parsed = parseUnifiedDiff(RENAME_DIFF);
+    expect(parsed.reasons).toEqual([]);
+    expect(parsed.files.map((file) => `${file.path}:${file.status}`)).toEqual([
+      "src/helper.ts:modified",
+      "src/config/index.ts:added",
+      "src/mixed.ts:modified",
+      "src/renamed.ts:renamed",
+    ]);
+    const renamed = parsed.files.at(-1)!;
+    expect(renamed.oldPath).toBe("src/old-name.ts");
+    expect(renamed.additions).toBe(1);
+    expect(parsed.files[0]!.additions).toBe(1);
+    expect(parsed.files[0]!.deletions).toBe(1);
+  });
+
+  it("reports a malformed diff as a partial snapshot instead of throwing", () => {
+    const snapshot = buildStructureSnapshot(input("this is not a diff at all\njust prose\n"));
+    expect(snapshot.files).toEqual([]);
+    expect(snapshot.comparison.partial).toBe(true);
+    expect(snapshot.comparison.reasons[0]).toContain("diff parse failed: expected unified diff file headers");
+  });
+});
+
+describe("connection analysis", () => {
+  const snapshot = buildStructureSnapshot(input(RENAME_DIFF));
+
+  it("keeps rename provenance on the file entry", () => {
+    const renamed = snapshot.files.find((file) => file.path === "src/renamed.ts")!;
+    expect(renamed.status).toBe("renamed");
+    expect(renamed.renamedFrom).toBe("src/old-name.ts");
+    expect(renamed.analyzed).toBe(true);
+  });
+
+  it("resolves a .js specifier to the .ts file under bundler conventions", () => {
+    const found = edge(snapshot, "src/renamed.ts", "src/helper.ts")!;
+    expect(found.specifier).toBe("./helper.js");
+    expect(found.kind).toBe("import");
+    expect(found.status).toBe("unchanged");
+    expect(found.evidence).toEqual([
+      { path: "src/renamed.ts", line: 1, text: "import { helper } from \"./helper.js\";" },
+    ]);
+  });
+
+  it("resolves an extensionless specifier through a directory index and marks type-only imports", () => {
+    const found = edge(snapshot, "src/renamed.ts", "src/config/index.ts")!;
+    expect(found.typeOnly).toBe(true);
+    expect(found.status).toBe("added");
+    expect(found.evidence[0]!.line).toBe(2);
+  });
+
+  it("treats an inline type specifier inside a value import as a value edge", () => {
+    const found = edge(snapshot, "src/renamed.ts", "src/mixed.ts")!;
+    expect(found.typeOnly).toBe(false);
+    expect(found.status).toBe("unchanged");
+  });
+
+  it("stays complete for a Git worktree comparison", () => {
+    expect(snapshot.comparison).toMatchObject({ kind: "worktree", partial: false, reasons: [] });
+    expect(snapshot.limits.truncated).toBe(false);
+  });
+});
+
+const KINDS_DIFF = `diff --git a/src/target.ts b/src/target.ts
+--- a/src/target.ts
++++ b/src/target.ts
+@@ -1 +1,2 @@
+ export const target = 1;
++export const extra = 2;
+diff --git a/src/legacy.js b/src/legacy.js
+--- a/src/legacy.js
++++ b/src/legacy.js
+@@ -1 +1,2 @@
+ module.exports = { legacy: true };
++module.exports.more = true;
+diff --git a/src/entry.ts b/src/entry.ts
+--- a/src/entry.ts
++++ b/src/entry.ts
+@@ -1,10 +1,16 @@
+ import "./target.ts";
++import { target } from "./target.ts";
+ export { target as reexported } from "./target.ts";
++export type { Target } from "./target.ts";
+ const legacy = require("./legacy.js");
+-const gone = require("./target.ts");
+ const lazy = () => import("./target.ts");
+ const dynamic = (name) => import(name);
+ const built = require(\`./\${name}.js\`);
+ import { readFile } from "node:fs/promises";
+ import react from "react";
+ import { missing } from "./not-in-diff.ts";
+-// import { commented } from "./target.ts";
++const sample = "import { fake } from './target.ts'";
+`;
+
+describe("edge kinds and honest omissions", () => {
+  const snapshot = buildStructureSnapshot(input(KINDS_DIFF));
+
+  it("supports import, re-export, require, and dynamic-import edges", () => {
+    const kinds = edgesFrom(snapshot, "src/entry.ts")
+      .map((found) => `${found.kind}:${found.to}:${found.typeOnly}:${found.status}`);
+    expect(kinds).toEqual([
+      "require:src/legacy.js:false:unchanged",
+      "dynamic-import:src/target.ts:false:unchanged",
+      "import:src/target.ts:false:unchanged",
+      "import:src/target.ts:false:added",
+      "reexport:src/target.ts:false:unchanged",
+      "reexport:src/target.ts:true:added",
+      "require:src/target.ts:false:removed",
+    ]);
+  });
+
+  it("keeps side-effect imports and merges duplicate statements per state", () => {
+    const sideEffect = edgesFrom(snapshot, "src/entry.ts")
+      .find((found) => found.kind === "import" && found.status === "unchanged")!;
+    expect(sideEffect.specifier).toBe("./target.ts");
+    expect(sideEffect.evidence).toHaveLength(1);
+  });
+
+  it("omits non-literal specifiers, external modules, and out-of-scope paths without inventing edges", () => {
+    const reasons = snapshot.limits.omitted.map((omission) => `${omission.path ?? ""}|${omission.reason}`);
+    expect(reasons).toContain("src/entry.ts|external modules (2): node:fs/promises, react");
+    expect(reasons.filter((reason) => reason.includes("non-literal specifier"))).toHaveLength(2);
+    expect(reasons).toContain("src/entry.ts|specifier './not-in-diff.ts' at line 11 matches no changed file: no import data outside the changed set");
+    expect(snapshot.comparison.partial).toBe(true);
+    expect(snapshot.comparison.reasons.some((reason) => reason.includes("no import data"))).toBe(true);
+  });
+
+  it("never reads an import out of a comment or a string literal", () => {
+    expect(edgesFrom(snapshot, "src/entry.ts").some((found) => found.specifier === "./commented.ts")).toBe(false);
+    expect(edgesFrom(snapshot, "src/entry.ts").some((found) => found.specifier === "./fake.ts")).toBe(false);
+  });
+
+  it("masks comments and string bodies while preserving offsets", () => {
+    const source = "import a from \"./x\"; // import b from \"./y\"\n/* import c from \"./z\" */";
+    const masked = maskLiterals(source);
+    expect(masked).toHaveLength(source.length);
+    expect(masked).toContain("import a from \"   \";");
+    expect(masked.slice(20)).toMatch(/^[ \n]+$/);
+  });
+});
+
+const REMOVAL_DIFF = `diff --git a/docs/guide.md b/docs/guide.md
+--- a/docs/guide.md
++++ b/docs/guide.md
+@@ -1 +1,2 @@
+ # Guide
++import { fake } from "./nope.ts";
+diff --git a/assets/logo.png b/assets/logo.png
+new file mode 100644
+index 0000000..8888888
+Binary files /dev/null and b/assets/logo.png differ
+diff --git a/src/dropped.ts b/src/dropped.ts
+deleted file mode 100644
+--- a/src/dropped.ts
++++ /dev/null
+@@ -1,2 +0,0 @@
+-import { keep } from "./keep.ts";
+-export const dropped = keep;
+diff --git a/src/keep.ts b/src/keep.ts
+--- a/src/keep.ts
++++ b/src/keep.ts
+@@ -1 +1,2 @@
+ export const keep = 1;
++export const other = 2;
+`;
+
+describe("unsupported inputs and deletions", () => {
+  const snapshot = buildStructureSnapshot(input(REMOVAL_DIFF));
+
+  it("marks binary and non-TypeScript files as unanalyzed with an explicit reason", () => {
+    const markdown = snapshot.files.find((file) => file.path === "docs/guide.md")!;
+    const binary = snapshot.files.find((file) => file.path === "assets/logo.png")!;
+    expect(markdown.analyzed).toBe(false);
+    expect(markdown.reason).toBe("unsupported file type '.md': no import data");
+    expect(binary.analyzed).toBe(false);
+    expect(binary.reason).toBe("binary content: no import data");
+    expect(snapshot.edges.some((found) => found.from === "docs/guide.md")).toBe(false);
+  });
+
+  it("reports the imports of a deleted file as removed connections", () => {
+    const found = edge(snapshot, "src/dropped.ts", "src/keep.ts")!;
+    expect(found.status).toBe("removed");
+    expect(found.evidence).toEqual([
+      { path: "src/dropped.ts", line: 1, text: "import { keep } from \"./keep.ts\";" },
+    ]);
+    expect(snapshot.files.find((file) => file.path === "src/dropped.ts")!.status).toBe("removed");
+  });
+});
+
+describe("source fidelity", () => {
+  it("refuses to analyze pasted code", () => {
+    const snapshot = buildStructureSnapshot(input("import a from \"./b.ts\";", "paste"));
+    expect(snapshot.files).toEqual([]);
+    expect(snapshot.edges).toEqual([]);
+    expect(snapshot.comparison.partial).toBe(true);
+    expect(snapshot.comparison.reasons[0]).toContain("structure analysis is unavailable");
+  });
+
+  it("labels a pull-request snapshot as patch-only partial", () => {
+    const snapshot = buildStructureSnapshot({ ...input(RENAME_DIFF, "pr"), headSha: "abc123" });
+    expect(snapshot.comparison.partial).toBe(true);
+    expect(snapshot.comparison.reasons[0]).toBe("patch-only: base and head objects are not read locally");
+    expect(snapshot.edges.length).toBeGreaterThan(0);
+  });
+
+  it("states the compared endpoints for every source kind", () => {
+    const endpoints = (snapshot: StructureSnapshot): string =>
+      `${snapshot.comparison.from} -> ${snapshot.comparison.to}`;
+    expect(endpoints(buildStructureSnapshot(input(RENAME_DIFF, "worktree")))).toBe("index -> working tree");
+    expect(endpoints(buildStructureSnapshot(input(RENAME_DIFF, "staged")))).toBe("HEAD -> index");
+    expect(endpoints(buildStructureSnapshot({ ...input(RENAME_DIFF, "commit"), label: "Commit 9fceb02" })))
+      .toBe("first parent -> commit 9fceb02");
+    expect(endpoints(buildStructureSnapshot({ ...input(RENAME_DIFF, "range"), label: "main...feature" })))
+      .toBe("merge-base -> feature");
+    expect(endpoints(buildStructureSnapshot({ ...input(RENAME_DIFF, "pr"), headSha: "abc123" })))
+      .toBe("base -> head abc123");
+    expect(endpoints(buildStructureSnapshot(input("code", "paste")))).toBe("unavailable -> unavailable");
+  });
+});
+
+function generatedDiff(sources: number, targets: number, perSource: number): string {
+  const parts: string[] = [];
+  for (let index = 0; index < targets; index += 1) {
+    parts.push(`diff --git a/src/t${index}.ts b/src/t${index}.ts\n--- a/src/t${index}.ts\n+++ b/src/t${index}.ts\n@@ -1 +1,2 @@\n export const t${index} = ${index};\n+export const extra${index} = ${index};\n`);
+  }
+  for (let index = 0; index < sources; index += 1) {
+    const imports = Array.from({ length: perSource }, (_unused, offset) =>
+      `+import { t${(index + offset) % targets} } from "./t${(index + offset) % targets}.ts";`).join("\n");
+    parts.push(`diff --git a/src/s${index}.ts b/src/s${index}.ts\nnew file mode 100644\n--- /dev/null\n+++ b/src/s${index}.ts\n@@ -0,0 +1,${perSource} @@\n${imports}\n`);
+  }
+  return parts.join("");
+}
+
+describe("resource limits and determinism", () => {
+  it("returns a valid truncated snapshot when the file cap is exceeded", () => {
+    const snapshot = buildStructureSnapshot(input(generatedDiff(150, 100, 2)));
+    expect(snapshot.files).toHaveLength(200);
+    expect(snapshot.limits.truncated).toBe(true);
+    expect(snapshot.limits.omitted.some((omission) => omission.reason.includes("file cap reached"))).toBe(true);
+    expect(snapshot.comparison.partial).toBe(true);
+    expect(snapshot.files.map((file) => file.path)).toEqual([...snapshot.files.map((file) => file.path)].sort());
+  });
+
+  it("returns a valid truncated snapshot when the connection cap is exceeded", () => {
+    const snapshot = buildStructureSnapshot(input(generatedDiff(100, 100, 21)));
+    expect(snapshot.files).toHaveLength(200);
+    expect(snapshot.edges).toHaveLength(2000);
+    expect(snapshot.limits.truncated).toBe(true);
+    expect(snapshot.limits.omitted.some((omission) => omission.reason.includes("connection cap reached"))).toBe(true);
+  });
+
+  it("bounds evidence per edge and merges duplicate statements", () => {
+    const duplicates = `diff --git a/src/t.ts b/src/t.ts
+--- a/src/t.ts
++++ b/src/t.ts
+@@ -1 +1,2 @@
+ export const t = 1;
++export const u = 2;
+diff --git a/src/many.ts b/src/many.ts
+new file mode 100644
+--- /dev/null
++++ b/src/many.ts
+@@ -0,0 +1,6 @@
++import { a } from "./t.ts";
++import { b } from "./t.ts";
++import { c } from "./t.ts";
++import { d } from "./t.ts";
++import { e } from "./t.ts";
++import { f } from "./t.ts";
+`;
+    const snapshot = buildStructureSnapshot(input(duplicates));
+    const merged = edgesFrom(snapshot, "src/many.ts");
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.evidence).toHaveLength(4);
+    expect(merged[0]!.evidence.map((item) => item.line)).toEqual([1, 2, 3, 4]);
+  });
+
+  it("produces byte-identical JSON across runs", () => {
+    const source = input(`${RENAME_DIFF}${KINDS_DIFF}${REMOVAL_DIFF}`);
+    expect(JSON.stringify(buildStructureSnapshot(source))).toBe(JSON.stringify(buildStructureSnapshot(source)));
+  });
+
+  it("returns a valid snapshot for a diff whose hunk header is unusable", () => {
+    const snapshot = structureSnapshotFor(input("diff --git a/a.ts b/a.ts\n@@ bad header @@\n+import x from \"./y\";\n"));
+    expect(snapshot.protocol).toBe("rt/1");
+    expect(snapshot.inputId).toBe("input-1");
+    expect(snapshot.edges).toEqual([]);
+    expect(snapshot.comparison.reasons).toContain("malformed hunk header at diff line 2: no import data for that file");
+    expect(snapshot.comparison.partial).toBe(true);
+    expect(snapshot.files[0]!.reason).toBe("no diff content for this file: no import data");
+  });
+
+  it("degrades to a partial snapshot when the analyzer itself throws", () => {
+    const hostile = {
+      ...input(""),
+      get content(): string { throw new Error("input content unavailable"); },
+    } as InputSnapshot;
+    const snapshot = structureSnapshotFor(hostile);
+    expect(snapshot.protocol).toBe("rt/1");
+    expect(snapshot.edges).toEqual([]);
+    expect(snapshot.comparison.partial).toBe(true);
+    expect(snapshot.comparison.reasons[0]).toContain("structure analysis failed: expected a parsable unified diff");
+    expect(snapshot.comparison.reasons[0]).toContain("input content unavailable");
+  });
+});
+
+function changedFile(path: string, lines: string[], header = ""): string {
+  const body = lines.map((line) => (line.startsWith("+") || line.startsWith("-") ? line : ` ${line}`)).join("\n");
+  return `diff --git a/${path} b/${path}\n${header}--- a/${path}\n+++ b/${path}\n@@ -1,${lines.length} +1,${lines.length} @@\n${body}\n`;
+}
+
+describe("statements the lexer must not misread", () => {
+  it("does not bind semicolon-free code to a later module string", () => {
+    const diff = changedFile("src/plain.ts", ["export const value = 1"])
+      + changedFile("src/free.ts", ["export const count = 1", "import { value } from \"./plain.ts\""]);
+    const snapshot = buildStructureSnapshot(input(diff));
+    const found = edgesFrom(snapshot, "src/free.ts");
+    expect(found).toHaveLength(1);
+    expect(found[0]).toMatchObject({ kind: "import", to: "src/plain.ts", specifier: "./plain.ts" });
+    expect(found[0]!.evidence[0]!.line).toBe(2);
+  });
+
+  it("accepts every import clause shape", () => {
+    const diff = changedFile("src/plain.ts", ["export const value = 1;"])
+      + changedFile("src/shapes.ts", [
+        "import plain from \"./plain.ts\";",
+        "import * as everything from \"./plain.ts\";",
+        "import defaultAndNamed, { value } from \"./plain.ts\";",
+        "import {",
+        "  value as renamed,",
+        "} from \"./plain.ts\";",
+      ]);
+    const snapshot = buildStructureSnapshot(input(diff));
+    expect(edgesFrom(snapshot, "src/shapes.ts")).toHaveLength(1);
+    expect(edgesFrom(snapshot, "src/shapes.ts")[0]!.evidence).toHaveLength(4);
+  });
+
+  it("keeps long import clauses and reports the ones past the work bound", () => {
+    const clause = (count: number): string =>
+      `import { ${Array.from({ length: count }, (_unused, index) => `value as v${index}`).join(", ")} } from "./plain.ts";`;
+    const short = clause(110);
+    const long = clause(160);
+    expect(short.length).toBeGreaterThan(1500);
+    expect(short.length).toBeLessThan(2000);
+    expect(long.length).toBeGreaterThan(2000);
+    expect(long.length).toBeLessThan(4000);
+
+    const kept = buildStructureSnapshot(input(
+      changedFile("src/plain.ts", ["export const value = 1;"]) + changedFile("src/wide-clause.ts", [`+${short}`])));
+    expect(edgesFrom(kept, "src/wide-clause.ts")).toHaveLength(1);
+    expect(kept.limits.omitted).toEqual([]);
+
+    const dropped = buildStructureSnapshot(input(
+      changedFile("src/plain.ts", ["export const value = 1;"]) + changedFile("src/huge-clause.ts", [`+${long}`])));
+    expect(edgesFrom(dropped, "src/huge-clause.ts")).toEqual([]);
+    expect(dropped.limits.omitted).toContainEqual({
+      path: "src/huge-clause.ts",
+      reason: "import clause longer than 2000 characters at line 1: no import data for that statement",
+    });
+    expect(dropped.comparison.partial).toBe(true);
+    expect(dropped.limits.truncated).toBe(true);
+  });
+
+  it("masks regex literals in expression positions but not division", () => {
+    const diff = changedFile("src/plain.ts", ["export const value = 1;"])
+      + changedFile("src/expressions.ts", [
+        "function first() { return /import { fake } from \"\\.\\/plain.ts\"/; }",
+        "const second = () => /import other from \"\\.\\/plain.ts\"/;",
+        "const ratio = a / b / c;",
+        "const half = y / 2; import { value } from \"./plain.ts\";",
+      ]);
+    const snapshot = buildStructureSnapshot(input(diff));
+    const found = edgesFrom(snapshot, "src/expressions.ts");
+    expect(found).toHaveLength(1);
+    expect(found[0]).toMatchObject({ to: "src/plain.ts", specifier: "./plain.ts" });
+    expect(found[0]!.evidence[0]!.line).toBe(4);
+  });
+
+  it("treats a keyword-named member before a slash as division", () => {
+    const diff = changedFile("src/plain.ts", ["export const value = 1;"])
+      + changedFile("src/members.ts", [
+        "const scaled = obj.return / 2; import { value } from \"./plain.ts\";",
+      ]);
+    const found = edgesFrom(buildStructureSnapshot(input(diff)), "src/members.ts");
+    expect(found).toHaveLength(1);
+    expect(found[0]).toMatchObject({ to: "src/plain.ts", specifier: "./plain.ts" });
+    expect(found[0]!.evidence[0]!.line).toBe(1);
+  });
+
+  it("rejects member calls separated by whitespace or newlines", () => {
+    const diff = changedFile("src/t.ts", ["export const t = 1;"])
+      + changedFile("src/spaced.ts", [
+        "const loaded = shim . require(\"./t.ts\");",
+        "const lazy = shim ?. import(\"./t.ts\");",
+        "const wrapped = shim .",
+        "  import(\"./t.ts\");",
+      ]);
+    const snapshot = buildStructureSnapshot(input(diff));
+    expect(edgesFrom(snapshot, "src/spaced.ts")).toEqual([]);
+    expect(snapshot.limits.omitted.filter((omission) => omission.path === "src/spaced.ts")).toEqual([]);
+  });
+
+  it("ignores imports inside regex literals and member calls", () => {
+    const diff = changedFile("src/plain.ts", ["export const value = 1;"])
+      + changedFile("src/tricky.ts", [
+        "const pattern = /import { fake } from \"\\.\\/plain.ts\"/;",
+        "const loaded = shim.require(\"./plain.ts\");",
+        "const lazy = shim.import(\"./plain.ts\");",
+        "const ratio = total / count / 2;",
+      ]);
+    const snapshot = buildStructureSnapshot(input(diff));
+    expect(edgesFrom(snapshot, "src/tricky.ts")).toEqual([]);
+    expect(snapshot.limits.omitted.filter((omission) => omission.path === "src/tricky.ts")).toEqual([]);
+  });
+
+  it("keeps offsets correct when the diff contains non-BMP characters", () => {
+    const source = "// 🚀 launch\nimport { value } from \"./plain.ts\";";
+    expect(maskLiterals(source)).toHaveLength(source.length);
+    const diff = changedFile("src/plain.ts", ["export const value = 1;"])
+      + changedFile("src/emoji.ts", ["// 🚀 launch note", "import { value } from \"./plain.ts\";"]);
+    const snapshot = buildStructureSnapshot(input(diff));
+    expect(edgesFrom(snapshot, "src/emoji.ts")[0]!.evidence).toEqual([
+      { path: "src/emoji.ts", line: 2, text: "import { value } from \"./plain.ts\";" },
+    ]);
+  });
+
+  it("anchors status on the specifier line of a multi-line statement", () => {
+    const diff = changedFile("src/old-target.ts", ["export const value = 1;"])
+      + changedFile("src/new-target.ts", ["export const value = 1;"])
+      + `diff --git a/src/multi.ts b/src/multi.ts\n--- a/src/multi.ts\n+++ b/src/multi.ts\n@@ -1,4 +1,4 @@\n import {\n   value\n-} from "./old-target.ts";\n+} from "./new-target.ts";\n export const multi = value;\n`;
+    const snapshot = buildStructureSnapshot(input(diff));
+    expect(edge(snapshot, "src/multi.ts", "src/new-target.ts")).toMatchObject({ status: "added" });
+    expect(edge(snapshot, "src/multi.ts", "src/new-target.ts")!.evidence.map((item) => item.line)).toEqual([1, 3]);
+    expect(edge(snapshot, "src/multi.ts", "src/old-target.ts")).toMatchObject({ status: "removed" });
+    expect(edge(snapshot, "src/multi.ts", "src/old-target.ts")!.evidence.map((item) => item.line)).toEqual([1, 3]);
+  });
+
+  it("reads statements from every hunk without gluing them together", () => {
+    const diff = changedFile("src/plain.ts", ["export const value = 1;"])
+      + `diff --git a/src/hunks.ts b/src/hunks.ts\n--- a/src/hunks.ts\n+++ b/src/hunks.ts\n@@ -1,2 +1,2 @@\n export const first = 1\n export const second = 2\n@@ -40,2 +40,3 @@\n export const third = 3\n+import { value } from "./plain.ts";\n`;
+    const snapshot = buildStructureSnapshot(input(diff));
+    const found = edgesFrom(snapshot, "src/hunks.ts");
+    expect(found).toHaveLength(1);
+    expect(found[0]).toMatchObject({ status: "added" });
+    expect(found[0]!.evidence[0]!.line).toBe(41);
+  });
+});
+
+describe("changed-state fidelity", () => {
+  it("reports a binding-only change as one modified connection", () => {
+    const diff = changedFile("src/b.ts", ["export const b = 1;", "export const c = 2;"])
+      + `diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1,2 @@\n-import { b } from "./b.ts";\n+import { b, c } from "./b.ts";\n export const a = 1;\n`;
+    const snapshot = buildStructureSnapshot(input(diff));
+    const found = edgesFrom(snapshot, "src/a.ts");
+    expect(found).toHaveLength(1);
+    expect(found[0]!.status).toBe("modified");
+    expect(found[0]!.specifier).toBe("./b.ts");
+    expect(found[0]!.evidence.map((item) => item.text)).toEqual([
+      "import { b } from \"./b.ts\";",
+      "import { b, c } from \"./b.ts\";",
+    ]);
+  });
+
+  it("marks a file with no diff content as unanalyzed", () => {
+    const diff = "diff --git a/src/moved.ts b/src/elsewhere.ts\nsimilarity index 100%\nrename from src/moved.ts\nrename to src/elsewhere.ts\n";
+    const snapshot = buildStructureSnapshot(input(diff));
+    expect(snapshot.files[0]).toMatchObject({
+      path: "src/elsewhere.ts",
+      status: "renamed",
+      renamedFrom: "src/moved.ts",
+      analyzed: false,
+      reason: "no diff content for this file: no import data",
+    });
+  });
+
+  it("refuses to analyze a combined merge diff", () => {
+    const diff = "diff --cc src/merged.ts\nindex 1111111,2222222..3333333\n--- a/src/merged.ts\n+++ b/src/merged.ts\n@@@ -1,2 -1,2 +1,3 @@@\n++import { x } from \"./x.ts\";\n";
+    const snapshot = buildStructureSnapshot(input(diff));
+    expect(snapshot.files).toEqual([]);
+    expect(snapshot.edges).toEqual([]);
+    expect(snapshot.comparison.reasons).toContain(
+      "merge commit: combined diffs are not analyzed; pick one parent range (e.g. <sha>^1...<sha>) and retry");
+  });
+});
+
+describe("specifier resolution", () => {
+  it("resolves an old-side specifier relative to the pre-rename path", () => {
+    const diff = changedFile("src/old/sib.ts", ["export const sib = 1;"])
+      + `diff --git a/src/old/mod.ts b/src/new/mod.ts\nsimilarity index 80%\nrename from src/old/mod.ts\nrename to src/new/mod.ts\n--- a/src/old/mod.ts\n+++ b/src/new/mod.ts\n@@ -1,2 +1,1 @@\n-import { sib } from "./sib.ts";\n export const mod = 1;\n`;
+    const snapshot = buildStructureSnapshot(input(diff));
+    expect(edge(snapshot, "src/new/mod.ts", "src/old/sib.ts")).toMatchObject({ status: "removed" });
+  });
+
+  it("refuses to resolve a new-side import of a path that no longer exists", () => {
+    const diff = `diff --git a/src/old/mod.ts b/src/new/mod.ts\nsimilarity index 80%\nrename from src/old/mod.ts\nrename to src/new/mod.ts\n--- a/src/old/mod.ts\n+++ b/src/new/mod.ts\n@@ -1,1 +1,2 @@\n export const mod = 1;\n+export const extra = 2;\n`
+      + `diff --git a/src/root.ts b/src/root.ts\n--- a/src/root.ts\n+++ b/src/root.ts\n@@ -1,1 +1,2 @@\n export const root = 1;\n+import { mod } from "./old/mod.ts";\n`;
+    const snapshot = buildStructureSnapshot(input(diff));
+    expect(edgesFrom(snapshot, "src/root.ts")).toEqual([]);
+    expect(snapshot.limits.omitted).toContainEqual({
+      path: "src/root.ts",
+      reason: "specifier './old/mod.ts' at line 2 matches no changed file: no import data outside the changed set",
+    });
+  });
+
+  it("resolves modern extensions and backslash separators", () => {
+    const diff = changedFile("src/util.mts", ["export const util = 1;"])
+      + changedFile("src/legacy.cts", ["export const legacy = 1;"])
+      + changedFile("src/deep/index.mts", ["export const deep = 1;"])
+      + changedFile("src/user.ts", [
+        "import { util } from \"./util\";",
+        "import { legacy } from \"./legacy\";",
+        "import { deep } from \"./deep\";",
+        "import { win } from \".\\\\util.mts\";",
+      ]);
+    const snapshot = buildStructureSnapshot(input(diff));
+    expect(edgesFrom(snapshot, "src/user.ts").map((found) => found.to)).toEqual([
+      "src/deep/index.mts", "src/legacy.cts", "src/util.mts",
+    ]);
+    expect(edge(snapshot, "src/user.ts", "src/util.mts")!.evidence.map((item) => item.line)).toEqual([1, 4]);
+  });
+});
+
+describe("bounded work", () => {
+  it("truncates over-long lines and says so", () => {
+    const padding = "x".repeat(4100);
+    const diff = changedFile("src/plain.ts", ["export const value = 1;"])
+      + changedFile("src/long.ts", [`+const pad = "${padding}"; import { value } from "./plain.ts";`]);
+    const snapshot = buildStructureSnapshot(input(diff));
+    expect(edgesFrom(snapshot, "src/long.ts")).toEqual([]);
+    expect(snapshot.limits.truncated).toBe(true);
+    expect(snapshot.limits.omitted).toContainEqual({
+      reason: "line length cap: 1 lines longer than 4000 characters were truncated; imports past that point are not analyzed",
+    });
+  });
+
+  it("stops reading after the diff-line cap", () => {
+    const snapshot = buildStructureSnapshot(input(`${"\n".repeat(200_001)}${changedFile("src/late.ts", ["+const late = 1;"])}`));
+    expect(snapshot.files).toEqual([]);
+    expect(snapshot.comparison.partial).toBe(true);
+    expect(snapshot.comparison.reasons).toContain(
+      "diff parsing stopped after 200000 lines: no import data for the rest of this comparison");
+  });
+
+  it("stops after the per-file statement cap", () => {
+    const statements = Array.from({ length: 2001 }, (_unused, index) => `+import { value as v${index} } from "./plain.ts";`);
+    const diff = changedFile("src/plain.ts", ["export const value = 1;"]) + changedFile("src/huge.ts", statements);
+    const snapshot = buildStructureSnapshot(input(diff));
+    expect(snapshot.limits.truncated).toBe(true);
+    expect(snapshot.limits.omitted).toContainEqual({
+      path: "src/huge.ts",
+      reason: "statement cap reached: expected at most 2000 import statements in this file, received more; later statements are not analyzed",
+    });
+    expect(edgesFrom(snapshot, "src/huge.ts")[0]!.evidence).toHaveLength(4);
+  });
+
+  it("marks the end of the omission list when the row cap is reached", () => {
+    const files = Array.from({ length: 200 }, (_unused, index) => changedFile(`src/f${index}.ts`, [
+      `+import { a } from "./missing-${index}-a.ts";`,
+      `+import { b } from "./missing-${index}-b.ts";`,
+    ])).join("");
+    const snapshot = buildStructureSnapshot(input(files));
+    expect(snapshot.limits.omitted).toHaveLength(201);
+    expect(snapshot.limits.omitted.at(-1)!.reason).toBe("further omissions not listed (200 more)");
+    expect(snapshot.limits.omitted.at(-1)!.path).toBeUndefined();
+  });
+
+  it("aggregates external modules with a bounded list and a total", () => {
+    const externals = Array.from({ length: 10 }, (_unused, index) => `+import p${index} from "pkg-${index}";`);
+    const snapshot = buildStructureSnapshot(input(changedFile("src/ext.ts", externals)));
+    expect(snapshot.limits.omitted).toContainEqual({
+      path: "src/ext.ts",
+      reason: "external modules (10): pkg-0, pkg-1, pkg-2, pkg-3, pkg-4, pkg-5, pkg-6, pkg-7, …",
+    });
+  });
+
+  it("trims evidence deterministically and neutralizes control characters", () => {
+    const long = `import { ${"value, ".repeat(40)}} from "./plain.ts";`;
+    const diff = changedFile("src/plain.ts", ["export const value = 1;"])
+      + changedFile("src/wide.ts", [`+${long}`]);
+    const snapshot = buildStructureSnapshot(input(diff));
+    const text = edgesFrom(snapshot, "src/wide.ts")[0]!.evidence[0]!.text;
+    expect(text).toHaveLength(200);
+    expect(text).toBe(long.slice(0, 200));
+    const bell = buildStructureSnapshot(input(changedFile("src/plain.ts", ["export const value = 1;"])
+      + changedFile("src/ctrl.ts", [`+import { value } from "./plain.ts"; // \u0007alarm`])));
+    expect(edgesFrom(bell, "src/ctrl.ts")[0]!.evidence[0]!.text).toBe(
+      "import { value } from \"./plain.ts\"; // \uFFFDalarm");
+  });
+});
+
+async function startServer(diffs: string[]) {
+  const home = await mkdtemp(join(tmpdir(), "review-tutor-structure-"));
+  temporaryRoots.push(home);
+  let call = 0;
+  const server = await startReviewTutorServer({
+    cwd: "/repo",
+    canonicalRepo: "/repo",
+    models: [{ id: "provider/model", label: "Model", thinkingLevels: ["low"] }],
+    skillPath,
+    home,
+    runner: { run: async () => ({ answer: "" }), cancel: () => {}, shutdown: async () => {} },
+    execFile: async () => ({ stdout: diffs[Math.min(call++, diffs.length - 1)]!, stderr: "" }),
+  });
+  return server;
+}
+
+describe("structure endpoint", () => {
+  it("requires the session bearer token", async () => {
+    const server = await startServer([RENAME_DIFF]);
+    try {
+      const response = await fetch(`http://127.0.0.1:${server.port}/api/structure`);
+      expect(response.status).toBe(401);
+      await response.body?.cancel();
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("reports a typed conflict when no input is loaded and recomputes on source switch", async () => {
+    const server = await startServer([RENAME_DIFF, REMOVAL_DIFF]);
+    const headers = { Authorization: `Bearer ${server.token}`, "Content-Type": "application/json" };
+    try {
+      const empty = await fetch(`http://127.0.0.1:${server.port}/api/structure`, { headers });
+      expect(empty.status).toBe(409);
+      expect((await empty.json() as { error: string }).error).toContain("expected a loaded input snapshot");
+
+      await fetch(`http://127.0.0.1:${server.port}/api/source`, {
+        method: "POST", headers, body: JSON.stringify({ protocol: "rt/1", kind: "worktree" }),
+      }).then((response) => response.json());
+      const first = await fetch(`http://127.0.0.1:${server.port}/api/structure`, { headers });
+      const firstBody = await first.text();
+      expect(first.status).toBe(200);
+      expect(JSON.parse(firstBody).files.map((file: { path: string }) => file.path)).toContain("src/renamed.ts");
+      const cached = await fetch(`http://127.0.0.1:${server.port}/api/structure`, { headers });
+      expect(await cached.text()).toBe(firstBody);
+
+      await fetch(`http://127.0.0.1:${server.port}/api/source`, {
+        method: "POST", headers, body: JSON.stringify({ protocol: "rt/1", kind: "staged" }),
+      }).then((response) => response.json());
+      const second = await fetch(`http://127.0.0.1:${server.port}/api/structure`, { headers });
+      const secondBody = await second.json() as StructureSnapshot;
+      expect(secondBody.files.map((file) => file.path)).toContain("src/dropped.ts");
+      expect(secondBody.inputId).not.toBe((JSON.parse(firstBody) as StructureSnapshot).inputId);
+    } finally {
+      await server.close();
+    }
+  });
+});

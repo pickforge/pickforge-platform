@@ -1,4 +1,4 @@
-import type { ConnectorRegistry } from "./connectors/registry.ts";
+import { splitModelId, type ConnectorRegistry } from "./connectors/registry.ts";
 import type { LearningEntry, QuizOutcome } from "./protocol.ts";
 
 const QUIZ_LABELS: Record<QuizOutcome, string> = {
@@ -20,9 +20,9 @@ function escapeHtml(value: unknown): string {
 function modelDetails(entry: LearningEntry, registry: ConnectorRegistry): { harness: string; model: string } {
   if (typeof entry.modelId !== "string") return { harness: "Pi", model: String(entry.modelId) };
   const resolved = registry.resolve(entry.modelId);
-  return resolved
-    ? { harness: resolved.connector.label, model: resolved.model }
-    : { harness: "Pi", model: entry.modelId };
+  if (resolved) return { harness: resolved.connector.label, model: resolved.model };
+  const { harness, model } = splitModelId(entry.modelId);
+  return { harness: harness === "pi" ? "Pi" : harness, model };
 }
 
 function card(entry: LearningEntry, registry: ConnectorRegistry): string {

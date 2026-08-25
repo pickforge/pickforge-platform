@@ -132,6 +132,7 @@ describe("standalone export", () => {
       { ...entry(), id: "colon-model", modelId: "ollama/qwen3:8b" },
       { ...entry(), id: "namespaced-colon-model", modelId: "pi:ollama/qwen3:8b" },
       { ...entry(), id: "invalid-model", modelId: 42 } as unknown as LearningEntry,
+      { ...entry(), id: "disabled-harness", modelId: "codex:gpt-5.6-sol" },
     ], exportRegistry);
     expect(html).toContain("Private code warning");
     expect(html).toContain("GitHub is the source of truth");
@@ -144,6 +145,8 @@ describe("standalone export", () => {
     expect(html.match(/<dt>Harness<\/dt><dd>Pi<\/dd>/g)).toHaveLength(6);
     expect(html.match(/<dt>Model<\/dt><dd>ollama\/qwen3:8b<\/dd>/g)).toHaveLength(2);
     expect(html).toContain("<dt>Model</dt><dd>42</dd>");
+    expect(html).toContain("<dt>Harness</dt><dd>codex</dd>");
+    expect(html).toContain("<dt>Model</dt><dd>gpt-5.6-sol</dd>");
     expect(html).toContain("&lt;script&gt;x&lt;/script&gt;");
     expect(html).toContain("&amp; hostile &lt;img src=x&gt;");
     expect(html).not.toContain("<script");

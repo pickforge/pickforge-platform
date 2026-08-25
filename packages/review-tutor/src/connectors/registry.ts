@@ -38,13 +38,9 @@ export function createConnectorRegistry(options: {
       return connectors().find((connector) => connector.id === id);
     },
     resolve(modelId) {
-      const separator = modelId.indexOf(":");
-      const slash = modelId.indexOf("/");
-      const namespaced = separator >= 0 && (slash < 0 || separator < slash);
-      const harness = namespaced ? modelId.slice(0, separator) : "pi";
+      const { harness, model } = splitModelId(modelId);
       const connector = this.byId(harness as HarnessId);
-      if (!connector) return undefined;
-      return { connector, model: namespaced ? modelId.slice(separator + 1) : modelId };
+      return connector ? { connector, model } : undefined;
     },
     async discoveries() {
       return Promise.all(connectors().map(async (connector) => ({
@@ -53,4 +49,14 @@ export function createConnectorRegistry(options: {
       })));
     },
   };
+}
+
+// A harness namespace is the text before the first ":" only when that ":" precedes any "/"; provider ids may contain ":".
+export function splitModelId(modelId: string): { harness: string; model: string } {
+  const separator = modelId.indexOf(":");
+  const slash = modelId.indexOf("/");
+  const namespaced = separator >= 0 && (slash < 0 || separator < slash);
+  return namespaced
+    ? { harness: modelId.slice(0, separator), model: modelId.slice(separator + 1) }
+    : { harness: "pi", model: modelId };
 }

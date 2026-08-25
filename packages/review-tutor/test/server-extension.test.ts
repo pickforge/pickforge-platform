@@ -362,6 +362,7 @@ describe("connector protocol boundary", () => {
         error: "model selection failed: unknown harness; refresh state and retry",
       });
 
+      await waitFor(async () => ((await (await call(server.port, server.token, "/api/log")).json()) as unknown[]).length === 2);
       const exported = await (await call(server.port, server.token, "/api/export")).text();
       expect(exported).toContain("<dt>Harness</dt><dd>Pi</dd>");
       expect(exported).toContain("<dt>Model</dt><dd>provider/model</dd>");

@@ -1656,7 +1656,8 @@ describe("Review Tutor composed page", () => {
     const { document } = await boot();
     const css = document.querySelector("style")?.textContent ?? "";
     expect(css).toContain("transition:grid-template-columns 200ms ease");
-    expect(css).toContain(".diff-row {\ncontent-visibility:auto;contain-intrinsic-block-size:auto 25px;");
+    expect(css).toContain(".rows-chunk {\ncontent-visibility:auto;contain-intrinsic-block-size:auto 3000px}");
+    expect(document.querySelectorAll(".rows-chunk .diff-row").length).toBe(document.querySelectorAll(".diff-row").length);
     expect(css).toContain(".rail {\nposition:relative;min-height:0;overflow:hidden auto;");
     expect(css).toContain(".config-section {\nwidth:clamp(320px,30vw,400px);");
     expect(css).toContain(".rail-toggle {\nposition:absolute;top:14px;right:8px;");

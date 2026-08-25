@@ -88,8 +88,8 @@ export const pageScript = String.raw`
   const MAX_SELECTED_BYTES = 16 * 1024;
   const MAX_CONTEXT_BYTES = 32 * 1024;
   const MOBILE_BREAKPOINT = 860;
-  const COLLAPSED_RAIL_WIDTH = 44;
   const RAIL_TRANSITION_MS = 200;
+  const ROWS_PER_CHUNK = 120;
   const encoder = new TextEncoder();
   function readQuizEntryIds() {
     try {
@@ -1564,12 +1564,19 @@ export const pageScript = String.raw`
       rows.className = "rows";
       rows.setAttribute("role", "group");
       rows.setAttribute("aria-label", file.path + " selectable lines");
+      // Rows are grouped into chunks that skip layout while off-screen, so large diffs stay cheap to resize and scroll.
+      let chunk = null;
       file.lines.forEach((data, rowIndex) => {
+        if (rowIndex % ROWS_PER_CHUNK === 0) {
+          chunk = document.createElement("div");
+          chunk.className = "rows-chunk";
+          rows.append(chunk);
+        }
         const row = document.createElement("div");
         row.className = "diff-row " + data.kind;
         if (data.kind === "hunk" || data.kind === "meta") {
           row.textContent = data.text;
-          rows.append(row);
+          chunk.append(row);
           return;
         }
         row.dataset.file = String(fileIndex);
@@ -1601,7 +1608,7 @@ export const pageScript = String.raw`
           ),
           makeSpan("code", data.text),
         );
-        rows.append(row);
+        chunk.append(row);
       });
       rows.addEventListener("pointerdown", (event) => {
         const row = event.target.closest(".diff-row[data-row]");
@@ -2338,13 +2345,11 @@ export const pageScript = String.raw`
     holdDiffWidth();
     applyRail();
   });
-  // While the rail width transitions, the diff keeps its final width so its rows lay out once, not every frame.
+  // While the rail width transitions, the diff keeps its current width so its rows lay out once at the end, not every frame.
   function holdDiffWidth() {
     if (typeof matchMedia !== "function" || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     const scroll = element("diff-scroll");
-    const width = element("diff-pane").getBoundingClientRect().width;
-    const railWidth = document.querySelector(".rail").getBoundingClientRect().width;
-    scroll.style.width = (railCollapsed ? width + railWidth - COLLAPSED_RAIL_WIDTH : width) + "px";
+    scroll.style.width = scroll.getBoundingClientRect().width + "px";
     clearTimeout(holdDiffWidth.timer);
     holdDiffWidth.timer = setTimeout(() => { scroll.style.width = ""; }, RAIL_TRANSITION_MS + 20);
   }

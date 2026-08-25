@@ -122,8 +122,10 @@ font:12px var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:no
 margin-left:auto;flex:none;font:12px var(--font-mono);font-variant-numeric:tabular-nums}
 .rows {
 min-width:0}
+.rows-chunk {
+content-visibility:auto;contain-intrinsic-block-size:auto 3000px}
 .diff-row {
-content-visibility:auto;contain-intrinsic-block-size:auto 25px;display:grid;grid-template-columns:52px 52px 24px minmax(0,1fr);min-height:25px;align-items:stretch;font:12.5px/25px var(--font-mono);position:relative}
+display:grid;grid-template-columns:52px 52px 24px minmax(0,1fr);min-height:25px;align-items:stretch;font:12.5px/25px var(--font-mono);position:relative}
 .diff-row.meta {
 display:block;padding:3px 14px;min-height:0;color:var(--muted);background:transparent;font:10.5px/1.5 var(--font-mono);white-space:pre-wrap}
 .diff-row.hunk {

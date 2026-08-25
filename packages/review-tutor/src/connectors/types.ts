@@ -13,6 +13,7 @@ export interface HarnessConnector {
 export interface DiscoveryDeps {
   piModels: ModelChoice[];
   piVersion?: string;
+  which(command: string): Promise<string | undefined>;
 }
 
 export type Discovery =

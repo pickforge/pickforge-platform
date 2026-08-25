@@ -1,4 +1,6 @@
+import { execFile } from "node:child_process";
 import type { ReviewTutorFlags } from "../flags.ts";
+import { ClaudeCodeConnector } from "./claude-code.ts";
 import { PiConnector } from "./pi.ts";
 import type {
   Discovery,
@@ -15,16 +17,26 @@ export interface ConnectorRegistry {
   discoveries(): Promise<Array<{ connector: HarnessConnector; discovery: Discovery }>>;
 }
 
+function which(command: string): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    execFile(command, ["--version"], { encoding: "utf8", shell: false }, (error, stdout) => {
+      resolve(error ? undefined : stdout);
+    });
+  });
+}
+
 export function createConnectorRegistry(options: {
   flags: ReviewTutorFlags;
   piModels: ModelChoice[];
   piVersion?: string;
+  which?: DiscoveryDeps["which"];
 }): ConnectorRegistry {
   const pi = new PiConnector();
-  const optionalConnectors: HarnessConnector[] = [];
+  const optionalConnectors: HarnessConnector[] = [new ClaudeCodeConnector()];
   const dependencies: DiscoveryDeps = {
     piModels: options.piModels,
     ...(options.piVersion ? { piVersion: options.piVersion } : {}),
+    which: options.which ?? which,
   };
 
   const connectors = (): HarnessConnector[] => [

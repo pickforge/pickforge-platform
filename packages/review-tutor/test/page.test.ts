@@ -290,7 +290,7 @@ describe("Review Tutor composed page", () => {
     expect(pageHtml).toContain("@media(max-width:860px)");
     expect(pageHtml).toContain(".diff-pane {\nmin-width:0;min-height:0;");
     expect(pageHtml).toContain(".toolbar select {\nwidth:auto;flex:1 1 120px;min-width:120px;max-width:280px}");
-    expect(pageHtml).toContain(".rail {\nmin-height:0;overflow-y:auto;");
+    expect(pageHtml).toContain(".rail {\nposition:relative;min-height:0;overflow-y:auto;");
     expect(pageHtml).toContain('role="region" aria-labelledby="tutor-title"');
     expect(pageHtml).toContain(".diff-pane>.tutor.open");
     expect(pageHtml).toContain("max-height:100%;overflow:auto");
@@ -1650,6 +1650,38 @@ describe("Review Tutor composed page", () => {
     expect(byId(document, "answer-text").textContent).toBe("");
     expect(byId(document, "answer").hidden).toBe(true);
     expect(byId(document, "history-pager").hidden).toBe(true);
+  });
+
+  it("collapses the rail with one layout pass and transform-only animation", async () => {
+    const { window, document } = await boot();
+    const rail = document.querySelector(".rail") as any;
+    const diffPane = byId(document, "diff-pane") as any;
+    const calls: Array<{ target: string; keyframes: any[] }> = [];
+    for (const [target, node] of [["rail", rail], ["diff", diffPane]] as const) {
+      node.animate = (keyframes: any[]) => { calls.push({ target, keyframes }); return {}; };
+    }
+    const original = document.querySelector(".workbench")!;
+    rail.getBoundingClientRect = () => ({ left: original.classList.contains("rail-collapsed") ? 1300 : 1000 });
+    let reduced = false;
+    (window as any).matchMedia = () => ({ matches: reduced });
+
+    byId(document, "toggle-rail").click();
+    expect(original.classList.contains("rail-collapsed")).toBe(true);
+    expect(calls.map((call) => call.target)).toEqual(["rail", "diff"]);
+    expect(calls[0]?.keyframes).toEqual([{ transform: "translateX(-300px)" }, { transform: "none" }]);
+    expect(calls[1]?.keyframes).toEqual([{ clipPath: "inset(0 300px 0 0)" }, { clipPath: "inset(0)" }]);
+
+    calls.length = 0;
+    byId(document, "toggle-rail").click();
+    expect(original.classList.contains("rail-collapsed")).toBe(false);
+    expect(calls.map((call) => call.target)).toEqual(["rail"]);
+    expect(calls[0]?.keyframes[0]).toEqual({ transform: "translateX(300px)" });
+
+    calls.length = 0;
+    reduced = true;
+    byId(document, "toggle-rail").click();
+    expect(original.classList.contains("rail-collapsed")).toBe(true);
+    expect(calls).toEqual([]);
   });
 
   it("opens mobile configuration as the sole dialog and restores the desktop collapse preference", async () => {

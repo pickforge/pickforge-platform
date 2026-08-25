@@ -2333,8 +2333,18 @@ export const pageScript = String.raw`
     if (innerWidth <= MOBILE_BREAKPOINT) { closeConfig(); return; }
     railCollapsed = !railCollapsed;
     sessionStorage.setItem("reviewTutorRailCollapsed", railCollapsed ? "1" : "0");
+    const rail = document.querySelector(".rail");
+    const before = rail.getBoundingClientRect().left;
     applyRail();
+    slideRail(rail, before - rail.getBoundingClientRect().left);
   });
+  // One layout pass, then transforms only: the rail slides into place and the diff is unclipped in step with it.
+  function slideRail(rail, offset) {
+    if (!offset || typeof rail.animate !== "function" || typeof matchMedia !== "function" || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const timing = { duration: 200, easing: "ease" };
+    rail.animate([{ transform: "translateX(" + offset + "px)" }, { transform: "none" }], timing);
+    if (offset < 0) element("diff-pane").animate([{ clipPath: "inset(0 " + -offset + "px 0 0)" }, { clipPath: "inset(0)" }], timing);
+  }
   element("jump-log").addEventListener("click", () => {
     if (innerWidth <= MOBILE_BREAKPOINT) closeConfig(false);
     setView("log", true);

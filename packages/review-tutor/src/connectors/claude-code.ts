@@ -23,6 +23,7 @@ interface ClaudeEvent {
   subtype?: unknown;
   is_error?: unknown;
   result?: unknown;
+  model?: unknown;
   total_cost_usd?: unknown;
   permissionMode?: unknown;
   tools?: unknown;
@@ -34,8 +35,8 @@ interface ClaudeEvent {
   message?: { content?: unknown };
 }
 
-function versionAtLeast(major: number, minor: number, patch: number): boolean {
-  return major > 2 || (major === 2 && (minor > 1 || (minor === 1 && patch >= 0)));
+function versionAtLeast(major: number, minor: number): boolean {
+  return major > 2 || (major === 2 && minor >= 1);
 }
 
 function assistantText(content: unknown): string | undefined {
@@ -69,10 +70,9 @@ function eventDelta(event: ClaudeEvent): string | undefined {
     : undefined;
 }
 
-function eventUsage(event: ClaudeEvent): Record<string, number> {
-  const usage = event.usage && typeof event.usage === "object"
-    ? event.usage as Record<string, unknown>
-    : {};
+function eventUsage(event: ClaudeEvent): Record<string, number> | undefined {
+  if (!event.usage || typeof event.usage !== "object") return undefined;
+  const usage = event.usage as Record<string, unknown>;
   const answerUsage: Record<string, number> = {};
   if (typeof usage.input_tokens === "number") answerUsage.input_tokens = usage.input_tokens;
   if (typeof usage.output_tokens === "number") answerUsage.output_tokens = usage.output_tokens;
@@ -85,7 +85,6 @@ export class ClaudeCodeConnector implements HarnessConnector {
   readonly id = "claude-code" as const;
   readonly label = "Claude Code";
   readonly envKeys = ["CLAUDE_CONFIG_DIR"] as const;
-  private latestAssistant?: string;
   private model = "unknown";
   private sawResult = false;
 
@@ -102,7 +101,7 @@ export class ClaudeCodeConnector implements HarnessConnector {
       return { available: false, reason: "Claude Code version could not be parsed." };
     }
     const version = `${match[1]}.${match[2]}.${match[3]}`;
-    if (!versionAtLeast(Number(match[1]), Number(match[2]), Number(match[3]))) {
+    if (!versionAtLeast(Number(match[1]), Number(match[2]))) {
       return {
         available: false,
         reason: `Claude Code ${version} is too old; 2.1.0 or newer is required.`,
@@ -112,9 +111,6 @@ export class ClaudeCodeConnector implements HarnessConnector {
   }
 
   spawnSpec(request: ConnectorRequest): SpawnSpec {
-    this.latestAssistant = undefined;
-    this.model = request.model;
-    this.sawResult = false;
     return {
       command: "claude",
       args: [
@@ -136,11 +132,14 @@ export class ClaudeCodeConnector implements HarnessConnector {
     }
 
     validateInit(event);
+    if (event.type === "system" && event.subtype === "init" && typeof event.model === "string") {
+      this.model = event.model;
+    }
     const delta = eventDelta(event);
     if (delta !== undefined) sink.delta(delta);
     if (event.type === "assistant") {
       const latest = assistantText(event.message?.content);
-      if (latest !== undefined) this.latestAssistant = latest;
+      if (latest !== undefined) sink.final(latest);
     }
     if (event.type === "result") this.handleResult(event, sink);
   }
@@ -148,21 +147,29 @@ export class ClaudeCodeConnector implements HarnessConnector {
   private handleResult(event: ClaudeEvent, sink: ParseSink): void {
     this.sawResult = true;
     if (event.is_error === true || event.subtype !== "success") {
-      throw new ConnectorError(this.failureMessage(event.result));
+      const message = this.failureMessage(event.result);
+      this.sawResult = false;
+      this.model = "unknown";
+      throw new ConnectorError(message);
     }
-    sink.usage(eventUsage(event));
-    const answer = typeof event.result === "string" ? event.result : this.latestAssistant;
-    if (answer !== undefined) sink.final(answer);
+    const usage = eventUsage(event);
+    if (usage !== undefined) sink.usage(usage);
+    if (typeof event.result === "string") sink.final(event.result);
   }
 
   finish(sink: ParseSink): ParsedAnswer {
-    if (!this.sawResult) {
-      throw new ConnectorError("Claude Code exited without a result.");
+    try {
+      if (!this.sawResult) {
+        throw new ConnectorError("Claude Code exited without a result.");
+      }
+      if (!sink.answer?.trim()) {
+        throw new ConnectorError("Claude Code returned an empty answer.");
+      }
+      return { answer: sink.answer, ...(sink.answerUsage ? { usage: sink.answerUsage } : {}) };
+    } finally {
+      this.sawResult = false;
+      this.model = "unknown";
     }
-    if (!sink.answer?.trim()) {
-      throw new ConnectorError("Claude Code returned an empty answer.");
-    }
-    return { answer: sink.answer, ...(sink.answerUsage ? { usage: sink.answerUsage } : {}) };
   }
 
   private failureMessage(value: unknown): string {

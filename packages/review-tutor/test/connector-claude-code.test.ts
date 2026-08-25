@@ -50,7 +50,6 @@ function sink() {
 
 async function parseFixture(name: string) {
   const connector = new ClaudeCodeConnector();
-  connector.spawnSpec(request);
   const target = sink();
   const fixture = await readFile(`${fixtureRoot}${name}.jsonl`, "utf8");
   for (const line of fixture.split("\n")) {
@@ -105,7 +104,7 @@ describe("Claude Code stream parsing", () => {
     const { connector, target } = await parseFixture("success");
     expect(target.deltas).toEqual(["o", "k"]);
     expect(target.usages).toEqual([{ input_tokens: 3, output_tokens: 1, total_cost_usd: 0.01 }]);
-    expect(target.finals).toEqual(["ok"]);
+    expect(target.finals).toEqual(["partial assistant copy", "ok"]);
     expect(connector.finish(target)).toEqual({
       answer: "ok",
       usage: { input_tokens: 3, output_tokens: 1, total_cost_usd: 0.01 },
@@ -123,15 +122,15 @@ describe("Claude Code stream parsing", () => {
     ["invalid model alias", "Claude Code rejected model sonnet."],
   ])("maps result failure %j", (result, message) => {
     const connector = new ClaudeCodeConnector();
-    connector.spawnSpec(request);
+    const target = sink();
+    connector.parseLine(JSON.stringify({ type: "system", subtype: "init", model: "sonnet" }), target);
     expect(() => connector.parseLine(JSON.stringify({
       type: "result", subtype: "error_during_execution", is_error: true, result,
-    }), sink())).toThrow(message);
+    }), target)).toThrow(message);
   });
 
   it("bounds and redacts an unmapped result failure", () => {
     const connector = new ClaudeCodeConnector();
-    connector.spawnSpec(request);
     const result = `sk-ant-fakefakefake ${"x".repeat(220)}`;
     expect(() => connector.parseLine(JSON.stringify({
       type: "result", subtype: "error_during_execution", is_error: true, result,
@@ -148,9 +147,44 @@ describe("Claude Code stream parsing", () => {
     expect(connector.finish(target)).toMatchObject({ answer: "ok" });
   });
 
+  it("does not report usage when the result omits it", () => {
+    const connector = new ClaudeCodeConnector();
+    const target = sink();
+    connector.parseLine(JSON.stringify({
+      type: "result", subtype: "success", is_error: false, result: "ok",
+    }), target);
+    expect(target.usages).toEqual([]);
+    expect(connector.finish(target)).toEqual({ answer: "ok" });
+  });
+
+  it("keeps answers isolated across sequential asks", () => {
+    const connector = new ClaudeCodeConnector();
+    const first = sink();
+    connector.parseLine(JSON.stringify({
+      type: "assistant", message: { content: [{ type: "text", text: "first" }] },
+    }), first);
+    connector.parseLine(JSON.stringify({ type: "result", subtype: "success" }), first);
+    expect(connector.finish(first).answer).toBe("first");
+
+    const second = sink();
+    connector.parseLine(JSON.stringify({
+      type: "assistant", message: { content: [{ type: "text", text: "second" }] },
+    }), second);
+    connector.parseLine(JSON.stringify({ type: "result", subtype: "success" }), second);
+    expect(connector.finish(second).answer).toBe("second");
+    expect(second.answer).not.toContain("first");
+  });
+
+  it("clears terminal state when finishing throws", () => {
+    const connector = new ClaudeCodeConnector();
+    const empty = sink();
+    connector.parseLine(JSON.stringify({ type: "result", subtype: "success", result: "" }), empty);
+    expect(() => connector.finish(empty)).toThrow("Claude Code returned an empty answer.");
+    expect(() => connector.finish(sink())).toThrow("Claude Code exited without a result.");
+  });
+
   it("refuses an init event with a write-capable tool", async () => {
     const connector = new ClaudeCodeConnector();
-    connector.spawnSpec(request);
     const target = sink();
     const fixture = await readFile(`${fixtureRoot}unsafe-init.jsonl`, "utf8");
     expect(() => connector.parseLine(fixture.trim(), target)).toThrow(
@@ -160,7 +194,6 @@ describe("Claude Code stream parsing", () => {
 
   it("refuses an init event with the wrong permission mode", () => {
     const connector = new ClaudeCodeConnector();
-    connector.spawnSpec(request);
     expect(() => connector.parseLine(JSON.stringify({
       type: "system", subtype: "init", permissionMode: "default", tools: ["Read", "Grep", "Glob"],
     }), sink())).toThrow("Claude Code did not honour the read-only tool set; refusing to continue.");

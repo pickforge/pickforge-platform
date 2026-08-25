@@ -42,7 +42,7 @@ With no argument, choose a source in the browser. The browser supports worktree,
 
 ## Model selection
 
-The model dialog lists the session's scoped models when `--models` or the settings scope configures them. Otherwise, it lists all available models. Thinking levels are offered only for reasoning models. A scope entry with an explicit level, such as `gpt-5.6-sol:high`, pins the tutor to that level.
+The model dialog lists the session's scoped models when `--models` or the settings scope configures them. Otherwise, it lists all available models. Thinking levels are offered only for reasoning models. Thinking levels are enforced by the server's model membership check. A scope entry with an explicit level, such as `gpt-5.6-sol:high`, pins the tutor to that level.
 
 ## Harness connectors
 

@@ -2350,6 +2350,7 @@ export const pageScript = String.raw`
   function holdDiffWidth() {
     if (typeof matchMedia !== "function" || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     const scroll = element("diff-scroll");
+    scroll.style.width = "";
     const width = scroll.getBoundingClientRect().width;
     const railWidth = document.querySelector(".rail").getBoundingClientRect().width;
     scroll.style.width = (railCollapsed ? width + railWidth - COLLAPSED_RAIL_WIDTH : width) + "px";

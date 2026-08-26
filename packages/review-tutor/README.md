@@ -46,7 +46,7 @@ The model dialog lists the session's scoped models when `--models` or the settin
 
 ## Harness connectors
 
-A harness connector owns model discovery, isolated invocation, and stream parsing while the shared runner owns process lifetime, bounds, and cancellation. Pi is registered by default; the Claude Code and Codex connectors are available behind `reviewTutorHarnessConnectors`. The flag defaults off. For local testing on main, set `REVIEW_TUTOR_FLAGS=reviewTutorHarnessConnectors` before starting Pi. Child processes receive only the shared environment allowlist plus keys explicitly declared by their connector, and runner failures redact common API keys, bearer credentials, and tokens before leaving the process boundary.
+A harness connector owns model discovery, isolated invocation, and stream parsing while the shared runner owns process lifetime, bounds, and cancellation. Pi, Claude Code, and Codex are registered; a connector appears in the Harness picker only when its executable is found and supported at startup, and the helper line explains any that are not. Child processes receive only the shared environment allowlist plus keys explicitly declared by their connector, and runner failures redact common API keys, bearer credentials, and tokens before leaving the process boundary.
 
 The Claude Code connector forwards `CLAUDE_CONFIG_DIR` when present, but never forwards `ANTHROPIC_API_KEY`; users who rely on that environment key must sign in through Claude Code instead.
 

@@ -6,7 +6,6 @@ import { describe, expect, it, vi } from "vitest";
 import { CodexConnector, discoveryEnvironment } from "../src/connectors/codex.ts";
 import { createConnectorRegistry } from "../src/connectors/registry.ts";
 import type { DiscoveryDeps, ParseSink } from "../src/connectors/types.ts";
-import { createReviewTutorFlags } from "../src/flags.ts";
 import { TutorRunner } from "../src/runner.ts";
 
 class FakeChild extends EventEmitter {
@@ -406,19 +405,14 @@ describe("Codex runner integration", () => {
 });
 
 describe("Codex registry", () => {
-  it("registers Codex only with the flag and preserves unavailable discovery", async () => {
-    const off = createConnectorRegistry({
-      flags: createReviewTutorFlags({ get: () => false, set: () => {} }),
-      piModels,
-    });
+  it("registers Codex and preserves unavailable discovery", async () => {
     const on = createConnectorRegistry({
-      flags: createReviewTutorFlags({ get: () => true, set: () => {} }),
       piModels,
+      which: async () => undefined,
       execFile: fakeDiscovery({
         "--version": Object.assign(new Error("spawn codex ENOENT"), { code: "ENOENT" }),
       }).execFile,
     });
-    expect(off.connectors().map(({ id }) => id)).toEqual(["pi"]);
     expect(on.connectors().map(({ id }) => id)).toEqual(["pi", "claude-code", "codex"]);
     const discoveries = await on.discoveries();
     expect(discoveries.find(({ connector }) => connector.id === "codex")).toEqual({

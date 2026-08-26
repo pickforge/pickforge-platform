@@ -74,6 +74,8 @@ function applyFlag(options: CliOptions, argv: readonly string[], index: number):
   return index;
 }
 
+const SOURCE_CHARACTERS = /^[A-Za-z0-9._/:@#~^-]+$/;
+
 export function parseArguments(argv: readonly string[]): CliOptions {
   const options: CliOptions = { open: true, detach: false, serveDetached: false, help: false };
   const positional: string[] = [];
@@ -83,7 +85,10 @@ export function parseArguments(argv: readonly string[]): CliOptions {
     else positional.push(argument);
   }
   if (positional.length > 1) throw new UsageError(`unexpected argument ${positional[1]!}`);
-  options.source = sourceFromArgument(positional[0] ?? "worktree");
+  const source = positional[0] ?? "worktree";
+  // Sources are revisions, ranges, or GitHub URLs; anything else is refused before it can reach a shell or Git.
+  if (!SOURCE_CHARACTERS.test(source)) throw new UsageError("source may only contain letters, digits, and . _ / : @ # ~ ^ -");
+  options.source = sourceFromArgument(source);
   return options;
 }
 

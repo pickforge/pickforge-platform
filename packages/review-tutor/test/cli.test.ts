@@ -127,6 +127,17 @@ describe("command line parsing", () => {
     },
   );
 
+  it.each([["$(id)"], ["a b"], ["x;y"], ["`ls`"], ["'q'"]])("refuses the source %j before it reaches Git or a shell", (source) => {
+    expect(() => parseArguments([source])).toThrow(/source may only contain/);
+  });
+
+  it.each([["worktree"], ["staged"], ["main...HEAD"], ["abc123"], ["https://github.com/pickforge/pickforge-platform/pull/83"], ["v0.12.0~1^2"]])(
+    "accepts the source %s",
+    (source) => {
+      expect(parseArguments([source]).source).toBeDefined();
+    },
+  );
+
   it("reports usage on stderr and exits 2 for an unknown flag", async () => {
     const { deps, out, err } = harness();
     await expect(runCli(["--nope"], deps)).resolves.toBe(2);

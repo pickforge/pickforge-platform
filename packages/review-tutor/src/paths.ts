@@ -1,6 +1,16 @@
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+/**
+ * Both loaders sit exactly one directory below the package root: Pi imports
+ * `src/paths.ts` from TS source and the built CLI bundles this file into
+ * `dist/cli.js`, so one `..` reaches the shipped skill from either location.
+ */
+export function defaultSkillPath(): string {
+  return fileURLToPath(new URL("../skills/review-tutor/SKILL.md", import.meta.url));
+}
 
 export interface StatePaths {
   root: string;

@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { setImmediate as yieldToEventLoop } from "node:timers";
+import { setTimeout as realSetTimeout } from "node:timers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   IdleTracker,
@@ -85,14 +85,15 @@ function harness(overrides: Partial<CliDeps> = {}): Harness {
 
 /** Yields to the real event loop under both timer modes so pending file-system work can land. */
 async function settle(check: () => boolean = () => true): Promise<void> {
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    // node:timers keeps the real setImmediate even while the global one is faked,
-    // so file-system callbacks (realpath, spawn) can land before the next check.
-    await new Promise((resolve) => yieldToEventLoop(resolve));
+  // node:timers keeps the real setTimeout even while the global one is faked, so
+  // file-system callbacks (realpath) can land on a slow runner before the next check.
+  const deadline = process.hrtime.bigint() + 5_000_000_000n;
+  while (process.hrtime.bigint() < deadline) {
+    await new Promise((resolve) => realSetTimeout(resolve, 2));
     if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(1);
     if (check()) return;
   }
-  throw new Error("test barrier failed: expected condition within 200 attempts");
+  throw new Error("test barrier failed: expected condition within 5 s");
 }
 
 afterEach(() => {

@@ -7,6 +7,8 @@ import type { ReviewTutorServer } from "./server.ts";
 type NodeExecFile = typeof nodeExecFile;
 
 const COMMAND_BUFFER = 1024 * 1024;
+const REPOSITORY_TIMEOUT_MS = 5_000;
+const BROWSER_TIMEOUT_MS = 10_000;
 
 export function createExecFileAdapter(execFile: NodeExecFile = nodeExecFile): ExecFile {
   return (file, argv, options) => new Promise((resolve, reject) => {
@@ -14,7 +16,7 @@ export function createExecFileAdapter(execFile: NodeExecFile = nodeExecFile): Ex
       cwd: options.cwd,
       encoding: options.encoding,
       maxBuffer: options.maxBuffer,
-      timeout: 30_000,
+      timeout: options.timeoutMs ?? 30_000,
       shell: false,
       ...(options.signal ? { signal: options.signal } : {}),
     }, (error, stdout, stderr) => {
@@ -56,6 +58,7 @@ export async function resolveRepository(cwd: string, execFile: ExecFile): Promis
       cwd,
       encoding: "utf8",
       maxBuffer: COMMAND_BUFFER,
+      timeoutMs: REPOSITORY_TIMEOUT_MS,
     }));
   } catch (error) {
     const code = (error as { code?: unknown }).code;
@@ -85,6 +88,7 @@ export async function openInBrowser(
       cwd: process.cwd(),
       encoding: "utf8",
       maxBuffer: COMMAND_BUFFER,
+      timeoutMs: BROWSER_TIMEOUT_MS,
     });
     return true;
   } catch {

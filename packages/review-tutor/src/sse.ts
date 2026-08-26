@@ -3,6 +3,7 @@ import type { SseEvent, SseEventType } from "./protocol.ts";
 
 export class SseHub {
   private next = 1;
+  private connections = 0;
   private readonly ring: SseEvent[] = [];
   private readonly clients = new Set<ServerResponse>();
 
@@ -10,6 +11,11 @@ export class SseHub {
 
   get clientCount(): number {
     return this.clients.size;
+  }
+
+  /** Counts every client ever attached, so a connection that lands between two polls is still visible. */
+  get connectionGeneration(): number {
+    return this.connections;
   }
 
   emit(type: SseEventType, data: unknown): SseEvent {
@@ -38,6 +44,7 @@ export class SseHub {
   connect(response: ServerResponse, since: number): () => void {
     if (this.isDead(response)) return () => {};
 
+    this.connections += 1;
     this.clients.add(response);
     for (const event of this.since(since)) {
       if (!this.write(response, this.format(event))) {

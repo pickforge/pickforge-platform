@@ -1,8 +1,6 @@
-#!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { realpath } from "node:fs/promises";
 import type { Readable } from "node:stream";
-import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   createExecFileAdapter,
   openInBrowser,
@@ -89,14 +87,21 @@ export function parseArguments(argv: readonly string[]): CliOptions {
   return options;
 }
 
-/** Zero clients for one whole window, not merely at the moment of a check. */
+/**
+ * Zero clients for one whole window. A page that connects and leaves entirely
+ * between two polls still shows up as a new connection generation, so it
+ * restarts the window instead of being missed.
+ */
 export class IdleTracker {
   private idleSince: number | undefined;
+  private generation: number | undefined;
 
   constructor(private readonly windowMs = IDLE_EXIT_MS) {}
 
-  expired(clientCount: number, now: number): boolean {
-    if (clientCount > 0) {
+  expired(clientCount: number, generation: number, now: number): boolean {
+    const moved = this.generation !== undefined && generation !== this.generation;
+    this.generation = generation;
+    if (clientCount > 0 || moved) {
       this.idleSince = undefined;
       return false;
     }
@@ -109,7 +114,7 @@ function waitForIdle(server: StartedReviewTutorServer): Promise<void> {
   return new Promise((resolve) => {
     const tracker = new IdleTracker();
     const timer = setInterval(() => {
-      if (!tracker.expired(server.clientCount(), Date.now())) return;
+      if (!tracker.expired(server.clientCount(), server.connectionGeneration(), Date.now())) return;
       clearInterval(timer);
       resolve();
     }, IDLE_CHECK_MS);
@@ -147,15 +152,17 @@ async function runServer(options: CliOptions, deps: CliDeps): Promise<number> {
     ...(options.source ? { initialSource: options.source } : {}),
     ...(options.home ? { home: options.home } : {}),
   });
+  // Armed before the browser call so a signal during that call still shuts the server down once.
+  const stopped = Promise.race([
+    new Promise<void>((resolve) => deps.signals(resolve)),
+    ...(options.serveDetached ? [waitForIdle(server)] : []),
+  ]);
   deps.stderr(`${await discoverySummary(registry)}\n`);
   deps.stdout(`${server.url}\n`);
   if (options.open && !options.serveDetached && !await deps.openInBrowser(server.url)) {
     deps.stderr("Could not open a browser. Open the URL above.\n");
   }
-  await Promise.race([
-    new Promise<void>((resolve) => deps.signals(resolve)),
-    ...(options.serveDetached ? [waitForIdle(server)] : []),
-  ]);
+  await stopped;
   await server.close();
   return 0;
 }
@@ -181,6 +188,8 @@ function readUrlLine(child: DetachedChild, timeoutMs: number): Promise<string> {
     const fail = (reason: string): void => {
       clearTimeout(timer);
       stdout.off("data", onData);
+      stdout.destroy();
+      child.unref();
       reject(new Error(reason));
     };
     timer = setTimeout(() => {
@@ -250,9 +259,4 @@ export function nodeCliDeps(scriptPath: string): CliDeps {
       stdio: ["ignore", "pipe", "ignore"],
     }),
   };
-}
-
-const entry = process.argv[1];
-if (entry && pathToFileURL(entry).href === import.meta.url) {
-  process.exitCode = await runCli(process.argv.slice(2), nodeCliDeps(fileURLToPath(import.meta.url)));
 }

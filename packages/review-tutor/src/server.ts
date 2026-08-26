@@ -32,9 +32,10 @@ export interface ReviewTutorServer {
   port: number;
 }
 
-/** A started server also reports its live SSE clients, which is how a detached CLI knows it is idle. */
+/** A started server also reports its SSE traffic, which is how a detached CLI knows it is idle. */
 export interface StartedReviewTutorServer extends ReviewTutorServer {
   clientCount(): number;
+  connectionGeneration(): number;
 }
 
 const responseHeaders = {
@@ -209,6 +210,7 @@ export async function startReviewTutorServer(options: ServerOptions): Promise<St
     url: `http://127.0.0.1:${port}/?session=${encodeURIComponent(token)}`,
     close,
     clientCount: () => hub.clientCount,
+    connectionGeneration: () => hub.connectionGeneration,
   };
 }
 

@@ -10,6 +10,7 @@ export type ExecFile = (
     maxBuffer: number;
     encoding: "utf8";
     signal?: AbortSignal;
+    timeoutMs?: number;
   },
 ) => Promise<{ stdout: string; stderr: string }>;
 

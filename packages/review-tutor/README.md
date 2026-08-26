@@ -46,7 +46,7 @@ The same tutor runs without a Pi host. Build the CLI once, then run it from any 
 
 ```bash
 bun run --cwd packages/review-tutor build
-node packages/review-tutor/dist/cli.js [source] [--no-open] [--detach] [--home <dir>]
+node packages/review-tutor/dist/bin.js [source] [--no-open] [--detach] [--home <dir>]
 ```
 
 An installed package exposes it as `review-tutor`. `source` accepts the same values as the Pi command and defaults to `worktree`. The URL is the only line on stdout; discovery results go to stderr. Unknown flags print usage on stderr and exit 2.

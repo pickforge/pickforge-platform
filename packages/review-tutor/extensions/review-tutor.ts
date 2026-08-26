@@ -12,12 +12,30 @@ import {
 } from "../src/cli-support.ts";
 import { createConnectorRegistry } from "../src/connectors/registry.ts";
 import { defaultSkillPath } from "../src/paths.ts";
+import type { ExecFile } from "../src/inputs.ts";
 import type { ModelChoice } from "../src/protocol.ts";
 import { startReviewTutorServer } from "../src/server.ts";
 
 export { createExecFileAdapter, createServerLifecycle } from "../src/cli-support.ts";
 
 const skillPath = defaultSkillPath();
+
+/** Repository resolution and browser opening stay on the host's own exec, with the host's timeouts. */
+export function piExecFile(pi: ExtensionAPI): ExecFile {
+  return async (file, argv, options) => {
+    const result = await pi.exec(file, argv, {
+      cwd: options.cwd,
+      ...(options.timeoutMs ? { timeout: options.timeoutMs } : {}),
+    });
+    if (result.code !== 0) {
+      throw Object.assign(new Error(`${file} exited with code ${result.code}`), {
+        code: result.code,
+        stderr: result.stderr,
+      });
+    }
+    return { stdout: result.stdout, stderr: result.stderr };
+  };
+}
 
 function safeNotify(
   ctx: ExtensionCommandContext,
@@ -77,6 +95,7 @@ function notifyBrowserResult(
 export default function reviewTutorExtension(pi: ExtensionAPI): void {
   const lifecycle = createServerLifecycle();
   const execFile = createExecFileAdapter();
+  const hostExecFile = piExecFile(pi);
 
   pi.registerCommand("review-tutor", {
     description: "Open the local Review Tutor for a PR, diff, commit, or pasted code",
@@ -93,7 +112,7 @@ export default function reviewTutorExtension(pi: ExtensionAPI): void {
 
         const server = await lifecycle.start(async (startupSignal) => {
           const cwd = await realpath(ctx.cwd);
-          const canonicalRepo = await resolveRepository(cwd, execFile);
+          const canonicalRepo = await resolveRepository(cwd, hostExecFile);
           const piModels = modelChoices(ctx);
           if (!piModels.length) {
             throw new Error(
@@ -114,7 +133,7 @@ export default function reviewTutorExtension(pi: ExtensionAPI): void {
         if (!server) return;
 
         safeStatus(ctx, "Review Tutor running");
-        const opened = await openInBrowser(server.url, process.platform, execFile);
+        const opened = await openInBrowser(server.url, process.platform, hostExecFile);
         notifyBrowserResult(ctx, opened, server.url);
       } catch (error) {
         safeStatus(ctx);

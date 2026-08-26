@@ -22,8 +22,12 @@ class FakeChild extends EventEmitter implements DetachedChild {
   kill = vi.fn(() => true);
 }
 
-function fakeServer(close = vi.fn(async () => {}), clientCount = () => 0): StartedReviewTutorServer {
-  return { url: URL_LINE, token: "token", port: 4321, close, clientCount };
+function fakeServer(
+  close = vi.fn(async () => {}),
+  clientCount = () => 0,
+  connectionGeneration = () => 0,
+): StartedReviewTutorServer {
+  return { url: URL_LINE, token: "token", port: 4321, close, clientCount, connectionGeneration };
 }
 
 interface Harness {
@@ -176,6 +180,23 @@ describe("foreground run", () => {
     await expect(run).resolves.toBe(0);
   });
 
+  it("shuts down once for a signal that arrives while the browser is still opening", async () => {
+    let openBrowser!: (opened: boolean) => void;
+    const context = harness({
+      openInBrowser: vi.fn(() => new Promise<boolean>((resolve) => { openBrowser = resolve; })),
+    });
+    const run = runCli([], context.deps);
+    await settle(() => openBrowser !== undefined);
+
+    context.signal();
+    await settle();
+    expect(context.close).not.toHaveBeenCalled();
+
+    openBrowser(true);
+    await expect(run).resolves.toBe(0);
+    expect(context.close).toHaveBeenCalledTimes(1);
+  });
+
   it("exits 1 when the repository cannot be resolved", async () => {
     const context = harness({
       execFile: async () => { throw Object.assign(new Error("not a repository"), { code: 128 }); },
@@ -208,7 +229,10 @@ describe("detached handshake", () => {
     await settle(() => context.children.length > 0);
     await vi.advanceTimersByTimeAsync(30_000);
     await expect(run).resolves.toBe(1);
-    expect(context.children[0]!.kill).toHaveBeenCalledWith("SIGTERM");
+    const child = context.children[0]!;
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(child.stdout.destroyed).toBe(true);
+    expect(child.unref).toHaveBeenCalledTimes(1);
     expect(context.err.join("")).toContain("expected a URL within 30 seconds");
     expect(context.out).toEqual([]);
   });
@@ -220,26 +244,38 @@ describe("detached handshake", () => {
     context.children[0]!.emit("exit", 1, null);
     await expect(run).resolves.toBe(1);
     expect(context.err.join("")).toContain("exited before reporting a URL");
+    expect(context.children[0]!.stdout.destroyed).toBe(true);
+    expect(context.children[0]!.unref).toHaveBeenCalledTimes(1);
   });
 });
 
 describe("detached idle exit", () => {
   it("expires only after a whole window without clients", () => {
     const tracker = new IdleTracker(1_000);
-    expect(tracker.expired(0, 0)).toBe(false);
-    expect(tracker.expired(0, 900)).toBe(false);
-    expect(tracker.expired(1, 950)).toBe(false);
-    expect(tracker.expired(0, 1_000)).toBe(false);
-    expect(tracker.expired(0, 1_999)).toBe(false);
-    expect(tracker.expired(0, 2_000)).toBe(true);
+    expect(tracker.expired(0, 0, 0)).toBe(false);
+    expect(tracker.expired(0, 0, 900)).toBe(false);
+    expect(tracker.expired(1, 1, 950)).toBe(false);
+    expect(tracker.expired(0, 1, 1_000)).toBe(false);
+    expect(tracker.expired(0, 1, 1_999)).toBe(false);
+    expect(tracker.expired(0, 1, 2_000)).toBe(true);
+  });
+
+  it("restarts the window for a connection that came and went between two polls", () => {
+    const tracker = new IdleTracker(1_000);
+    expect(tracker.expired(0, 3, 0)).toBe(false);
+    expect(tracker.expired(0, 4, 900)).toBe(false);
+    expect(tracker.expired(0, 4, 1_000)).toBe(false);
+    expect(tracker.expired(0, 4, 1_999)).toBe(false);
+    expect(tracker.expired(0, 4, 2_000)).toBe(true);
   });
 
   it("closes a detached server once it has been idle for the whole window", async () => {
     vi.useFakeTimers();
     let clients = 1;
+    let generation = 1;
     const close = vi.fn(async () => {});
     const context = harness({
-      startServer: async () => fakeServer(close, () => clients),
+      startServer: async () => fakeServer(close, () => clients, () => generation),
     });
 
     const run = runCli(["--serve-detached", "--no-open"], context.deps);
@@ -251,6 +287,26 @@ describe("detached idle exit", () => {
     await vi.advanceTimersByTimeAsync(29 * 60_000);
     expect(close).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(2 * 60_000);
+    await expect(run).resolves.toBe(0);
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("delays exit by a full window when a page connects between two polls", async () => {
+    vi.useFakeTimers();
+    let generation = 1;
+    const close = vi.fn(async () => {});
+    const context = harness({
+      startServer: async () => fakeServer(close, () => 0, () => generation),
+    });
+
+    const run = runCli(["--serve-detached", "--no-open"], context.deps);
+    await settle(() => context.out.length > 0);
+    await vi.advanceTimersByTimeAsync(25 * 60_000);
+    generation += 1;
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(close).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(25 * 60_000);
     await expect(run).resolves.toBe(0);
     expect(close).toHaveBeenCalledTimes(1);
   });

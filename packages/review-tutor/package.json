@@ -10,7 +10,7 @@
     "skills": ["skills/review-tutor"]
   },
   "bin": {
-    "review-tutor": "dist/cli.js"
+    "review-tutor": "dist/bin.js"
   },
   "files": [
     "dist",
@@ -20,7 +20,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsup src/cli.ts --format esm --clean --splitting false --out-dir dist",
+    "build": "tsup src/bin.ts --format esm --clean --splitting false --out-dir dist",
     "test": "cd ../.. && vitest run packages/review-tutor/test",
     "typecheck": "tsc -p ../../tsconfig.json --noEmit"
   },

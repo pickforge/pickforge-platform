@@ -27,14 +27,14 @@ function which(command: string): Promise<string | undefined> {
 }
 
 export function createConnectorRegistry(options: {
-  piModels: ModelChoice[];
+  piModels?: ModelChoice[];
   piVersion?: string;
   which?: DiscoveryDeps["which"];
   execFile?: DiscoveryExecFile;
 }): ConnectorRegistry {
   const registered: HarnessConnector[] = [new PiConnector(), new ClaudeCodeConnector(), new CodexConnector()];
   const dependencies: DiscoveryDeps = {
-    piModels: options.piModels,
+    ...(options.piModels ? { piModels: options.piModels } : {}),
     ...(options.piVersion ? { piVersion: options.piVersion } : {}),
     which: options.which ?? which,
     ...(options.execFile ? { execFile: options.execFile } : {}),

@@ -21,7 +21,8 @@ export type DiscoveryExecFile = (
 ) => Promise<{ stdout: string; stderr: string }>;
 
 export interface DiscoveryDeps {
-  piModels: ModelChoice[];
+  /** Present only when a Pi host already holds the model snapshot; absent hosts make Pi discover itself. */
+  piModels?: ModelChoice[];
   piVersion?: string;
   which(command: string): Promise<string | undefined>;
   execFile?: DiscoveryExecFile;

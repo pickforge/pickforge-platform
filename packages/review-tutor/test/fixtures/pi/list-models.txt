@@ -1,0 +1,8 @@
+Warning: No models match pattern "opencode-go/glm-5.3"
+
+provider           model                                               context  max-out  thinking  images
+openai-codex       gpt-5.6-sol                                         272K     128K     yes       yes
+anthropic          claude-fable-5                                      1M       64K      yes       yes
+ollama             qwen3:8b                                            256K     32K      yes       no
+deepseek-official  deepseek-v4-flash                                   1M       384K     yes       no
+local              basic                                               8K       4K       no        no

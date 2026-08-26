@@ -40,6 +40,21 @@ You can provide an initial source:
 
 With no argument, choose a source in the browser. The browser supports worktree, staged, commit, range, GitHub PR URL, and pasted code sources. It opens automatically. If that fails, Pi shows a notification with the local URL to open.
 
+## Command line
+
+The same tutor runs without a Pi host. Build the CLI once, then run it from any shell inside a Git worktree:
+
+```bash
+bun run --cwd packages/review-tutor build
+node packages/review-tutor/dist/cli.js [source] [--no-open] [--detach] [--home <dir>]
+```
+
+An installed package exposes it as `review-tutor`. `source` accepts the same values as the Pi command and defaults to `worktree`. The URL is the only line on stdout; discovery results go to stderr. Unknown flags print usage on stderr and exit 2.
+
+Without a Pi host, the Pi harness discovers itself through `pi --version` and `pi --list-models`, so the model list is whatever that Pi install offers. Claude Code and Codex are discovered exactly as they are under Pi.
+
+The foreground run stays attached until Ctrl-C or `SIGTERM`. `--detach` starts the server in its own process, prints the URL, and returns; that detached server exits by itself after 30 minutes with no page connected, or on `SIGTERM`.
+
 ## Model selection
 
 The model dialog lists the session's scoped models when `--models` or the settings scope configures them. Otherwise, it lists all available models. Thinking levels are offered only for reasoning models. Thinking levels are enforced by the server's model membership check. A scope entry with an explicit level, such as `gpt-5.6-sol:high`, pins the tutor to that level.

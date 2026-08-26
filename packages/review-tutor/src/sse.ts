@@ -8,6 +8,10 @@ export class SseHub {
 
   constructor(private readonly capacity = 256) {}
 
+  get clientCount(): number {
+    return this.clients.size;
+  }
+
   emit(type: SseEventType, data: unknown): SseEvent {
     const event = { id: this.next++, type, data };
     this.ring.push(event);

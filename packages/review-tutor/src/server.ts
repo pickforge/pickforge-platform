@@ -32,6 +32,11 @@ export interface ReviewTutorServer {
   port: number;
 }
 
+/** A started server also reports its live SSE clients, which is how a detached CLI knows it is idle. */
+export interface StartedReviewTutorServer extends ReviewTutorServer {
+  clientCount(): number;
+}
+
 const responseHeaders = {
   "Cache-Control": "no-store",
   "X-Content-Type-Options": "nosniff",
@@ -152,7 +157,7 @@ function handleError(response: ServerResponse, error: unknown): void {
   }
 }
 
-export async function startReviewTutorServer(options: ServerOptions): Promise<ReviewTutorServer> {
+export async function startReviewTutorServer(options: ServerOptions): Promise<StartedReviewTutorServer> {
   const token = randomBytes(32).toString("base64url");
   const paths = resolveStatePaths(options.canonicalRepo, options.home);
   await initProjectPaths(paths, options.canonicalRepo);
@@ -165,9 +170,10 @@ export async function startReviewTutorServer(options: ServerOptions): Promise<Re
     models: discovery.available ? discovery.models : [],
     ...(!discovery.available ? { reason: discovery.reason } : {}),
   }));
+  const hub = new SseHub();
   const session = new ReviewTutorSession(
     { ...options, models, harnesses }, paths, await loadTutorRubric(options.skillPath),
-    options.runner ?? new TutorRunner(), new SseHub(),
+    options.runner ?? new TutorRunner(), hub,
   );
   let closing: Promise<void> | undefined;
   const server = createServer(async (request, response) => {
@@ -197,7 +203,13 @@ export async function startReviewTutorServer(options: ServerOptions): Promise<Re
     throw error;
   }
   const port = (server.address() as AddressInfo).port;
-  return { token, port, url: `http://127.0.0.1:${port}/?session=${encodeURIComponent(token)}`, close };
+  return {
+    token,
+    port,
+    url: `http://127.0.0.1:${port}/?session=${encodeURIComponent(token)}`,
+    close,
+    clientCount: () => hub.clientCount,
+  };
 }
 
 async function loadInitialSource(options: ServerOptions, session: ReviewTutorSession): Promise<void> {

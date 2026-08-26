@@ -320,6 +320,30 @@ describe("local server security", () => {
 });
 
 describe("connector protocol boundary", () => {
+  it("reports an unavailable Claude Code harness without offering its models when flagged on", async () => {
+    const connectorRegistry = createConnectorRegistry({
+      flags: createReviewTutorFlags({ get: () => true, set: () => {} }),
+      piModels: [{ id: "provider/model", label: "Model", thinkingLevels: ["low"] }],
+      which: async () => undefined,
+    });
+    const { server } = await start(new ControlledRunner(), { registry: connectorRegistry });
+    try {
+      const state = await (await call(server.port, server.token, "/api/state")).json() as {
+        models: Array<{ id: string }>;
+        harnesses: Array<{ id: string; available: boolean; reason?: string }>;
+      };
+      expect(state.harnesses).toContainEqual({
+        id: "claude-code",
+        label: "Claude Code",
+        available: false,
+        reason: "Claude Code is not installed (claude not found on PATH).",
+      });
+      expect(state.models.some((model) => model.id.startsWith("claude-code:"))).toBe(false);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("reports namespaced state, resolves legacy Pi asks, rejects unknown harnesses, and exports harness details", async () => {
     const { server, runner } = await start();
     try {
@@ -352,6 +376,10 @@ describe("connector protocol boundary", () => {
       expect(runner.calls[1]).toMatchObject({ model: "ollama/qwen3:8b" });
       runner.calls[1]!.deferred.resolve({ answer: "colon answer" });
       await waitFor(() => runner.completedCalls === 2);
+      await waitFor(async () => {
+        const entries = await (await call(server.port, server.token, "/api/log")).json() as unknown[];
+        return entries.length === 2;
+      });
 
       const unknown = await call(server.port, server.token, "/api/ask", {
         method: "POST",

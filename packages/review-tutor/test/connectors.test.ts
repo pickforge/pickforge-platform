@@ -55,9 +55,9 @@ describe("connector registry", () => {
     }
   });
 
-  it("keeps only the explicitly registered Pi connector with the flag off or on", () => {
+  it("registers Claude Code only when the connector flag is on", () => {
     expect(registry(false).connectors().map((connector) => connector.id)).toEqual(["pi"]);
-    expect(registry(true).connectors().map((connector) => connector.id)).toEqual(["pi"]);
+    expect(registry(true).connectors().map((connector) => connector.id)).toEqual(["pi", "claude-code"]);
   });
 
   it("resolves namespaced and legacy Pi ids and rejects unknown harnesses", () => {
@@ -76,7 +76,11 @@ describe("connector registry", () => {
 
   it("namespaces Pi discovery without spawning a process", async () => {
     const connector = new PiConnector();
-    await expect(connector.discover({ piModels: models, piVersion: "1.2.3" })).resolves.toEqual({
+    await expect(connector.discover({
+      piModels: models,
+      piVersion: "1.2.3",
+      which: async () => undefined,
+    })).resolves.toEqual({
       available: true,
       version: "1.2.3",
       models: [{ ...models[0], id: "pi:anthropic/model" }],

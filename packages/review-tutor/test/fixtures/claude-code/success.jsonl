@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","permissionMode":"dontAsk","tools":["Read","Grep","Glob"]}
+{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"o"}}}
+{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"k"}}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"partial assistant copy"}]}}
+{"type":"result","subtype":"success","is_error":false,"result":"ok","usage":{"input_tokens":3,"output_tokens":1},"total_cost_usd":0.01}

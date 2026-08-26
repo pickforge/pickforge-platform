@@ -4,6 +4,8 @@ Review Tutor is a local-first, browser-based companion for guided reviews of PRs
 
 ## Install
 
+The npm package ships with pickforge-platform v0.13.0; until then, use a checkout: `pi install /path/to/packages/review-tutor` and `node packages/review-tutor/dist/bin.js …` after `bun run build`.
+
 Requirements: Node 22 or newer, Git, and whichever of `pi`, `claude`, or `codex` you want as tutor harnesses, each logged in.
 
 ### Pi

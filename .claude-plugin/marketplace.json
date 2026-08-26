@@ -1,5 +1,6 @@
 {
   "name": "pickforge",
+  "description": "Pickforge Studio plugins.",
   "owner": {
     "name": "Pickforge"
   },

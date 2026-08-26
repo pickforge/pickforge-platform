@@ -21,8 +21,10 @@ class FakeChild extends EventEmitter {
 
 const models = [{ id: "anthropic/model", label: "Model", thinkingLevels: ["low"] }];
 
+const absentExecFile = async () => { throw Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }); };
+
 function registry() {
-  return createConnectorRegistry({ piModels: models });
+  return createConnectorRegistry({ piModels: models, which: async () => undefined, execFile: absentExecFile });
 }
 
 const request = {

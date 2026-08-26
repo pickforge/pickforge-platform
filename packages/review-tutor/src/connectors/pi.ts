@@ -3,11 +3,54 @@ import type {
   Discovery,
   DiscoveryDeps,
   HarnessConnector,
+  ModelChoice,
   ParseSink,
   ParsedAnswer,
   SpawnSpec,
 } from "./types.ts";
+import {
+  BASE_DISCOVERY_ENV_KEYS,
+  createDiscoveryExecFile,
+  discoveryOptions,
+} from "./discovery.ts";
 import { ConnectorError } from "./types.ts";
+
+const MINIMUM_VERSION = [0, 83, 0] as const;
+const DISCOVERY_ENV_KEYS = [...BASE_DISCOVERY_ENV_KEYS, "XDG_CONFIG_HOME"] as const;
+const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"];
+const HEADER_COLUMNS = ["provider", "model", "context", "max-out", "thinking", "images"];
+
+const defaultExecFile = createDiscoveryExecFile(DISCOVERY_ENV_KEYS);
+
+function versionAtLeast(version: readonly number[]): boolean {
+  for (let index = 0; index < MINIMUM_VERSION.length; index += 1) {
+    const difference = version[index]! - MINIMUM_VERSION[index]!;
+    if (difference !== 0) return difference > 0;
+  }
+  return true;
+}
+
+function tableRows(output: string): string[][] {
+  const lines = output.split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim() && !line.startsWith("Warning:"));
+  const header = lines.findIndex((line) => {
+    const columns = line.trim().split(/\s{2,}/);
+    return HEADER_COLUMNS.every((column, index) => columns[index] === column);
+  });
+  if (header < 0) return [];
+  return lines.slice(header + 1)
+    .map((line) => line.trim().split(/\s{2,}/))
+    .filter((columns) => columns.length >= HEADER_COLUMNS.length);
+}
+
+function listedModels(output: string): ModelChoice[] {
+  return tableRows(output).map(([provider, model, , , thinking]) => ({
+    id: `pi:${provider!}/${model!}`,
+    label: `${provider!}: ${model!}`,
+    thinkingLevels: thinking === "yes" ? [...REASONING_LEVELS] : ["off"],
+  }));
+}
 
 interface PiContent {
   type?: unknown;
@@ -57,11 +100,47 @@ export class PiConnector implements HarnessConnector {
   readonly label = "Pi";
 
   async discover(deps: DiscoveryDeps): Promise<Discovery> {
-    return {
-      available: true,
-      version: deps.piVersion ?? "unknown",
-      models: deps.piModels.map((model) => ({ ...model, id: `pi:${model.id}` })),
-    };
+    if (deps.piModels) {
+      return {
+        available: true,
+        version: deps.piVersion ?? "unknown",
+        models: deps.piModels.map((model) => ({ ...model, id: `pi:${model.id}` })),
+      };
+    }
+    return this.discoverWithoutHost(deps.execFile ?? defaultExecFile);
+  }
+
+  private async discoverWithoutHost(execFile: NonNullable<DiscoveryDeps["execFile"]>): Promise<Discovery> {
+    let versionOutput: string;
+    try {
+      ({ stdout: versionOutput } = await execFile("pi", ["--version"], discoveryOptions()));
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ENOENT"
+        ? { available: false, reason: "Pi is not installed (pi not found on PATH)." }
+        : { available: false, reason: "Pi could not report a supported version." };
+    }
+    const match = /^(\d+)\.(\d+)\.(\d+)/.exec(versionOutput.trim());
+    if (!match) {
+      return { available: false, reason: "Pi could not report a supported version." };
+    }
+    const version = match.slice(1, 4).map(Number);
+    const versionLabel = version.join(".");
+    if (!versionAtLeast(version)) {
+      return {
+        available: false,
+        reason: `Pi ${versionLabel} is too old; version 0.83.0 or newer is required.`,
+      };
+    }
+    let models: ModelChoice[];
+    try {
+      const { stdout } = await execFile("pi", ["--list-models"], discoveryOptions());
+      models = listedModels(stdout);
+    } catch {
+      return { available: false, reason: "Pi could not list its models." };
+    }
+    return models.length
+      ? { available: true, version: versionLabel, models }
+      : { available: false, reason: "Pi could not list its models." };
   }
 
   spawnSpec(request: ConnectorRequest): SpawnSpec {

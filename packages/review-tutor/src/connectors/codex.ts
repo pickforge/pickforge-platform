@@ -1,22 +1,24 @@
-import { execFile as nodeExecFile } from "node:child_process";
 import type {
   ConnectorRequest,
   Discovery,
   DiscoveryDeps,
-  DiscoveryExecFile,
   HarnessConnector,
   ParseSink,
   ParsedAnswer,
   SpawnSpec,
 } from "./types.ts";
+import {
+  BASE_DISCOVERY_ENV_KEYS,
+  createDiscoveryExecFile,
+  discoveryOptions,
+  scrubbedEnvironment,
+} from "./discovery.ts";
 import { redact } from "./redact.ts";
 import { ConnectorError } from "./types.ts";
 
-const MAX_CATALOG_BYTES = 1024 * 1024;
-const DISCOVERY_TIMEOUT_MS = 10_000;
 const FALLBACK_LEVELS = ["low", "medium", "high"];
 const MINIMUM_VERSION = [0, 140, 0] as const;
-const DISCOVERY_ENV_KEYS = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "CODEX_HOME"] as const;
+const DISCOVERY_ENV_KEYS = [...BASE_DISCOVERY_ENV_KEYS, "CODEX_HOME"] as const;
 
 interface CodexModel {
   slug?: unknown;
@@ -35,18 +37,10 @@ interface CodexEvent {
 }
 
 export function discoveryEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  return Object.fromEntries(DISCOVERY_ENV_KEYS.flatMap((key) => {
-    const value = source[key];
-    return value === undefined ? [] : [[key, value]];
-  }));
+  return scrubbedEnvironment(DISCOVERY_ENV_KEYS, source);
 }
 
-const defaultExecFile: DiscoveryExecFile = (file, args, options) => new Promise((resolve, reject) => {
-  nodeExecFile(file, args, { ...options, env: discoveryEnvironment(), shell: false }, (error, stdout, stderr) => {
-    if (error) reject(error);
-    else resolve({ stdout, stderr });
-  });
-});
+const defaultExecFile = createDiscoveryExecFile(DISCOVERY_ENV_KEYS);
 
 function versionAtLeast(version: readonly number[]): boolean {
   for (let index = 0; index < MINIMUM_VERSION.length; index += 1) {
@@ -147,13 +141,7 @@ export class CodexConnector implements HarnessConnector {
     const execFile = deps.execFile ?? defaultExecFile;
     let versionOutput: string;
     try {
-      const options = {
-        encoding: "utf8" as const,
-        maxBuffer: MAX_CATALOG_BYTES,
-        signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
-        timeout: DISCOVERY_TIMEOUT_MS,
-      };
-      ({ stdout: versionOutput } = await execFile("codex", ["--version"], options));
+      ({ stdout: versionOutput } = await execFile("codex", ["--version"], discoveryOptions()));
     } catch (error) {
       return (error as NodeJS.ErrnoException).code === "ENOENT"
         ? { available: false, reason: "Codex is not installed (codex not found on PATH)." }
@@ -172,13 +160,7 @@ export class CodexConnector implements HarnessConnector {
       };
     }
     try {
-      const options = {
-        encoding: "utf8" as const,
-        maxBuffer: MAX_CATALOG_BYTES,
-        signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
-        timeout: DISCOVERY_TIMEOUT_MS,
-      };
-      const { stdout } = await execFile("codex", ["debug", "models"], options);
+      const { stdout } = await execFile("codex", ["debug", "models"], discoveryOptions());
       return { available: true, version: versionLabel, models: modelChoices(parseModels(stdout)) };
     } catch {
       return { available: false, reason: "Codex could not list its models." };

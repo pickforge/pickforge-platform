@@ -4,21 +4,53 @@ Review Tutor is a local-first, browser-based companion for guided reviews of PRs
 
 ## Install
 
-This package is private and remains at version `0.0.0`, so it is not available through the npm scope. Install it from a local checkout:
+The npm package ships with pickforge-platform v0.13.0; until then, use a checkout: `pi install /path/to/packages/review-tutor` and `node packages/review-tutor/dist/bin.js …` after `bun run build`.
+
+Requirements: Node 22 or newer, Git, and whichever of `pi`, `claude`, or `codex` you want as tutor harnesses, each logged in.
+
+### Pi
+
+Install from npm or a checkout:
 
 ```bash
+pi install npm:@pickforge/review-tutor
 pi install /absolute/path/to/packages/review-tutor
 ```
 
-The package manifest loads both the extension and the tutor skill.
+Then run:
 
-To try it for one Pi run without installing it:
-
-```bash
-pi -e /absolute/path/to/packages/review-tutor
+```text
+/review-tutor <source>
 ```
 
-`-e` loads the extension only; the tutor skill is registered by `pi install`. The `/review-tutor` command still works fully either way because it reads its skill file directly from the package.
+### Claude Code
+
+```bash
+claude plugin marketplace add pickforge/pickforge-platform
+claude plugin install review-tutor@pickforge
+```
+
+Then run:
+
+```text
+/review-tutor <source>
+```
+
+### Codex
+
+From a checkout, copy the skill into your Codex home:
+
+```bash
+cp -r packages/review-tutor/codex-skill/review-tutor ~/.codex/skills/review-tutor
+```
+
+Then ask Codex to "open the review tutor for …".
+
+### Any shell
+
+```bash
+npx -y @pickforge/review-tutor worktree
+```
 
 ## Usage
 

@@ -1,0 +1,18 @@
+{
+  "name": "pickforge",
+  "description": "Pickforge Studio plugins.",
+  "owner": {
+    "name": "Pickforge"
+  },
+  "plugins": [
+    {
+      "name": "review-tutor",
+      "description": "Open the Pickforge Review Tutor for a PR, diff, or commit in your browser.",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/pickforge/pickforge-platform.git",
+        "path": "packages/review-tutor/claude-plugin"
+      }
+    }
+  ]
+}

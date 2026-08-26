@@ -1,0 +1,32 @@
+{
+  "models": [
+    {
+      "slug": "gpt-5.5",
+      "display_name": "",
+      "visibility": "list",
+      "priority": 20
+    },
+    {
+      "slug": "gpt-5.6-sol",
+      "display_name": "GPT-5.6 Sol",
+      "visibility": "list",
+      "supported_reasoning_levels": [
+        { "effort": "low", "description": "Fast" },
+        { "effort": "medium", "description": "Balanced" },
+        { "effort": "high", "description": "Deep" },
+        { "effort": "max", "description": "Maximum" },
+        { "effort": "ultra", "description": "Prohibited" }
+      ],
+      "default_reasoning_level": "medium",
+      "priority": 10
+    },
+    {
+      "slug": "internal-model",
+      "display_name": "Internal",
+      "visibility": "hidden",
+      "supported_reasoning_levels": [{ "effort": "low", "description": "Fast" }],
+      "default_reasoning_level": "low",
+      "priority": 1
+    }
+  ]
+}

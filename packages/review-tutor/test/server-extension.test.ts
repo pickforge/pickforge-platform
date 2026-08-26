@@ -325,6 +325,7 @@ describe("connector protocol boundary", () => {
       flags: createReviewTutorFlags({ get: () => true, set: () => {} }),
       piModels: [{ id: "provider/model", label: "Model", thinkingLevels: ["low"] }],
       which: async () => undefined,
+      execFile: async () => { throw Object.assign(new Error("spawn codex ENOENT"), { code: "ENOENT" }); },
     });
     const { server } = await start(new ControlledRunner(), { registry: connectorRegistry });
     try {

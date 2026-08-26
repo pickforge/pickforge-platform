@@ -1,0 +1,3 @@
+{"type":"error","message":"Reconnecting 1/5 url: https://provider.invalid"}
+{"type":"error","message":"Reconnecting 2/5 request id: req_fixture"}
+{"type":"turn.failed","error":{"message":"401 unauthorized url: https://provider.invalid request id: req_fixture"}}

@@ -10,10 +10,21 @@ export interface HarnessConnector {
   readonly envKeys?: readonly string[];
 }
 
+export type DiscoveryExecFile = (
+  file: string,
+  args: string[],
+  options: {
+    encoding: "utf8";
+    maxBuffer: number;
+    timeout: number;
+  },
+) => Promise<{ stdout: string; stderr: string }>;
+
 export interface DiscoveryDeps {
   piModels: ModelChoice[];
   piVersion?: string;
   which(command: string): Promise<string | undefined>;
+  execFile?: DiscoveryExecFile;
 }
 
 export type Discovery =

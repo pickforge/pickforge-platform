@@ -162,6 +162,7 @@ export async function startReviewTutorServer(options: ServerOptions): Promise<Re
     id: connector.id,
     label: connector.label,
     available: discovery.available,
+    models: discovery.available ? discovery.models : [],
     ...(!discovery.available ? { reason: discovery.reason } : {}),
   }));
   const session = new ReviewTutorSession(

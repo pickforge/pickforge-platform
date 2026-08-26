@@ -50,6 +50,8 @@ A harness connector owns model discovery, isolated invocation, and stream parsin
 
 The Claude Code connector forwards `CLAUDE_CONFIG_DIR` when present, but never forwards `ANTHROPIC_API_KEY`; users who rely on that environment key must sign in through Claude Code instead.
 
+The Harness select in the configuration rail lists the harnesses discovery found, Pi first. The line under it reports the rest: how many are available, or why one is not. Discovery runs once at server start, so restart Pi to re-discover. Choosing a harness refills Model and Thinking with that harness's models and restores the model you last used there.
+
 The Codex connector discovers models through `codex app-server`, invokes reviews with `codex exec --json`, and relies on Codex's existing local authentication.
 
 ## Local data

@@ -84,6 +84,8 @@ export const pageScript = String.raw`
   let railCollapsed = sessionStorage.getItem("reviewTutorRailCollapsed") === "1";
   let restoreComposerOnDesktop = false;
   const QUIZ_IDS_KEY = "reviewTutorQuizEntryIds";
+  const HARNESS_KEY = "reviewTutorHarness";
+  const MODEL_BY_HARNESS_KEY = "reviewTutorModelByHarness";
   const MAX_QUIZ_IDS = 100;
   const MAX_SELECTED_BYTES = 16 * 1024;
   const MAX_CONTEXT_BYTES = 32 * 1024;
@@ -1357,6 +1359,7 @@ export const pageScript = String.raw`
     element("answer").classList.remove("streaming");
     setAnswerTail("");
     setAnswer("");
+    setAnswerAttribution("");
     setAskLabel("Ask");
     clearHistoryState();
     updateActions();
@@ -1414,6 +1417,7 @@ export const pageScript = String.raw`
     element("question").value = item.entry.question;
     element("question-state").textContent = "answered";
     setAnswer(item.entry.answer);
+    setAnswerAttribution(item.entry.modelId);
     setAnswerTail("Saved answer · " + new Date(item.entry.createdAt).toLocaleString());
     const pager = element("history-pager");
     pager.hidden = historyEntries.length < 2;
@@ -1801,6 +1805,7 @@ export const pageScript = String.raw`
     composerSelectionKey = selectionIdentity();
     setAnswerTail("");
     setAnswer("");
+    setAnswerAttribution(element("model").value);
     element("ask").setAttribute("aria-busy", "true");
     setAskLabel("Sending", true);
     announce("Question sent. Waiting for the tutor.");
@@ -1898,6 +1903,8 @@ export const pageScript = String.raw`
           "-" +
           (entry.selection.endLine || entry.selection.startLine),
       );
+    const identity = attribution(entry.modelId);
+    if (identity) parts.push(identity);
     parts.push(new Date(entry.createdAt).toLocaleString());
     return parts.join(" · ");
   }
@@ -2129,13 +2136,7 @@ export const pageScript = String.raw`
       select.addEventListener("change", updateMatches);
     }
     state = await api("/api/state");
-    fill(
-      element("model"),
-      state.models.map((model) => model.id),
-    );
-    for (let i = 0; i < state.models.length; i++)
-      element("model").options[i].textContent = state.models[i].label;
-    updateThinking();
+    updateHarnesses();
     currentSource = state.input;
     if (currentSource) acceptSource(currentSource);
     updateActions();
@@ -2232,11 +2233,86 @@ export const pageScript = String.raw`
       entry.selection.startLine === expected.startLine &&
       entry.selection.endLine === expected.endLine;
   }
+  function harnesses() {
+    return state?.harnesses || [];
+  }
+  function harnessModels(id) {
+    return harnesses().find((harness) => harness.id === id)?.models || [];
+  }
+  function harnessLabel(id) {
+    return harnesses().find((harness) => harness.id === id)?.label || id;
+  }
+  function attribution(modelId) {
+    for (const harness of harnesses())
+      for (const model of harness.models || [])
+        if (model.id === modelId) return harness.label + " · " + model.label;
+    if (!modelId) return "";
+    // Same fallback as the HTML export: the namespace before the first ":" (when it precedes any "/") is the harness.
+    const text = String(modelId), separator = text.indexOf(":"), slash = text.indexOf("/");
+    const namespaced = separator >= 0 && (slash < 0 || separator < slash);
+    return namespaced ? harnessLabel(text.slice(0, separator)) + " · " + text.slice(separator + 1) : text;
+  }
+  function setAnswerAttribution(modelId) {
+    element("answer-attribution").textContent = attribution(modelId);
+  }
+  function readStoredModels() {
+    try {
+      const stored = JSON.parse(sessionStorage.getItem(MODEL_BY_HARNESS_KEY) || "{}");
+      return stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {};
+    } catch {
+      return {};
+    }
+  }
+  function rememberSelection() {
+    const stored = readStoredModels();
+    stored[element("harness").value] = element("model").value;
+    try {
+      sessionStorage.setItem(MODEL_BY_HARNESS_KEY, JSON.stringify(stored));
+      sessionStorage.setItem(HARNESS_KEY, element("harness").value);
+    } catch {}
+  }
+  function harnessHelper() {
+    const unavailable = harnesses().filter((harness) => !harness.available);
+    if (unavailable.length)
+      return unavailable.map((harness) => harness.reason).join(" ") + " Restart Pi to re-discover.";
+    return harnesses().length === 1
+      ? harnesses()[0].label + " is the only connected harness."
+      : harnesses().length + " harnesses available.";
+  }
+  function updateHarnesses() {
+    const available = harnesses().filter((harness) => harness.available);
+    const select = element("harness");
+    select.replaceChildren();
+    for (const harness of available) select.append(option(harness.id, harness.label));
+    let remembered = null;
+    try {
+      remembered = sessionStorage.getItem(HARNESS_KEY);
+    } catch {}
+    select.value = available.some((harness) => harness.id === remembered)
+      ? remembered
+      : (available[0]?.id || "");
+    element("harness-helper").textContent = harnessHelper();
+    updateModels();
+  }
+  function updateModels() {
+    const models = harnessModels(element("harness").value);
+    fill(element("model"), models.map((model) => model.id));
+    for (let index = 0; index < models.length; index++)
+      element("model").options[index].textContent = models[index].label;
+    const remembered = readStoredModels()[element("harness").value];
+    element("model").value = models.some((model) => model.id === remembered)
+      ? remembered
+      : (models[0]?.id || "");
+    updateThinking();
+  }
   function updateThinking() {
-    const model = state?.models.find(
+    const previous = element("thinking").value;
+    const model = harnessModels(element("harness").value).find(
       (candidate) => candidate.id === element("model").value,
     );
-    fill(element("thinking"), model?.thinkingLevels || []);
+    const levels = model?.thinkingLevels || [];
+    fill(element("thinking"), levels);
+    element("thinking").value = levels.includes(previous) ? previous : (levels[0] || "");
   }
   function acceptSource(source) {
     currentSource = source;
@@ -2257,7 +2333,15 @@ export const pageScript = String.raw`
     updateActions();
   }
   element("kind").addEventListener("change", updateSourceFields);
-  element("model").addEventListener("change", updateThinking);
+  element("harness").addEventListener("change", () => {
+    updateModels();
+    rememberSelection();
+    announce("Harness: " + harnessLabel(element("harness").value));
+  });
+  element("model").addEventListener("change", () => {
+    updateThinking();
+    rememberSelection();
+  });
   for (const id of ["view-diff", "view-structure", "view-log"]) {
     element(id).addEventListener("click", () => setView(id.replace("view-", "")));
     element(id).addEventListener("keydown", handleViewKey);

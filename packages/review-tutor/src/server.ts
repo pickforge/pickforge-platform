@@ -2,11 +2,12 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import type { ConnectorRegistry } from "./connectors/registry.ts";
 import { loadInput, type ExecFile } from "./inputs.ts";
 import { initProjectPaths } from "./log.ts";
 import { bootstrapHtml, pageHtml, staleSessionHtml } from "./page.ts";
 import { loadTutorRubric } from "./prompt.ts";
-import { validateSourceRequest, type ModelChoice } from "./protocol.ts";
+import { validateSourceRequest } from "./protocol.ts";
 import { resolveStatePaths } from "./paths.ts";
 import { TutorRunner } from "./runner.ts";
 import { ReviewTutorSession, type RunnerLike, type SessionReply } from "./server-session.ts";
@@ -15,7 +16,7 @@ import { SseHub } from "./sse.ts";
 export interface ServerOptions {
   cwd: string;
   canonicalRepo: string;
-  models: ModelChoice[];
+  registry: ConnectorRegistry;
   execFile: ExecFile;
   skillPath: string;
   runner?: RunnerLike;
@@ -155,8 +156,17 @@ export async function startReviewTutorServer(options: ServerOptions): Promise<Re
   const token = randomBytes(32).toString("base64url");
   const paths = resolveStatePaths(options.canonicalRepo, options.home);
   await initProjectPaths(paths, options.canonicalRepo);
+  const discoveries = await options.registry.discoveries();
+  const models = discoveries.flatMap(({ discovery }) => discovery.available ? discovery.models : []);
+  const harnesses = discoveries.map(({ connector, discovery }) => ({
+    id: connector.id,
+    label: connector.label,
+    available: discovery.available,
+    ...(!discovery.available ? { reason: discovery.reason } : {}),
+  }));
   const session = new ReviewTutorSession(
-    options, paths, await loadTutorRubric(options.skillPath), options.runner ?? new TutorRunner(), new SseHub(),
+    { ...options, models, harnesses }, paths, await loadTutorRubric(options.skillPath),
+    options.runner ?? new TutorRunner(), new SseHub(),
   );
   let closing: Promise<void> | undefined;
   const server = createServer(async (request, response) => {

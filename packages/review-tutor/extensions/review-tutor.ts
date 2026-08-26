@@ -5,6 +5,8 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
+import { createConnectorRegistry } from "../src/connectors/registry.ts";
+import { createReviewTutorFlags } from "../src/flags.ts";
 import type { ExecFile } from "../src/inputs.ts";
 import type { ModelChoice, SourceRequest } from "../src/protocol.ts";
 import {
@@ -252,16 +254,18 @@ export default function reviewTutorExtension(pi: ExtensionAPI): void {
         const server = await lifecycle.start(async (startupSignal) => {
           const cwd = await realpath(ctx.cwd);
           const canonicalRepo = await repositoryRoot(pi, cwd);
-          const models = modelChoices(ctx);
-          if (!models.length) {
+          const piModels = modelChoices(ctx);
+          if (!piModels.length) {
             throw new Error(
               "model snapshot failed: expected at least one available model; configure a Pi model and retry",
             );
           }
+          const flags = createReviewTutorFlags();
+          const registry = createConnectorRegistry({ flags, piModels });
           return startReviewTutorServer({
             cwd,
             canonicalRepo,
-            models,
+            registry,
             skillPath,
             initialSource: sourceFromArgument(args),
             startupSignal,

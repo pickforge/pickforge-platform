@@ -3,7 +3,9 @@ import type { ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createConnectorRegistry } from "../src/connectors/registry.ts";
 import { exportLearningHtml } from "../src/export-html.ts";
+import { createReviewTutorFlags } from "../src/flags.ts";
 import {
   appendEntry,
   foldLog,
@@ -15,6 +17,10 @@ import type { LearningEntry, QuizOutcome } from "../src/protocol.ts";
 import { SseHub } from "../src/sse.ts";
 
 const dirs: string[] = [];
+const exportRegistry = createConnectorRegistry({
+  flags: createReviewTutorFlags(),
+  piModels: [],
+});
 afterEach(async () => {
   await Promise.all(dirs.splice(0).map((path) => rm(path, {
     recursive: true,
@@ -123,7 +129,11 @@ describe("standalone export", () => {
       entry("got_it"),
       entry("almost"),
       entry("review_again"),
-    ]);
+      { ...entry(), id: "colon-model", modelId: "ollama/qwen3:8b" },
+      { ...entry(), id: "namespaced-colon-model", modelId: "pi:ollama/qwen3:8b" },
+      { ...entry(), id: "invalid-model", modelId: 42 } as unknown as LearningEntry,
+      { ...entry(), id: "disabled-harness", modelId: "codex:gpt-5.6-sol" },
+    ], exportRegistry);
     expect(html).toContain("Private code warning");
     expect(html).toContain("GitHub is the source of truth");
     expect(html).toContain("https://github.com/a/b/pull/1");
@@ -132,13 +142,18 @@ describe("standalone export", () => {
     expect(html).toContain("Got it");
     expect(html).toContain("Almost");
     expect(html).toContain("Review again");
+    expect(html.match(/<dt>Harness<\/dt><dd>Pi<\/dd>/g)).toHaveLength(6);
+    expect(html.match(/<dt>Model<\/dt><dd>ollama\/qwen3:8b<\/dd>/g)).toHaveLength(2);
+    expect(html).toContain("<dt>Model</dt><dd>42</dd>");
+    expect(html).toContain("<dt>Harness</dt><dd>codex</dd>");
+    expect(html).toContain("<dt>Model</dt><dd>gpt-5.6-sol</dd>");
     expect(html).toContain("&lt;script&gt;x&lt;/script&gt;");
     expect(html).toContain("&amp; hostile &lt;img src=x&gt;");
     expect(html).not.toContain("<script");
     expect(html).not.toContain("<script>x</script>");
     expect(html).not.toMatch(/(?:src|href)=["']https?:\/\//);
 
-    const empty = exportLearningHtml([]);
+    const empty = exportLearningHtml([], exportRegistry);
     expect(empty).toContain("No learning entries yet");
     expect(empty).not.toContain("<article>");
   });

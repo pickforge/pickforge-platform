@@ -56,11 +56,7 @@ export interface InputSnapshot {
   rangeTo?: string;
 }
 
-export interface ModelChoice {
-  id: string;
-  label: string;
-  thinkingLevels: string[];
-}
+export type { ModelChoice } from "./connectors/types.ts";
 
 export interface LearningPreferences {
   explanationLanguage: string;

@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadInput } from "../src/inputs.ts";
-import { parsePiJson } from "../src/pi-json.ts";
+import { PiConnector } from "../src/connectors/pi.ts";
+import type { ParseSink } from "../src/connectors/types.ts";
 import { buildTutorPrompt, loadTutorRubric } from "../src/prompt.ts";
 import {
   validateAskRequest,
@@ -343,39 +344,50 @@ describe("prompt and Pi JSON", () => {
     expect(data.history).toEqual([]);
   });
 
-  it("parses split NDJSON, deltas, usage, final assistant, and failures", () => {
-    const parser = parsePiJson();
-    expect(parser.push(
-      '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"he',
-    )).toEqual([]);
-    expect(parser.push('llo"}}\n')).toEqual([{ type: "delta", text: "hello" }]);
-    parser.push('{"type":"message_end","message":{"usage":{"input":1,"output":2}}}\n');
-    parser.push(
-      '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"final"}]}]}\n',
+  it("parses Pi deltas, usage, final assistant, and failures", () => {
+    const connector = new PiConnector();
+    let answer: string | undefined;
+    let answerUsage: Record<string, number> | undefined;
+    const deltas: string[] = [];
+    const sink: ParseSink = {
+      get answer() { return answer; },
+      get answerUsage() { return answerUsage; },
+      delta: (text) => deltas.push(text),
+      usage: (usage) => { answerUsage = usage; },
+      final: (next) => {
+        if (answer === undefined || next.trim()) answer = next;
+      },
+    };
+
+    connector.parseLine(
+      '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"hello"}}',
+      sink,
     );
-    expect(parser.finish()).toMatchObject({
+    connector.parseLine('{"type":"message_end","message":{"usage":{"input":1,"output":2}}}', sink);
+    connector.parseLine(
+      '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"final"}]}]}',
+      sink,
+    );
+    expect(deltas).toEqual(["hello"]);
+    expect(connector.finish(sink)).toEqual({
       answer: "final",
       usage: { input: 1, output: 2 },
     });
 
-    const stringFinal = parsePiJson();
-    stringFinal.push(
-      '{"type":"agent_end","messages":[{"role":"assistant","content":"text"}]}\n',
+    connector.parseLine(
+      '{"type":"agent_end","messages":[{"role":"assistant","content":"text"}]}',
+      sink,
     );
-    expect(stringFinal.finish().answer).toBe("text");
-    const repeatedFinal = parsePiJson();
-    repeatedFinal.push(
-      '{"type":"agent_end","messages":[{"role":"assistant","content":"accepted"}]}\n',
+    connector.parseLine('{"type":"agent_end","messages":"invalid"}', sink);
+    connector.parseLine('{"type":"agent_end","messages":[]}', sink);
+    expect(connector.finish(sink).answer).toBe("text");
+    expect(() => connector.parseLine("nope", sink)).toThrow(/Pi JSON/);
+
+    answer = undefined;
+    connector.parseLine(
+      '{"type":"agent_end","messages":[{"role":"assistant","content":[]}]}',
+      sink,
     );
-    repeatedFinal.push('{"type":"agent_end","messages":"invalid"}\n');
-    repeatedFinal.push('{"type":"agent_end","messages":[]}\n');
-    expect(repeatedFinal.finish().answer).toBe("accepted");
-    const malformed = parsePiJson();
-    expect(() => malformed.push("nope\n")).toThrow(/Pi JSON/);
-    const empty = parsePiJson();
-    empty.push(
-      '{"type":"agent_end","messages":[{"role":"assistant","content":[]}]}\n',
-    );
-    expect(() => empty.finish()).toThrow(/empty/);
+    expect(() => connector.finish(sink)).toThrow(/empty/);
   });
 });

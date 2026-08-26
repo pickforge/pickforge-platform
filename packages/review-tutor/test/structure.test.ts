@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { createConnectorRegistry } from "../src/connectors/registry.ts";
+import { createReviewTutorFlags } from "../src/flags.ts";
 import type { ExecFile } from "../src/inputs.ts";
 import type { InputSnapshot, StructureEdge, StructureSnapshot } from "../src/protocol.ts";
 import { startReviewTutorServer } from "../src/server.ts";
@@ -12,6 +14,10 @@ import {
 
 const skillPath = fileURLToPath(new URL("../skills/review-tutor/SKILL.md", import.meta.url));
 const temporaryRoots: string[] = [];
+const registry = () => createConnectorRegistry({
+  flags: createReviewTutorFlags(),
+  piModels: [{ id: "provider/model", label: "Model", thinkingLevels: ["low"] }],
+});
 
 afterEach(async () => {
   while (temporaryRoots.length) {
@@ -1237,7 +1243,7 @@ async function startServer(diffs: string[]) {
   const server = await startReviewTutorServer({
     cwd: "/repo",
     canonicalRepo: "/repo",
-    models: [{ id: "provider/model", label: "Model", thinkingLevels: ["low"] }],
+    registry: registry(),
     skillPath,
     home,
     runner: { run: async () => ({ answer: "" }), cancel: () => {}, shutdown: async () => {} },
@@ -1296,7 +1302,7 @@ describe("structure endpoint", () => {
     const server = await startReviewTutorServer({
       cwd: "/repo",
       canonicalRepo: "/repo",
-      models: [{ id: "provider/model", label: "Model", thinkingLevels: ["low"] }],
+      registry: registry(),
       skillPath,
       home,
       runner: { run: async () => ({ answer: "" }), cancel: () => {}, shutdown: async () => {} },

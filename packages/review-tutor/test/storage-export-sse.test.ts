@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createConnectorRegistry } from "../src/connectors/registry.ts";
 import { exportLearningHtml } from "../src/export-html.ts";
-import { createReviewTutorFlags } from "../src/flags.ts";
 import {
   appendEntry,
   foldLog,
@@ -18,7 +17,6 @@ import { SseHub } from "../src/sse.ts";
 
 const dirs: string[] = [];
 const exportRegistry = createConnectorRegistry({
-  flags: createReviewTutorFlags(),
   piModels: [],
 });
 afterEach(async () => {
@@ -132,7 +130,7 @@ describe("standalone export", () => {
       { ...entry(), id: "colon-model", modelId: "ollama/qwen3:8b" },
       { ...entry(), id: "namespaced-colon-model", modelId: "pi:ollama/qwen3:8b" },
       { ...entry(), id: "invalid-model", modelId: 42 } as unknown as LearningEntry,
-      { ...entry(), id: "disabled-harness", modelId: "codex:gpt-5.6-sol" },
+      { ...entry(), id: "unknown-harness", modelId: "future:gpt-9" },
     ], exportRegistry);
     expect(html).toContain("Private code warning");
     expect(html).toContain("GitHub is the source of truth");
@@ -145,8 +143,8 @@ describe("standalone export", () => {
     expect(html.match(/<dt>Harness<\/dt><dd>Pi<\/dd>/g)).toHaveLength(6);
     expect(html.match(/<dt>Model<\/dt><dd>ollama\/qwen3:8b<\/dd>/g)).toHaveLength(2);
     expect(html).toContain("<dt>Model</dt><dd>42</dd>");
-    expect(html).toContain("<dt>Harness</dt><dd>codex</dd>");
-    expect(html).toContain("<dt>Model</dt><dd>gpt-5.6-sol</dd>");
+    expect(html).toContain("<dt>Harness</dt><dd>future</dd>");
+    expect(html).toContain("<dt>Model</dt><dd>gpt-9</dd>");
     expect(html).toContain("&lt;script&gt;x&lt;/script&gt;");
     expect(html).toContain("&amp; hostile &lt;img src=x&gt;");
     expect(html).not.toContain("<script");

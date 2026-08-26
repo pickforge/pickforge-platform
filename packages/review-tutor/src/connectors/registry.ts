@@ -1,5 +1,4 @@
 import { execFile } from "node:child_process";
-import type { ReviewTutorFlags } from "../flags.ts";
 import { ClaudeCodeConnector } from "./claude-code.ts";
 import { CodexConnector } from "./codex.ts";
 import { PiConnector } from "./pi.ts";
@@ -28,14 +27,12 @@ function which(command: string): Promise<string | undefined> {
 }
 
 export function createConnectorRegistry(options: {
-  flags: ReviewTutorFlags;
   piModels: ModelChoice[];
   piVersion?: string;
   which?: DiscoveryDeps["which"];
   execFile?: DiscoveryExecFile;
 }): ConnectorRegistry {
-  const pi = new PiConnector();
-  const optionalConnectors: HarnessConnector[] = [new ClaudeCodeConnector(), new CodexConnector()];
+  const registered: HarnessConnector[] = [new PiConnector(), new ClaudeCodeConnector(), new CodexConnector()];
   const dependencies: DiscoveryDeps = {
     piModels: options.piModels,
     ...(options.piVersion ? { piVersion: options.piVersion } : {}),
@@ -43,10 +40,7 @@ export function createConnectorRegistry(options: {
     ...(options.execFile ? { execFile: options.execFile } : {}),
   };
 
-  const connectors = (): HarnessConnector[] => [
-    pi,
-    ...(options.flags.isEnabled("reviewTutorHarnessConnectors") ? optionalConnectors : []),
-  ];
+  const connectors = (): HarnessConnector[] => registered;
 
   return {
     connectors,

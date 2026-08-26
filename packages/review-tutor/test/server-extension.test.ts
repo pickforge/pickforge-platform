@@ -11,7 +11,6 @@ import {
 } from "../extensions/review-tutor.ts";
 import { createConnectorRegistry } from "../src/connectors/registry.ts";
 import type { HarnessConnector } from "../src/connectors/types.ts";
-import { createReviewTutorFlags } from "../src/flags.ts";
 import { pageHtml } from "../src/page.ts";
 import { resolveStatePaths } from "../src/paths.ts";
 import type { AskRequest } from "../src/protocol.ts";
@@ -21,12 +20,13 @@ const skillPath = fileURLToPath(
   new URL("../skills/review-tutor/SKILL.md", import.meta.url),
 );
 const temporaryRoots: string[] = [];
+const absentExecFile = async () => { throw Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }); };
 
 function registry(models = [
   { id: "provider/model", label: "Model", thinkingLevels: ["low"] },
   { id: "ollama/qwen3:8b", label: "Qwen", thinkingLevels: ["low"] },
 ]) {
-  return createConnectorRegistry({ flags: createReviewTutorFlags(), piModels: models });
+  return createConnectorRegistry({ piModels: models, which: async () => undefined, execFile: absentExecFile });
 }
 
 interface DeferredResult {
@@ -322,7 +322,6 @@ describe("local server security", () => {
 describe("connector protocol boundary", () => {
   it("reports an unavailable Claude Code harness without offering its models when flagged on", async () => {
     const connectorRegistry = createConnectorRegistry({
-      flags: createReviewTutorFlags({ get: () => true, set: () => {} }),
       piModels: [{ id: "provider/model", label: "Model", thinkingLevels: ["low"] }],
       which: async () => undefined,
       execFile: async () => { throw Object.assign(new Error("spawn codex ENOENT"), { code: "ENOENT" }); },
@@ -359,7 +358,11 @@ describe("connector protocol boundary", () => {
         "pi:provider/model",
         "pi:ollama/qwen3:8b",
       ]);
-      expect(state.harnesses).toEqual([{ id: "pi", label: "Pi", available: true, models: state.models }]);
+      expect(state.harnesses).toEqual([
+        { id: "pi", label: "Pi", available: true, models: state.models },
+        { id: "claude-code", label: "Claude Code", available: false, reason: "Claude Code is not installed (claude not found on PATH).", models: [] },
+        { id: "codex", label: "Codex", available: false, reason: "Codex is not installed (codex not found on PATH).", models: [] },
+      ]);
 
       const source = await loadSource(server.port, server.token);
       expect((await ask(server.port, server.token, source.id)).status).toBe(202);
@@ -387,11 +390,19 @@ describe("connector protocol boundary", () => {
 
       const unknown = await call(server.port, server.token, "/api/ask", {
         method: "POST",
-        body: JSON.stringify({ ...askBody(source.id), modelId: "codex:x" }),
+        body: JSON.stringify({ ...askBody(source.id), modelId: "unknown:x" }),
       });
       expect(unknown.status).toBe(400);
       await expect(unknown.json()).resolves.toEqual({
         error: "model selection failed: unknown harness; refresh state and retry",
+      });
+      const foreign = await call(server.port, server.token, "/api/ask", {
+        method: "POST",
+        body: JSON.stringify({ ...askBody(source.id), modelId: "codex:x" }),
+      });
+      expect(foreign.status).toBe(400);
+      await expect(foreign.json()).resolves.toEqual({
+        error: "model selection failed: expected an available model and thinking level; refresh state and retry",
       });
 
       await waitFor(async () => ((await (await call(server.port, server.token, "/api/log")).json()) as unknown[]).length === 2);

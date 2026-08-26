@@ -9,7 +9,6 @@ import {
   type HarnessConnector,
   type ParseSink,
 } from "../src/connectors/types.ts";
-import { createReviewTutorFlags } from "../src/flags.ts";
 import { TutorRunner } from "../src/runner.ts";
 
 class FakeChild extends EventEmitter {
@@ -22,15 +21,8 @@ class FakeChild extends EventEmitter {
 
 const models = [{ id: "anthropic/model", label: "Model", thinkingLevels: ["low"] }];
 
-function flags(enabled: boolean) {
-  return createReviewTutorFlags({
-    get: () => enabled,
-    set: () => {},
-  });
-}
-
-function registry(enabled = false) {
-  return createConnectorRegistry({ flags: flags(enabled), piModels: models });
+function registry() {
+  return createConnectorRegistry({ piModels: models });
 }
 
 const request = {
@@ -42,22 +34,8 @@ const request = {
 };
 
 describe("connector registry", () => {
-  it("reads the environment override once when flags are created", () => {
-    const previous = process.env.REVIEW_TUTOR_FLAGS;
-    try {
-      process.env.REVIEW_TUTOR_FLAGS = "reviewTutorHarnessConnectors";
-      const snapshot = createReviewTutorFlags();
-      process.env.REVIEW_TUTOR_FLAGS = "";
-      expect(snapshot.isEnabled("reviewTutorHarnessConnectors")).toBe(true);
-    } finally {
-      if (previous === undefined) delete process.env.REVIEW_TUTOR_FLAGS;
-      else process.env.REVIEW_TUTOR_FLAGS = previous;
-    }
-  });
-
-  it("registers optional connectors only when the flag is on", () => {
-    expect(registry(false).connectors().map((connector) => connector.id)).toEqual(["pi"]);
-    expect(registry(true).connectors().map((connector) => connector.id)).toEqual(["pi", "claude-code", "codex"]);
+  it("registers Pi, Claude Code, and Codex in that order", () => {
+    expect(registry().connectors().map((connector) => connector.id)).toEqual(["pi", "claude-code", "codex"]);
   });
 
   it("resolves namespaced and legacy Pi ids and rejects unknown harnesses", () => {
@@ -71,8 +49,7 @@ describe("connector registry", () => {
       connector: { id: "pi" },
       model: "ollama/qwen3:8b",
     });
-    expect(registry().resolve("codex:x")).toBeUndefined();
-    expect(registry(true).resolve("codex:x")).toMatchObject({ model: "x" });
+    expect(registry().resolve("codex:x")).toMatchObject({ model: "x" });
     expect(registry().resolve("unknown:x")).toBeUndefined();
   });
 

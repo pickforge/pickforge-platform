@@ -27,7 +27,24 @@ export const hookFragments: Record<Exclude<Harness, "pi">, Json> = {
 
 function stable(value: unknown): string { return JSON.stringify(value); }
 
+function isPlainObject(value: unknown): value is Json {
+  if (typeof value !== "object" || value === null) return false;
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  return prototype === Object.prototype || prototype === null;
+}
+
+function validateDocument(value: unknown, source: string): asserts value is Json {
+  if (!isPlainObject(value)) throw new Error(`${source}: expected a JSON object`);
+  if (value.hooks === undefined) return;
+  if (!isPlainObject(value.hooks)) throw new Error(`${source}: expected "hooks" to be an object`);
+  for (const [event, entries] of Object.entries(value.hooks)) {
+    if (!Array.isArray(entries)) throw new Error(`${source}: expected "hooks.${event}" to be an array`);
+  }
+}
+
 export function mergeHookFragment(existing: Json, fragment: Json): Json {
+  validateDocument(existing, "existing document");
+  validateDocument(fragment, "hook fragment");
   const currentHooks = (existing.hooks ?? {}) as Json;
   const incomingHooks = (fragment.hooks ?? {}) as Json;
   const hooks: Json = { ...currentHooks };
@@ -40,9 +57,13 @@ export function mergeHookFragment(existing: Json, fragment: Json): Json {
 }
 
 async function readJson(path: string): Promise<Json> {
-  try { return JSON.parse(await readFile(path, "utf8")) as Json; }
-  catch (error) {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
+    validateDocument(parsed, path);
+    return parsed;
+  } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    if (error instanceof SyntaxError) throw new Error(`${path}: invalid JSON: ${error.message}`);
     throw error;
   }
 }
@@ -63,14 +84,21 @@ async function executable(name: string): Promise<boolean> {
   return false;
 }
 
+export function spawnPi(command: string, platform = process.platform, spawnProcess = spawn): ReturnType<typeof spawn> {
+  const args = ["install", "npm:@pickforge/complexity-gate"];
+  return platform === "win32"
+    ? spawnProcess("cmd.exe", ["/d", "/s", "/c", command, ...args], { stdio: "inherit" })
+    : spawnProcess(command, args, { stdio: "inherit" });
+}
+
 async function runPi(): Promise<void> {
-  const command = "pi install npm:@pickforge/complexity-gate";
-  if (!(await executable(process.platform === "win32" ? "pi.cmd" : "pi"))) {
-    console.log(command);
+  const command = process.platform === "win32" ? "pi.cmd" : "pi";
+  if (!(await executable(command))) {
+    console.log("pi install npm:@pickforge/complexity-gate");
     return;
   }
   await new Promise<void>((resolve, reject) => {
-    const child = spawn("pi", ["install", "npm:@pickforge/complexity-gate"], { stdio: "inherit" });
+    const child = spawnPi(command);
     child.on("error", reject);
     child.on("exit", (code) => code === 0 ? resolve() : reject(new Error(`pi install exited ${code}`)));
   });

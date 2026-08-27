@@ -71,7 +71,8 @@ export async function downloadBinary(options: DownloadOptions): Promise<string> 
     await writeFile(archivePath, archiveBytes);
     await extract(archivePath, temp, platform);
     const binaryName = platform === "win32" ? "complexity-gate.exe" : "complexity-gate";
-    const source = join(temp, binaryName);
+    // cargo-dist archives unpack into a directory named after the archive stem.
+    const source = join(temp, `complexity-gate-${target}`, binaryName);
     await mkdir(options.vendorDir, { recursive: true });
     const destination = join(options.vendorDir, binaryName);
     await rename(source, destination);

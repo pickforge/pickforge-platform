@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { spawn } from "node:child_process";
@@ -75,7 +75,8 @@ export async function downloadBinary(options: DownloadOptions): Promise<string> 
     const source = join(temp, `complexity-gate-${target}`, binaryName);
     await mkdir(options.vendorDir, { recursive: true });
     const destination = join(options.vendorDir, binaryName);
-    await rename(source, destination);
+    // copy, not rename: the temp dir may live on another filesystem (EXDEV).
+    await copyFile(source, destination);
     if (platform !== "win32") await chmod(destination, 0o755);
     return destination;
   } finally {

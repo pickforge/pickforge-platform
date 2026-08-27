@@ -18,55 +18,78 @@
     },
     "packages/auth": {
       "name": "@pickforge/auth",
-      "version": "0.12.0",
+      "version": "0.13.0",
       "dependencies": {
         "@supabase/supabase-js": "^2.110.0",
       },
     },
     "packages/billing": {
       "name": "@pickforge/billing",
-      "version": "0.12.0",
+      "version": "0.13.0",
     },
     "packages/brand": {
       "name": "@pickforge/brand",
-      "version": "0.12.0",
+      "version": "0.13.0",
       "dependencies": {
         "@fontsource/geist-mono": "^5.2.8",
         "@fontsource/geist-sans": "^5.2.5",
       },
     },
-    "packages/edge-shared": {
-      "name": "@pickforge/edge-shared",
-      "version": "0.12.0",
-    },
-    "packages/flags": {
-      "name": "@pickforge/flags",
-      "version": "0.12.0",
-    },
-    "packages/review-tutor": {
-      "name": "@pickforge/review-tutor",
-      "version": "0.0.0",
+    "packages/complexity-gate": {
+      "name": "@pickforge/complexity-gate",
+      "version": "0.1.0",
+      "bin": {
+        "complexity-gate": "bin/complexity-gate",
+        "complexity-gate-install": "dist/install.js",
+      },
       "devDependencies": {
         "@earendil-works/pi-coding-agent": "^0.84.2",
       },
       "peerDependencies": {
         "@earendil-works/pi-coding-agent": ">=0.83.0",
       },
+      "optionalPeers": [
+        "@earendil-works/pi-coding-agent",
+      ],
+    },
+    "packages/edge-shared": {
+      "name": "@pickforge/edge-shared",
+      "version": "0.13.0",
+    },
+    "packages/flags": {
+      "name": "@pickforge/flags",
+      "version": "0.13.0",
+    },
+    "packages/review-tutor": {
+      "name": "@pickforge/review-tutor",
+      "version": "0.13.0",
+      "bin": {
+        "review-tutor": "dist/bin.js",
+      },
+      "devDependencies": {
+        "@earendil-works/pi-coding-agent": "^0.84.2",
+      },
+      "peerDependencies": {
+        "@earendil-works/pi-coding-agent": ">=0.83.0",
+      },
+      "optionalPeers": [
+        "@earendil-works/pi-coding-agent",
+      ],
     },
     "packages/sync": {
       "name": "@pickforge/sync",
-      "version": "0.12.0",
+      "version": "0.13.0",
     },
     "packages/tauri-release": {
       "name": "@pickforge/tauri-release",
-      "version": "0.12.0",
+      "version": "0.13.0",
       "bin": {
         "pickforge-tauri-release": "dist/cli.js",
       },
     },
     "packages/tauri-updater": {
       "name": "@pickforge/tauri-updater",
-      "version": "0.12.0",
+      "version": "0.13.0",
     },
   },
   "overrides": {
@@ -280,6 +303,8 @@
     "@pickforge/billing": ["@pickforge/billing@workspace:packages/billing"],
 
     "@pickforge/brand": ["@pickforge/brand@workspace:packages/brand"],
+
+    "@pickforge/complexity-gate": ["@pickforge/complexity-gate@workspace:packages/complexity-gate"],
 
     "@pickforge/edge-shared": ["@pickforge/edge-shared@workspace:packages/edge-shared"],
 

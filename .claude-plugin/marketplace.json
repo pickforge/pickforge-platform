@@ -13,6 +13,15 @@
         "url": "https://github.com/pickforge/pickforge-platform.git",
         "path": "packages/review-tutor/claude-plugin"
       }
+    },
+    {
+      "name": "complexity-gate",
+      "description": "Block completion when changed functions exceed complexity limits.",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/pickforge/pickforge-platform.git",
+        "path": "packages/complexity-gate/claude-plugin"
+      }
     }
   ]
 }

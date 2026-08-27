@@ -1,0 +1,40 @@
+#!/usr/bin/env node
+import { access, realpath } from "node:fs/promises";
+import { constants } from "node:fs";
+import { spawn } from "node:child_process";
+import { delimiter, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const script = await realpath(fileURLToPath(import.meta.url));
+const root = dirname(dirname(script));
+const binaryName = process.platform === "win32" ? "complexity-gate.exe" : "complexity-gate";
+const vendored = join(root, "vendor", binaryName);
+
+async function usable(path) {
+  try { await access(path, constants.X_OK); return true; } catch { return false; }
+}
+
+async function pathBinary() {
+  for (const directory of (process.env.PATH ?? "").split(delimiter)) {
+    const candidate = join(directory, binaryName);
+    if (!(await usable(candidate))) continue;
+    try { if (await realpath(candidate) === script) continue; } catch { continue; }
+    return candidate;
+  }
+}
+
+let selected;
+for (const candidate of [process.env.COMPLEXITY_GATE_BIN, vendored]) {
+  if (candidate && await usable(candidate)) { selected = candidate; break; }
+}
+selected ??= await pathBinary();
+if (!selected) {
+  console.error("complexity-gate: binary not found; set COMPLEXITY_GATE_BIN or run complexity-gate-install");
+  process.exit(127);
+}
+const child = spawn(selected, process.argv.slice(2), { stdio: "inherit" });
+child.on("error", () => {
+  console.error("complexity-gate: binary not found; set COMPLEXITY_GATE_BIN or run complexity-gate-install");
+  process.exit(127);
+});
+child.on("exit", (code, signal) => signal ? process.kill(process.pid, signal) : process.exit(code ?? 1));

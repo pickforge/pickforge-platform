@@ -1,0 +1,34 @@
+{
+  "name": "@pickforge/complexity-gate",
+  "version": "0.1.0",
+  "description": "Cross-harness function complexity gate for coding agents.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package", "claude-code-plugin", "codex", "code-review", "complexity"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pickforge/pickforge-platform.git",
+    "directory": "packages/complexity-gate"
+  },
+  "homepage": "https://github.com/pickforge/pickforge-platform/tree/main/packages/complexity-gate",
+  "engines": { "node": ">=22" },
+  "publishConfig": { "access": "public" },
+  "pi": {
+    "extensions": ["extensions/complexity-gate.ts"],
+    "skills": ["skills/complexity-gate"]
+  },
+  "bin": {
+    "complexity-gate": "bin/complexity-gate",
+    "complexity-gate-install": "dist/install.js"
+  },
+  "files": ["bin", "dist", "scripts", "extensions", "skills", "claude-plugin", "codex-skill", "codex-hooks.json", "README.md"],
+  "scripts": {
+    "build": "tsup src/install.ts src/postinstall.ts --format esm --clean --splitting false --out-dir dist",
+    "postinstall": "node scripts/postinstall.cjs",
+    "test": "cd ../.. && vitest run packages/complexity-gate/test",
+    "typecheck": "tsc -p ../../tsconfig.json --noEmit"
+  },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": ">=0.83.0" },
+  "peerDependenciesMeta": { "@earendil-works/pi-coding-agent": { "optional": true } },
+  "devDependencies": { "@earendil-works/pi-coding-agent": "^0.84.2" }
+}

@@ -1,0 +1,12 @@
+{
+  "description": "Check edited and changed functions with complexity-gate.",
+  "hooks": {
+    "PostToolUse": [{
+      "matcher": "Edit|Write|MultiEdit",
+      "hooks": [{ "type": "command", "command": "complexity-gate hook codex" }]
+    }],
+    "Stop": [{
+      "hooks": [{ "type": "command", "command": "complexity-gate hook codex" }]
+    }]
+  }
+}

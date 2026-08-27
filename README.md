@@ -7,6 +7,7 @@ Shared platform packages for Pickforge desktop apps.
 - `@pickforge/tauri-release`: signed Tauri release and updater-feed helpers.
 - `@pickforge/brand`: CSS tokens, fonts, reset, and framework-neutral primitives.
 - `@pickforge/auth`: UI-free Supabase Auth wrapper and entitlement reader.
+- `@pickforge/complexity-gate`: cross-harness function complexity checks and stop gates.
 
 Desktop apps keep updating from signed Tauri artifacts and signed `latest.json`
 feeds. Stable releases stay tag-driven; nightly builds use a separate opt-in

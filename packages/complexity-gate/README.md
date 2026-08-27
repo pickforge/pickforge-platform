@@ -47,4 +47,4 @@ The wrapper resolves the executable in this order: `COMPLEXITY_GATE_BIN`, the ve
 
 ## Hook documentation
 
-Hook formats and event names were checked against the Claude Code plugin/hooks and Codex hooks documentation on 2026-07-08. Both currently expose `PostToolUse` and `Stop`; both fragments invoke the Rust binary's harness-specific hook adapter.
+Hook formats and event names were checked against the Claude Code plugin/hooks and Codex hooks documentation on 2026-08-26. Both currently expose `PostToolUse` and `Stop`; both fragments invoke the Rust binary's harness-specific hook adapter.

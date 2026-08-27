@@ -4,7 +4,7 @@ Function-complexity feedback and stop gates for Pi, Claude Code, and Codex. The 
 
 ## Install
 
-Requires Node 22 or newer. Set `COMPLEXITY_GATE_BIN` to an existing binary to skip the release download. Set `COMPLEXITY_GATE_VERSION` to a release tag (default `v0.1.0`).
+Requires Node 22 or newer. Set `COMPLEXITY_GATE_BIN` to an existing binary to skip the release download. Set `COMPLEXITY_GATE_VERSION` to a release tag (default `v0.1.1`).
 
 ```bash
 npm install -g @pickforge/complexity-gate

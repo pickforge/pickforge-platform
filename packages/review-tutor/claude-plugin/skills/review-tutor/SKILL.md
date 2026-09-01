@@ -1,7 +1,6 @@
 ---
 name: review-tutor
-description: Open the Review Tutor for a review, PR, diff, or commit in your browser.
-disable-model-invocation: true
+description: Open the Review Tutor for a review, PR, diff, or commit in your browser. Use when the user asks to review, walk through, or learn from a PR, diff, commit, or the current worktree.
 allowed-tools: Bash(npx -y @pickforge/review-tutor *)
 ---
 

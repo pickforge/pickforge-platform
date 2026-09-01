@@ -15,3 +15,7 @@
 
 For substantial work, read `../AGENTS.md` (workspace root) and use the `plan-issue` workflow — GitHub Issues are the canonical plan/progress tracker.
 
+## Shipped skills
+
+Never pair a pre-approved `allowed-tools: Bash(...)` rule with a model-invocable skill whose command argument the model supplies. Permission matching splits on compound operators but not on `$(...)`, so the pre-approval becomes a shell-injection path reachable from any untrusted text the model is reading. Either keep the skill human-invocable (`disable-model-invocation: true`) or drop the pre-approval so the call is confirmed.
+

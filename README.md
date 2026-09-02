@@ -13,31 +13,17 @@ Desktop apps keep updating from signed Tauri artifacts and signed `latest.json`
 feeds. Stable releases stay tag-driven; nightly builds use a separate opt-in
 feed.
 
-## Workspace skills
+## Releasing
 
-`skills/` holds agent runbooks shared across the workspace (`release`, `ci`,
-`pickforge-ui`).
-Run `scripts/link-workspace-skills.sh` to symlink them into the workspace root
-and every sibling repo (rerun after adding a repo or a skill) — skill discovery
-does not traverse parent directories, so each repo needs its own link.
-
-`pickforge-ui` is the workspace-specific overlay. Its directed workflow also
-requires the separately installed personal `design-director` skill and a sibling
-`branding-visual/` checkout. The link script does not install those external
-dependencies; the overlay fails closed when either canonical source is missing.
-
-App-local skills (like each app's `run` skill) live canonically in that repo's
-`.agents/skills/<name>/SKILL.md`, with `.claude/skills/<name>` committed as a
-relative symlink (`../../.agents/skills/<name>`) so both Claude and other
-agents discover the same file. If the repo ignores `.claude/`, carve the skill
-out (see pickforge's `.gitignore`).
+Release steps and gotchas for every Tauri app live in [`RELEASING.md`](RELEASING.md).
 
 ## CI conventions
 
 Apply to every workspace repo; new repos adopt them on day one.
 
-- `bun-version` is pinned in all workflows, never `latest` — current pin and
-  bump procedure live in [`skills/ci/SKILL.md`](skills/ci/SKILL.md).
+- `bun-version` is pinned in all workflows, never `latest`. Current pin: 1.3.12.
+  To bump: `grep -rn bun-version ~/Projects/Pickforge/*/.github/workflows/*.yml`,
+  update every hit in the same wave (one PR per repo), and update this line.
 - `Swatinem/rust-cache@v2` goes in every Rust workflow, **including release**
   (uncached release builds ran 12–35 min; cached 5–8). Repos where the Cargo
   manifest lives under `src-tauri/` (not a workspace) need

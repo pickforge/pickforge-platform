@@ -1,21 +1,20 @@
-# Repo Guidance
+# pickforge-platform
 
-- Start test-first by default. For bugs, add a failing regression test first when practical.
-- Add characterization tests before risky refactors.
-- Keep tests in the same PR as behavior changes.
-- Do not lower coverage thresholds without explicit maintainer approval.
-- Keep durable domain and business behavior out of UI components where applicable, without adding DDD ceremony.
-- Use Bun workspace commands from the repo root: `bun run typecheck`, `bun run test`, `bun run test:coverage`, and `bun run build`.
+Shared `@pickforge/*` TypeScript packages (auth, billing, brand, flags, sync, edge-shared, tauri-release, tauri-updater, review-tutor, complexity-gate) plus the platform Supabase migrations and Edge Functions. No app UI lives here.
 
-## Web Components
+```
+bun install
+bun run check        # typecheck, lint, test, coverage, build; the same gate as CI
+bun run test         # vitest only, no database
+supabase db start && PICKFORGE_ALLOW_LOCAL_DB_TESTS=1 bun run test:supabase
+supabase db advisors --local --type security --fail-on warn
+```
 
-- Stateful DOM nodes (dialog, live regions) must stay stable across renders — full innerHTML rebuilds on state ticks replay showModal/animations and break assistive-tech announcements.
+`*.contract.test.ts` files are excluded from plain vitest on purpose. They only run in the database suite, against Postgres.
 
-## Workspace policy
+Worth knowing:
 
-For substantial work, read `../AGENTS.md` (workspace root) and use the `plan-issue` workflow — GitHub Issues are the canonical plan/progress tracker.
-
-## Shipped skills
-
-Never pair a pre-approved `allowed-tools: Bash(...)` rule with a model-invocable skill whose command argument the model supplies. Permission matching splits on compound operators but not on `$(...)`, so the pre-approval becomes a shell-injection path reachable from any untrusted text the model is reading. Either keep the skill human-invocable (`disable-model-invocation: true`) or drop the pre-approval so the call is confirmed.
-
+- Tests go in the same PR as the behavior change. Coverage thresholds in `vitest.config.ts` don't get lowered without asking me.
+- Packages publish to npm on a `v*` tag and every version has to bump together or the publish fails. Release steps for the apps are in `RELEASING.md`.
+- In `packages/tauri-updater`, stateful DOM nodes (the dialog, live regions) must survive a re-render. Rebuilding `innerHTML` on a state tick replays `showModal` and breaks assistive-tech announcements.
+- Skills shipped inside packages must not combine a pre-approved `allowed-tools: Bash(...)` rule with a command argument the model supplies. Permission matching doesn't split on `$(...)`, so that pair is a shell-injection path. Keep the skill human-invocable or drop the pre-approval.

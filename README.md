@@ -28,8 +28,7 @@ Apply to every workspace repo; new repos adopt them on day one.
   (uncached release builds ran 12–35 min; cached 5–8). Repos where the Cargo
   manifest lives under `src-tauri/` (not a workspace) need
   `with: workspaces: src-tauri`.
-- Tagged releases follow the shared `@pickforge/tauri-release` pipeline; the
-  runbook is the `release` skill.
+- Tagged releases follow the shared `@pickforge/tauri-release` pipeline; the runbook is [`RELEASING.md`](RELEASING.md).
 
 ## Commands
 

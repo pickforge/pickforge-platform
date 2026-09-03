@@ -1,17 +1,17 @@
 # @pickforge/complexity-gate
 
-Function-complexity feedback and stop gates for Pi, Claude Code, and Codex. The npm package downloads the matching Rust binary, verifies its SHA-256 checksum, and keeps install non-fatal when a release or network is unavailable.
+Function-complexity feedback and completion gates for Claude Code, Codex, Pi, OMP, Grok, Cursor, and OpenCode. The npm package downloads the matching Rust binary, verifies its SHA-256 checksum, and keeps installation non-fatal when a release or network is unavailable.
 
 ## Install
 
-Requires Node 22 or newer. Set `COMPLEXITY_GATE_BIN` to an existing binary to skip the release download. Set `COMPLEXITY_GATE_VERSION` to a release tag (default `v0.1.1`).
+Requires Node 22 or newer. Set `COMPLEXITY_GATE_BIN` to an existing binary to skip the release download. Set `COMPLEXITY_GATE_VERSION` to a release tag (default `v0.2.0`).
 
 ```bash
 npm install -g @pickforge/complexity-gate
-complexity-gate-install --all
+complexity-gate-install
 ```
 
-Choose one or more harnesses with `--harness claude,codex,pi`. With no flags, the installer prompts for a comma-separated list. `--print` prints configuration without writing, and `--home <dir>` changes the settings root.
+The package install adds only the binary. The second command asks which harness integrations to install; choose a comma-separated list, `all`, or `none`. For automation, use `--all` or `--harness claude,codex`. `--print` prints configuration without writing, and `--home <dir>` changes the JSON hook settings root.
 
 ### Pi
 
@@ -39,6 +39,35 @@ cp -r node_modules/@pickforge/complexity-gate/codex-skill/complexity-gate ~/.cod
 
 The installer merges `codex-hooks.json` into `~/.codex/hooks.json`.
 
+### OMP
+
+The installer runs `omp plugin install npm:@pickforge/complexity-gate`. OMP uses the same after-edit and agent-end extension as Pi.
+
+### Grok
+
+The installer adds native `PostToolUse` and `Stop` hooks under `~/.grok/hooks/`. If Claude Code or Cursor hooks are already selected, Grok reuses those compatible hooks to avoid running the gate twice. Edit findings appear in the hook annotation; the stop hook blocks completion until the changed functions pass.
+
+### Cursor
+
+The installer merges `afterFileEdit` and `stop` hooks into `~/.cursor/hooks.json`. Edit findings appear in hook output, and the stop hook sends a correction follow-up when changed functions fail.
+
+### OpenCode
+
+The installer runs `opencode plugin @pickforge/complexity-gate --global`, which updates OpenCode's global config. The plugin appends edit findings to tool output and continues an idle session when changed functions fail.
+
+## AGENTS.md
+
+Add this to a project or global `AGENTS.md` to require the gate during coding and reviews:
+
+```md
+Use complexity-gate for every coding and code-review task. If it is missing,
+install it with `npm install --global @pickforge/complexity-gate`, then run
+`complexity-gate-install` and select the harness integrations to enable. Run
+`complexity-gate check --changed` before completion. Fix every `FAIL` without
+raising limits or hiding branches. Report every `UNVERIFIED` file instead of
+estimating its complexity.
+```
+
 ## Configure
 
 Run `complexity-gate init` to create `.complexity-gate.json`. The defaults are complexity 15, depth 4, 100 nonblank/non-comment lines, and 6 parameters. See the installed skill for the refactoring workflow.
@@ -47,4 +76,4 @@ The wrapper resolves the executable in this order: `COMPLEXITY_GATE_BIN`, the ve
 
 ## Hook documentation
 
-Hook formats and event names were checked against the Claude Code plugin/hooks and Codex hooks documentation on 2026-08-26. Both currently expose `PostToolUse` and `Stop`; both fragments invoke the Rust binary's harness-specific hook adapter.
+Hook formats and event names were checked against the official Claude Code, Codex, Grok, Cursor, and OpenCode documentation on 2026-09-03. Pi and OMP use their native extension API.

@@ -53,7 +53,7 @@ export async function downloadBinary(options: DownloadOptions): Promise<string> 
   const platform = options.platform ?? process.platform;
   const target = targets[`${platform}-${options.arch ?? process.arch}`];
   if (!target) throw new Error(`unsupported platform: ${platform}/${options.arch ?? process.arch}`);
-  const tag = options.tag ?? process.env.COMPLEXITY_GATE_VERSION ?? "v0.1.1";
+  const tag = options.tag ?? process.env.COMPLEXITY_GATE_VERSION ?? "v0.2.0";
   const extension = platform === "win32" ? "zip" : "tar.xz";
   const archive = `complexity-gate-${target}.${extension}`;
   const base = `https://github.com/pickforge/complexity-gate/releases/download/${tag}`;

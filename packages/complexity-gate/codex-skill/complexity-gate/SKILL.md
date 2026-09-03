@@ -1,9 +1,12 @@
 ---
 name: complexity-gate
-description: Measure and reduce function complexity with the complexity-gate binary. Use when a complexity-gate hook reports FAIL lines, when the user asks to refactor, simplify, or clean up code, mentions complexity, maintainability, deeply nested logic, or god functions, or after writing any nontrivial branching code.
+description: Measure and reduce function complexity with the complexity-gate binary. Use for every coding and code-review task, when a complexity-gate hook reports FAIL lines, or when the user asks to refactor or simplify code.
 ---
 
 # Complexity gate
+
+For every coding or code-review task, run `complexity-gate check --changed`
+before completion. Hooks provide immediate feedback but do not replace this final check.
 
 Never estimate complexity yourself. The only accepted numbers come from:
 

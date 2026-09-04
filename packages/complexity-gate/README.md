@@ -6,6 +6,8 @@ Function-complexity feedback and completion gates for Claude Code, Codex, Pi, OM
 
 Requires Node 22 or newer. Set `COMPLEXITY_GATE_BIN` to an existing binary to skip the release download. Set `COMPLEXITY_GATE_VERSION` to a release tag (default `v0.2.0`).
 
+Want your coding agent to perform the setup? Send it the [AI installation guide](https://github.com/pickforge/complexity-gate/blob/main/INSTALL_WITH_AGENT.md). It covers harness selection, hooks, plugins, agent instructions, and verification.
+
 ```bash
 npm install -g @pickforge/complexity-gate
 complexity-gate-install
@@ -54,19 +56,6 @@ The installer merges `afterFileEdit` and `stop` hooks into `~/.cursor/hooks.json
 ### OpenCode
 
 The installer runs `opencode plugin @pickforge/complexity-gate --global`, which updates OpenCode's global config. The plugin appends edit findings to tool output and continues an idle session when changed functions fail.
-
-## AGENTS.md
-
-Add this to a project or global `AGENTS.md` to require the gate during coding and reviews:
-
-```md
-Use complexity-gate for every coding and code-review task. If it is missing,
-install it with `npm install --global @pickforge/complexity-gate`, then run
-`complexity-gate-install` and select the harness integrations to enable. Run
-`complexity-gate check --changed` before completion. Fix every `FAIL` without
-raising limits or hiding branches. Report every `UNVERIFIED` file instead of
-estimating its complexity.
-```
 
 ## Configure
 

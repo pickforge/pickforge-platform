@@ -34,5 +34,5 @@ jobs:
               echo "Skipping ${name}@${version}: already published"
               continue
             fi
-            npm publish "$package_dir" --access public --provenance
+            npm publish "./$package_dir" --access public --provenance
           done

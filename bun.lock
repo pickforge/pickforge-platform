@@ -18,18 +18,18 @@
     },
     "packages/auth": {
       "name": "@pickforge/auth",
-      "version": "0.14.0",
+      "version": "0.14.1",
       "dependencies": {
         "@supabase/supabase-js": "^2.110.0",
       },
     },
     "packages/billing": {
       "name": "@pickforge/billing",
-      "version": "0.14.0",
+      "version": "0.14.1",
     },
     "packages/brand": {
       "name": "@pickforge/brand",
-      "version": "0.14.0",
+      "version": "0.14.1",
       "dependencies": {
         "@fontsource/geist-mono": "^5.2.8",
         "@fontsource/geist-sans": "^5.2.5",
@@ -37,7 +37,7 @@
     },
     "packages/complexity-gate": {
       "name": "@pickforge/complexity-gate",
-      "version": "0.14.0",
+      "version": "0.14.1",
       "bin": {
         "complexity-gate": "bin/complexity-gate",
         "complexity-gate-install": "dist/install.js",
@@ -54,15 +54,15 @@
     },
     "packages/edge-shared": {
       "name": "@pickforge/edge-shared",
-      "version": "0.14.0",
+      "version": "0.14.1",
     },
     "packages/flags": {
       "name": "@pickforge/flags",
-      "version": "0.14.0",
+      "version": "0.14.1",
     },
     "packages/review-tutor": {
       "name": "@pickforge/review-tutor",
-      "version": "0.14.0",
+      "version": "0.14.1",
       "bin": {
         "review-tutor": "dist/bin.js",
       },
@@ -78,18 +78,18 @@
     },
     "packages/sync": {
       "name": "@pickforge/sync",
-      "version": "0.14.0",
+      "version": "0.14.1",
     },
     "packages/tauri-release": {
       "name": "@pickforge/tauri-release",
-      "version": "0.14.0",
+      "version": "0.14.1",
       "bin": {
         "pickforge-tauri-release": "dist/cli.js",
       },
     },
     "packages/tauri-updater": {
       "name": "@pickforge/tauri-updater",
-      "version": "0.14.0",
+      "version": "0.14.1",
     },
   },
   "overrides": {

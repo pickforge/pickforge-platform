@@ -1,6 +1,6 @@
 {
   "name": "@pickforge/review-tutor",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "description": "Cross-harness code review with guided fix sessions.",
   "type": "module",
   "license": "MIT",

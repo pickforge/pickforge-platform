@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { hookFragments, install, mergeHookFragment, spawnPi } from "../src/install.ts";
+import { hookFragments, install, mergeHookFragment, parseArgs, parseHarnessSelection, spawnOmp, spawnOpenCode, spawnPi } from "../src/install.ts";
 
 const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map((path) => rm(path, { recursive: true, force: true }))));
@@ -61,12 +61,52 @@ describe("hook installation", () => {
     expect(spawn).toHaveBeenCalledWith("cmd.exe", ["/d", "/s", "/c", "pi.cmd", "install", "npm:@pickforge/complexity-gate"], { stdio: "inherit" });
   });
 
+  it("runs omp.cmd through cmd.exe on Windows", () => {
+    const spawn = vi.fn();
+    spawnOmp("omp.cmd", "win32", spawn as never);
+    expect(spawn).toHaveBeenCalledWith("cmd.exe", ["/d", "/s", "/c", "omp.cmd", "plugin", "install", "npm:@pickforge/complexity-gate"], { stdio: "inherit" });
+  });
+
+  it("runs opencode.cmd through cmd.exe on Windows", () => {
+    const spawn = vi.fn();
+    spawnOpenCode("opencode.cmd", "win32", spawn as never);
+    expect(spawn).toHaveBeenCalledWith("cmd.exe", ["/d", "/s", "/c", "opencode.cmd", "plugin", "@pickforge/complexity-gate", "--global"], { stdio: "inherit" });
+  });
+
+  it("parses explicit and interactive harness selections", () => {
+    expect(parseArgs(["--all"]).harnesses).toEqual(["claude", "codex", "pi", "omp", "grok", "cursor", "opencode"]);
+    expect(parseHarnessSelection("Cursor, OpenCode")).toEqual(["cursor", "opencode"]);
+    expect(parseHarnessSelection("none")).toEqual([]);
+    expect(parseHarnessSelection("")).toEqual([]);
+  });
+
+  it("writes native Grok and Cursor configuration", async () => {
+    const home = await mkdtemp(join(tmpdir(), "complexity-harnesses-"));
+    roots.push(home);
+    await install(["--harness", "grok", "--home", home]);
+    await install(["--harness", "cursor", "--home", home]);
+    const grok = JSON.parse(await readFile(join(home, ".grok", "hooks", "complexity-gate.json"), "utf8"));
+    const cursor = JSON.parse(await readFile(join(home, ".cursor", "hooks.json"), "utf8"));
+    expect(grok.hooks.Stop[0].hooks[0].command).toContain("hook grok");
+    expect(cursor.hooks.stop[0]).toMatchObject({ command: "complexity-gate hook cursor", loop_limit: 3 });
+  });
+
+  it("reuses compatible hooks instead of running Grok twice", async () => {
+    const home = await mkdtemp(join(tmpdir(), "complexity-grok-compat-"));
+    roots.push(home);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    await install(["--harness", "claude,grok", "--home", home]);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("using the installed Claude Code"));
+    await expect(readFile(join(home, ".grok", "hooks", "complexity-gate.json"))).rejects.toMatchObject({ code: "ENOENT" });
+    log.mockRestore();
+  });
+
   it("prints fragments without writing", async () => {
     const home = await mkdtemp(join(tmpdir(), "complexity-print-"));
     roots.push(home);
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
     await install(["--print", "--all", "--home", home]);
-    expect(log).toHaveBeenCalledTimes(3);
+    expect(log).toHaveBeenCalledTimes(7);
     expect(log.mock.calls.flat().join("\n")).toContain("complexity-gate hook codex");
     await expect(readFile(join(home, ".claude", "settings.json"))).rejects.toMatchObject({ code: "ENOENT" });
     log.mockRestore();

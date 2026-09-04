@@ -4,7 +4,7 @@
   "description": "Cross-harness function complexity gate for coding agents.",
   "type": "module",
   "license": "MIT",
-  "keywords": ["pi-package", "claude-code-plugin", "codex", "code-review", "complexity"],
+  "keywords": ["pi-package", "claude-code-plugin", "codex", "cursor", "grok", "omp", "opencode", "code-review", "complexity"],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/pickforge/pickforge-platform.git",
@@ -13,6 +13,10 @@
   "homepage": "https://github.com/pickforge/pickforge-platform/tree/main/packages/complexity-gate",
   "engines": { "node": ">=22" },
   "publishConfig": { "access": "public" },
+  "main": "./dist/opencode.js",
+  "exports": {
+    ".": "./dist/opencode.js"
+  },
   "pi": {
     "extensions": ["extensions/complexity-gate.ts"],
     "skills": ["skills/complexity-gate"]
@@ -23,7 +27,7 @@
   },
   "files": ["bin", "dist", "scripts", "extensions", "skills", "claude-plugin", "codex-skill", "codex-hooks.json", "README.md"],
   "scripts": {
-    "build": "tsup src/install.ts src/postinstall.ts --format esm --clean --splitting false --out-dir dist",
+    "build": "tsup src/install.ts src/postinstall.ts src/opencode.ts --format esm --clean --splitting false --out-dir dist",
     "postinstall": "node scripts/postinstall.cjs",
     "test": "cd ../.. && vitest run packages/complexity-gate/test",
     "typecheck": "tsc -p ../../tsconfig.json --noEmit"

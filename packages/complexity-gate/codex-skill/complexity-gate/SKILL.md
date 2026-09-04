@@ -12,12 +12,15 @@ Never estimate complexity yourself. The only accepted numbers come from:
 
 ```bash
 complexity-gate check <file>        # one file
-complexity-gate check --changed     # every function you touched this session
+complexity-gate check --changed     # compact list of changed files that need work
+complexity-gate check --changed --verbose <file>
 ```
 
-Output: `FAIL path:line name  metric value > limit`. Metrics: `complexity`
-(cyclomatic), `depth` (nesting), `lines`, `params`. `UNVERIFIED path` means no
-grammar for that language: say so in your report, do not count by hand.
+The changed check reports counts and at most 20 paths. Use its `DETAILS` command
+for one file at a time. Detailed output is
+`FAIL path:line name  metric value > limit`. Metrics include `complexity`,
+`depth`, `lines`, and `params`. `UNVERIFIED path` means no grammar for that
+language: say so in your report, do not count by hand.
 
 The Stop hook re-runs `--changed` when you try to finish and blocks while any
 FAIL remains. Fix the listed functions; do not suppress, rename, or move them to
@@ -45,9 +48,12 @@ escape the diff.
 
 ## Workflow
 
-1. Run `complexity-gate check --changed`; rank FAILs by value descending.
-2. Refactor worst first, one function at a time.
-3. Re-run the check. End with:
+1. Run `complexity-gate check --changed` from inside the repository.
+2. Choose one listed file and run its scoped `--verbose` command.
+3. Refactor the worst violation, then rerun the compact check.
+4. Report only functions changed and tests run. Do not print `PASS` lines.
+
+Use this compact report shape when a refactor was required:
 
 ```
 ## Complexity report

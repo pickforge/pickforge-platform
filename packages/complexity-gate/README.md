@@ -4,7 +4,7 @@ Function-complexity feedback and completion gates for Claude Code, Codex, Pi, OM
 
 ## Install
 
-Requires Node 22 or newer. Set `COMPLEXITY_GATE_BIN` to an existing binary to skip the release download. Set `COMPLEXITY_GATE_VERSION` to a release tag (default `v0.2.0`).
+Requires Node 22 or newer. Set `COMPLEXITY_GATE_BIN` to an existing binary to skip the release download. Set `COMPLEXITY_GATE_VERSION` to a release tag (default `v0.2.1`).
 
 Want your coding agent to perform the setup? Send it the [AI installation guide](https://github.com/pickforge/complexity-gate/blob/main/INSTALL_WITH_AGENT.md). It covers harness selection, hooks, plugins, agent instructions, and verification.
 
@@ -21,7 +21,10 @@ The package install adds only the binary. The second command asks which harness 
 pi install npm:@pickforge/complexity-gate
 ```
 
-The extension checks files after `edit` and `write` tool results. Violations are appended as tool feedback. At agent-turn completion it checks changed functions and queues up to three refactor follow-ups per session.
+The extension checks files after `edit` and `write` tool results. Compact,
+bounded summaries are appended as tool feedback. At agent-turn completion it
+checks changed functions and queues up to three refactor follow-ups per session.
+It never injects more than 24 lines or 8 KiB from the command.
 
 ### Claude Code
 
@@ -61,8 +64,14 @@ The installer runs `opencode plugin @pickforge/complexity-gate --global`, which 
 
 Run `complexity-gate init` to create `.complexity-gate.json`. The defaults are complexity 15, depth 4, 100 nonblank/non-comment lines, and 6 parameters. See the installed skill for the refactoring workflow.
 
+`complexity-gate check --changed` lists at most 20 failing or unverified paths.
+Run its scoped `--verbose` command to inspect one file. Outside a Git repository
+with `HEAD`, the command fails without scanning the current directory.
+
 The wrapper resolves the executable in this order: `COMPLEXITY_GATE_BIN`, the verified binary under `vendor/`, then `complexity-gate` on `PATH`. stdin, stdout, stderr, argv, and exit status are inherited unchanged.
 
 ## Hook documentation
 
 Hook formats and event names were checked against the official Claude Code, Codex, Grok, Cursor, and OpenCode documentation on 2026-09-03. Pi and OMP use their native extension API.
+All integrations return compact summaries automatically. Detailed per-function
+output is only produced by a deliberate, file-scoped `--verbose` check.

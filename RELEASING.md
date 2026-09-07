@@ -5,7 +5,7 @@ CI builds and signs on a `v*` tag (`release.yml`). Never build release artifacts
 ## 1. Prep PR
 
 - Draft notes from `docs/releases/UNRELEASED.md`.
-- Bump the version in `package.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `Cargo.lock` (run `cargo check` to refresh it). Stage per file; a batched `git add a b c` aborts on one bad path and release PRs have missed the cargo bumps that way.
+- Bump the app manifests and matching Cargo lockfile together. Check the repo's workspace layout: PickForge and PickScribe also have a root `Cargo.toml`; PickGauge keeps its lockfile under `src-tauri/`.
 - Check `gh issue list --label flagged`. Flipping a flag on means changing its `default` in this PR. List flipped flags in the notes and tick "enabled in vX.Y.Z" on their issues.
 - Open the PR as `chore: release vX.Y.Z`.
 
@@ -33,13 +33,12 @@ gh release view vX.Y.Z --json assets --jq '.assets[].name'
 ```
 
 - Every asset in `collect.patterns` and `updater.requiredPlatforms` of `<app>.release.json` is present.
-- No assets with an older version in the name. Delete leftovers: `gh release delete-asset vX.Y.Z <name>`.
+- No assets with an older version in the name. Ask before removing or replacing release assets.
 - `latest.json` URLs all point at vX.Y.Z. This feed is the one thing a bad release breaks for every existing user.
 
-To repair `latest.json`:
+After approval to replace a broken `latest.json`, use a fresh scratch directory for the repair:
 
 ```bash
-rm -rf release-assets
 gh release download vX.Y.Z --dir release-assets --pattern '*'
 bun run pickforge-tauri-release generate-latest-json \
   --config <app>.release.json --assets-dir release-assets --version X.Y.Z \
@@ -58,6 +57,6 @@ Report the draft URL and what you verified. After publish, reset `docs/releases/
 ## Gotchas
 
 - Bundle paths differ: pickforge and pickscribe are Cargo workspaces (`target/release/bundle`); pickgauge is not (`src-tauri/target/release/bundle`). `collect.artifactRoot` is authoritative.
-- Platform packages publish with `npm publish --workspaces` on tag. Every package version must bump together or publish fails.
+- Platform package versions are independent. `.github/workflows/publish.yml` publishes each unpublished package version and skips versions already on npm. Bump changed packages and affected internal dependency ranges.
 - Signing runs in CI from `TAURI_SIGNING_PRIVATE_KEY`. Local updater keys live in `~/.pickforge-keys`. Never move or print them.
 - CI is the proof, local runs are preflight. Transient failure twice in a row is not transient. Read the log.

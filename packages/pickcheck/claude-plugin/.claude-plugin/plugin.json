@@ -1,0 +1,9 @@
+{
+  "name": "pickcheck",
+  "version": "0.14.1",
+  "description": "Block agent completion when changed functions exceed complexity limits.",
+  "author": { "name": "Pickforge" },
+  "homepage": "https://github.com/pickforge/pickforge-platform/tree/main/packages/pickcheck",
+  "repository": "https://github.com/pickforge/pickforge-platform",
+  "license": "MIT"
+}

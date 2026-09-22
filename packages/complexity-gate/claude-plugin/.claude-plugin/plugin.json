@@ -1,9 +1,0 @@
-{
-  "name": "complexity-gate",
-  "version": "0.14.1",
-  "description": "Block agent completion when changed functions exceed complexity limits.",
-  "author": { "name": "Pickforge" },
-  "homepage": "https://github.com/pickforge/pickforge-platform/tree/main/packages/complexity-gate",
-  "repository": "https://github.com/pickforge/pickforge-platform",
-  "license": "MIT"
-}

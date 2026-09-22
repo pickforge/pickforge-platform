@@ -1,0 +1,12 @@
+{
+  "description": "Check edited and changed functions with pickcheck.",
+  "hooks": {
+    "PostToolUse": [{
+      "matcher": "Edit|Write|MultiEdit",
+      "hooks": [{ "type": "command", "command": "pickcheck hook codex" }]
+    }],
+    "Stop": [{
+      "hooks": [{ "type": "command", "command": "pickcheck hook codex" }]
+    }]
+  }
+}

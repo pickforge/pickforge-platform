@@ -15,12 +15,12 @@
       }
     },
     {
-      "name": "complexity-gate",
+      "name": "pickcheck",
       "description": "Block completion when changed functions exceed complexity limits.",
       "source": {
         "source": "git-subdir",
         "url": "https://github.com/pickforge/pickforge-platform.git",
-        "path": "packages/complexity-gate/claude-plugin"
+        "path": "packages/pickcheck/claude-plugin"
       }
     }
   ]

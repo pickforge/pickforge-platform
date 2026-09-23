@@ -1,0 +1,38 @@
+{
+  "name": "@pickforge/pickcheck",
+  "version": "0.14.1",
+  "description": "Cross-harness function complexity gate for coding agents.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package", "claude-code-plugin", "codex", "cursor", "grok", "omp", "opencode", "code-review", "complexity"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pickforge/pickforge-platform.git",
+    "directory": "packages/pickcheck"
+  },
+  "homepage": "https://github.com/pickforge/pickforge-platform/tree/main/packages/pickcheck",
+  "engines": { "node": ">=22" },
+  "publishConfig": { "access": "public" },
+  "main": "./dist/opencode.js",
+  "exports": {
+    ".": "./dist/opencode.js"
+  },
+  "pi": {
+    "extensions": ["extensions/pickcheck.ts"],
+    "skills": ["skills/pickcheck"]
+  },
+  "bin": {
+    "pickcheck": "bin/pickcheck",
+    "pickcheck-install": "dist/install.js"
+  },
+  "files": ["bin", "dist", "scripts", "extensions", "skills", "claude-plugin", "codex-skill", "codex-hooks.json", "README.md"],
+  "scripts": {
+    "build": "tsup src/install.ts src/postinstall.ts src/opencode.ts --format esm --clean --splitting false --out-dir dist",
+    "postinstall": "node scripts/postinstall.cjs",
+    "test": "cd ../.. && vitest run packages/pickcheck/test",
+    "typecheck": "tsc -p ../../tsconfig.json --noEmit"
+  },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": ">=0.83.0" },
+  "peerDependenciesMeta": { "@earendil-works/pi-coding-agent": { "optional": true } },
+  "devDependencies": { "@earendil-works/pi-coding-agent": "^0.84.2" }
+}

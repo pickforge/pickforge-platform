@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { constants } from "node:fs";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
@@ -249,4 +249,14 @@ export async function install(argv = process.argv.slice(2)): Promise<void> {
   await installHarnesses(harnesses, options.home);
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) install().catch((error) => { console.error(`pickcheck-install: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 2; });
+async function invokedDirectly(): Promise<boolean> {
+  if (!process.argv[1]) return false;
+  try {
+    // npm bin entries are symlinks; compare real paths so the CLI also runs through them.
+    return await realpath(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
+}
+
+if (await invokedDirectly()) install().catch((error) => { console.error(`pickcheck-install: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 2; });

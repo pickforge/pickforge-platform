@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile, mkdir } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -39,6 +39,16 @@ describe("hook installation", () => {
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain(path);
     expect(await readFile(path, "utf8")).toBe(contents);
+  });
+
+  it("runs when invoked through a bin symlink", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pickcheck-bin-"));
+    roots.push(dir);
+    const link = join(dir, "pickcheck-install");
+    await symlink(resolve("packages/pickcheck/src/install.ts"), link);
+    const result = spawnSync(process.execPath, [link, "--print", "--harness", "codex"], { encoding: "utf8" });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("pickcheck hook codex");
   });
 
   it("preserves unrelated keys and hooks", async () => {

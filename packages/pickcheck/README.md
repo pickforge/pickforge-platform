@@ -62,7 +62,7 @@ The installer runs `opencode plugin @pickforge/pickcheck --global`, which update
 
 ## Configure
 
-Run `pickcheck init` to create `.pickcheck.json`. The defaults are complexity 15, depth 4, 100 nonblank/non-comment lines, and 6 parameters. See the installed skill for the refactoring workflow.
+Run `pickcheck init` to create `.pickcheck.json`. The defaults are cognitive complexity 15, depth 4, 100 nonblank/non-comment lines, 6 parameters, and 3 boolean operators per expression; cyclomatic complexity is measured but off unless a config sets its limit. See the installed skill for the refactoring workflow.
 
 `pickcheck check --changed` lists at most 20 failing or unverified paths.
 Run its scoped `--verbose` command to inspect one file. Outside a Git repository

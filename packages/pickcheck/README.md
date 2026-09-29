@@ -4,7 +4,7 @@ Function-complexity feedback and completion gates for Claude Code, Codex, Pi, OM
 
 ## Install
 
-Requires Node 22 or newer. Set `PICKCHECK_BIN` to an existing binary to skip the release download. Set `PICKCHECK_VERSION` to a release tag (default `v0.3.0`).
+Requires Node 22 or newer. Set `PICKCHECK_BIN` to an existing binary to skip the release download. Set `PICKCHECK_VERSION` to a release tag (default `v0.4.0`).
 
 Want your coding agent to perform the setup? Send it the [AI installation guide](https://github.com/pickforge/pickcheck/blob/main/INSTALL_WITH_AGENT.md). It covers harness selection, hooks, plugins, agent instructions, and verification.
 
@@ -62,7 +62,7 @@ The installer runs `opencode plugin @pickforge/pickcheck --global`, which update
 
 ## Configure
 
-Run `pickcheck init` to create `.pickcheck.json`. The defaults are complexity 15, depth 4, 100 nonblank/non-comment lines, and 6 parameters. See the installed skill for the refactoring workflow.
+Run `pickcheck init` to create `.pickcheck.json`. The defaults are cognitive complexity 15, depth 4, 100 nonblank/non-comment lines, 6 parameters, and 3 boolean operators per expression; cyclomatic complexity is measured but off unless a config sets its limit. See the installed skill for the refactoring workflow.
 
 `pickcheck check --changed` lists at most 20 failing or unverified paths.
 Run its scoped `--verbose` command to inspect one file. Outside a Git repository

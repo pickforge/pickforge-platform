@@ -53,7 +53,7 @@ export async function downloadBinary(options: DownloadOptions): Promise<string> 
   const platform = options.platform ?? process.platform;
   const target = targets[`${platform}-${options.arch ?? process.arch}`];
   if (!target) throw new Error(`unsupported platform: ${platform}/${options.arch ?? process.arch}`);
-  const tag = options.tag ?? process.env.PICKCHECK_VERSION ?? "v0.3.0";
+  const tag = options.tag ?? process.env.PICKCHECK_VERSION ?? "v0.4.0";
   const extension = platform === "win32" ? "zip" : "tar.xz";
   const archive = `pickcheck-${target}.${extension}`;
   const base = `https://github.com/pickforge/pickcheck/releases/download/${tag}`;

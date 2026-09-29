@@ -45,7 +45,7 @@
     },
     "packages/pickcheck": {
       "name": "@pickforge/pickcheck",
-      "version": "0.14.1",
+      "version": "0.15.0",
       "bin": {
         "pickcheck": "bin/pickcheck",
         "pickcheck-install": "dist/install.js",

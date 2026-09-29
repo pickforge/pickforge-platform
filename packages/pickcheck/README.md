@@ -4,7 +4,7 @@ Function-complexity feedback and completion gates for Claude Code, Codex, Pi, OM
 
 ## Install
 
-Requires Node 22 or newer. Set `PICKCHECK_BIN` to an existing binary to skip the release download. Set `PICKCHECK_VERSION` to a release tag (default `v0.3.0`).
+Requires Node 22 or newer. Set `PICKCHECK_BIN` to an existing binary to skip the release download. Set `PICKCHECK_VERSION` to a release tag (default `v0.4.0`).
 
 Want your coding agent to perform the setup? Send it the [AI installation guide](https://github.com/pickforge/pickcheck/blob/main/INSTALL_WITH_AGENT.md). It covers harness selection, hooks, plugins, agent instructions, and verification.
 

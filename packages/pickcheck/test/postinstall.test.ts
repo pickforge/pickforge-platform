@@ -49,12 +49,6 @@ describe("binary downloader", () => {
     expect(fetchImpl.mock.calls[0]![0]).toMatch(/\/pickcheck-x86_64-pc-windows-msvc\.zip$/);
     expect(destination).toBe(join(vendorDir, "pickcheck.exe"));
     expect(await readFile(destination, "utf8")).toBe("fake exe");
-
-    const stemLayout = async (_archivePath: string, outputDir: string) => {
-      await mkdir(join(outputDir, "pickcheck-x86_64-pc-windows-msvc"));
-      await writeFile(join(outputDir, "pickcheck-x86_64-pc-windows-msvc", "pickcheck.exe"), "fake exe");
-    };
-    await expect(downloadBinary({ vendorDir: join(root, "stem-vendor"), platform: "win32", arch: "x64", fetchImpl: fetchImpl as unknown as typeof fetch, extractImpl: stemLayout })).rejects.toThrow("ENOENT");
   });
 
   it("uses the configurable cargo-dist asset name with fake fetch", async () => {

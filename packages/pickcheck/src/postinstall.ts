@@ -19,6 +19,7 @@ export type DownloadOptions = {
   tag?: string;
   vendorDir: string;
   fetchImpl?: typeof fetch;
+  extractImpl?: (archivePath: string, outputDir: string, platform: NodeJS.Platform) => Promise<void>;
 };
 
 function run(file: string, args: string[]): Promise<void> {
@@ -69,10 +70,11 @@ export async function downloadBinary(options: DownloadOptions): Promise<string> 
   try {
     const archivePath = join(temp, archive);
     await writeFile(archivePath, archiveBytes);
-    await extract(archivePath, temp, platform);
+    await (options.extractImpl ?? extract)(archivePath, temp, platform);
     const binaryName = platform === "win32" ? "pickcheck.exe" : "pickcheck";
-    // cargo-dist archives unpack into a directory named after the archive stem.
-    const source = join(temp, `pickcheck-${target}`, binaryName);
+    // cargo-dist tar.xz archives unpack into a directory named after the archive stem;
+    // zip archives keep their files at the archive root.
+    const source = extension === "zip" ? join(temp, binaryName) : join(temp, `pickcheck-${target}`, binaryName);
     await mkdir(options.vendorDir, { recursive: true });
     const destination = join(options.vendorDir, binaryName);
     // copy, not rename: the temp dir may live on another filesystem (EXDEV).

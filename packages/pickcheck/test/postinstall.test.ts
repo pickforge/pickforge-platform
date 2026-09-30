@@ -30,6 +30,26 @@ describe("binary downloader", () => {
     expect((await stat(destination)).mode & 0o111).not.toBe(0);
   });
 
+  it("vendors the Windows binary from the zip archive root", async () => {
+    const root = await mkdtemp(join(tmpdir(), "complexity-zip-"));
+    roots.push(root);
+    const asset = "pickcheck-x86_64-pc-windows-msvc.zip";
+    const archive = new TextEncoder().encode("fake zip");
+    const checksum = createHash("sha256").update(archive).digest("hex");
+    const fetchImpl = vi.fn(async (url: string) => new Response(url.endsWith("sha256.sum")
+      ? `${checksum} *${asset}\n`
+      : archive));
+    const rootLayout = async (_archivePath: string, outputDir: string) => {
+      await writeFile(join(outputDir, "LICENSE"), "license");
+      await writeFile(join(outputDir, "pickcheck.exe"), "fake exe");
+      await writeFile(join(outputDir, "README.md"), "readme");
+    };
+    const vendorDir = join(root, "vendor");
+    const destination = await downloadBinary({ vendorDir, platform: "win32", arch: "x64", fetchImpl: fetchImpl as unknown as typeof fetch, extractImpl: rootLayout });
+    expect(fetchImpl.mock.calls[0]![0]).toMatch(/\/pickcheck-x86_64-pc-windows-msvc\.zip$/);
+    expect(destination).toBe(join(vendorDir, "pickcheck.exe"));
+    expect(await readFile(destination, "utf8")).toBe("fake exe");
+  });
 
   it("uses the configurable cargo-dist asset name with fake fetch", async () => {
     const vendorDir = await mkdtemp(join(tmpdir(), "complexity-download-"));
